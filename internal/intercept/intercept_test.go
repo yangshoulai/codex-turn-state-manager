@@ -131,16 +131,17 @@ func newHarness(t *testing.T) *harness {
 	corr := NewCorrelationManager(time.Hour)
 	corr.SetClock(func() time.Time { return *clock })
 
+	stats := &Stats{}
 	return &harness{
 		settings: manager,
 		states:   registry,
 		store:    store,
 		corr:     corr,
 		injector: NewInjector(InjectorConfig{
-			Settings: manager, States: registry, Corr: corr,
+			Settings: manager, States: registry, Corr: corr, Stats: stats,
 		}),
 		collector: NewCollector(CollectorConfig{
-			Settings: manager, States: registry, Corr: corr,
+			Settings: manager, States: registry, Corr: corr, Stats: stats,
 		}),
 		clock: clock,
 	}
@@ -644,5 +645,54 @@ func TestObserveCompletion_SkippedWhenMasterSwitchOff(t *testing.T) {
 		Outcome: hostapi.CompletionFailed, StatusCode: 400,
 	}, []byte("previous_response_not_found")); got.Invalidated {
 		t.Error("self-healing must not run while the master switch is off")
+	}
+}
+
+// TestStatsCountPipelineActivity covers the counters the panel reports.
+//
+// They exist because a header rewrite leaves no trace: without them, "has the
+// plugin ever injected anything?" can only be answered by logging every request,
+// which a proxy should not do.
+func TestStatsCountPipelineActivity(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	// An account with a usable binding.
+	req := request("gpt-5-codex", "auth-id-1", "codex-auth-1")
+	h.injector.Inject(req)
+
+	// An account with none.
+	req2 := request("gpt-5-codex", "auth-id-1", "codex-auth-unknown")
+	h.injector.Inject(req2)
+
+	// A request where the host published no account at all.
+	req3 := request("gpt-5-codex", "", "")
+	h.injector.Inject(req3)
+
+	// A capture of a new value, then a repeat of it.
+	h.corr.Record("cap-1", "gpt-5-codex", "auth-id-1", "codex-auth-2")
+	h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-2", stateOf(targetLength)))
+	h.corr.Record("cap-2", "gpt-5-codex", "auth-id-1", "codex-auth-2")
+	h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-2", stateOf(targetLength)))
+
+	got := h.injector.stats.Snapshot()
+	if got.RequestsSeen != 3 {
+		t.Errorf("RequestsSeen = %d, want 3", got.RequestsSeen)
+	}
+	if got.Injected != 1 {
+		t.Errorf("Injected = %d, want 1", got.Injected)
+	}
+	if got.NoBinding != 1 {
+		t.Errorf("NoBinding = %d, want 1", got.NoBinding)
+	}
+	if got.UnresolvedAuth != 1 {
+		t.Errorf("UnresolvedAuth = %d, want 1", got.UnresolvedAuth)
+	}
+	if got.Captured != 1 {
+		t.Errorf("Captured = %d, want 1 (a repeat is not a new capture)", got.Captured)
+	}
+	if got.CapturedReused != 1 {
+		t.Errorf("CapturedReused = %d, want 1", got.CapturedReused)
 	}
 }

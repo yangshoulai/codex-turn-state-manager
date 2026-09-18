@@ -20,6 +20,7 @@ type Injector struct {
 	states   *states.Registry
 	corr     *CorrelationManager
 	logf     func(hostapi.LogLevel, string, map[string]any)
+	stats    *Stats
 }
 
 // InjectorConfig configures an Injector.
@@ -28,15 +29,20 @@ type InjectorConfig struct {
 	States   *states.Registry
 	Corr     *CorrelationManager
 	Log      func(hostapi.LogLevel, string, map[string]any)
+	Stats    *Stats
 }
 
 // NewInjector builds an injector.
 func NewInjector(cfg InjectorConfig) *Injector {
+	if cfg.Stats == nil {
+		cfg.Stats = &Stats{}
+	}
 	return &Injector{
 		settings: cfg.Settings,
 		states:   cfg.States,
 		corr:     cfg.Corr,
 		logf:     cfg.Log,
+		stats:    cfg.Stats,
 	}
 }
 
@@ -70,17 +76,21 @@ func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 		i.corr.Record(req.RequestID, req.Model, req.AuthID, req.AuthIndex)
 	}
 
+	i.stats.requestsSeen.Add(1)
+
 	if !caps.Inject {
 		// Master switch off: no injection, no bookkeeping beyond the record.
 		return Decision{Action: ActionPassthrough, AuthIndex: req.AuthIndex}
 	}
 	if req.AuthIndex == "" {
 		// The host did not publish the selected account. Nothing to look up.
+		i.stats.unresolvedAuth.Add(1)
 		return Decision{Action: ActionUnresolvedAuth}
 	}
 
 	binding, status := i.states.Lookup(req.AuthIndex, req.Model)
 	if !status.Usable() {
+		i.stats.noBinding.Add(1)
 		return Decision{Action: ActionNoBinding, AuthIndex: req.AuthIndex}
 	}
 
@@ -91,6 +101,17 @@ func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 	if req.RequestID != "" {
 		i.corr.MarkInjected(req.RequestID, binding.StateValue)
 	}
+
+	// Logged at debug: this is the one place the plugin changes a user's
+	// outbound request, and "did injection actually happen" is otherwise
+	// unanswerable from outside the process.
+	i.stats.injected.Add(1)
+	i.log(hostapi.LogDebug, "injected turn state into request", map[string]any{
+		"requestId": req.RequestID,
+		"authIndex": req.AuthIndex,
+		"model":     req.Model,
+		"length":    binding.StateLength,
+	})
 
 	return Decision{Action: ActionInjected, AuthIndex: req.AuthIndex, StateLen: binding.StateLength}
 }

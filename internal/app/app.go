@@ -56,6 +56,7 @@ type App struct {
 	scheduler *probe.Scheduler
 
 	corr      *intercept.CorrelationManager
+	stats     *intercept.Stats
 	injector  *intercept.Injector
 	collector *intercept.Collector
 	router    *routing.Scheduler
@@ -164,11 +165,12 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	})
 
 	a.corr = intercept.NewCorrelationManager(intercept.DefaultCorrelationTTL)
+	a.stats = &intercept.Stats{}
 	a.injector = intercept.NewInjector(intercept.InjectorConfig{
-		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf,
+		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
 	})
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
-		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf,
+		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
 	})
 	a.router = routing.NewScheduler(routing.SchedulerConfig{
 		Settings: a.settings, States: a.states, Cursors: db.Cursors(),
@@ -281,6 +283,13 @@ func (a *App) Models() *models.Registry { return a.models }
 
 // Catalog returns the account model list source.
 func (a *App) Catalog() *models.Catalog { return a.catalog }
+
+// PipelineStats exposes the request-pipeline counters.
+//
+// Counters rather than log lines: a header rewrite leaves no other trace, so
+// this is how the panel can answer "has the plugin ever actually injected?" --
+// and unlike per-request logging it stays affordable in production.
+func (a *App) PipelineStats() intercept.StatsSnapshot { return a.stats.Snapshot() }
 
 // ReadPlan implements accounts.PlanReader.
 //

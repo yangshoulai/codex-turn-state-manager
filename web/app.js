@@ -1172,6 +1172,24 @@ async function loadProbes() {
 async function loadStatus() {
   const status = await api("GET", "/status");
   $("version").textContent = status.version ? `v${status.version}` : "";
+
+  // The pipeline counters are the only evidence that injection and capture are
+  // happening at all: both rewrite headers and leave nothing else behind.
+  const p = status.pipeline || {};
+  const node = $("pipeline");
+  if (!node) return;
+  const parts = [];
+  if (p.requestsSeen) parts.push(`请求 ${p.requestsSeen}`);
+  if (p.injected) parts.push(`注入 ${p.injected}`);
+  if (p.captured || p.capturedReused) {
+    parts.push(`捕获 ${p.captured || 0}${p.capturedReused ? `+${p.capturedReused}续期` : ""}`);
+  }
+  if (p.invalidated) parts.push(`自愈 ${p.invalidated}`);
+  if (p.unresolvedAuth) parts.push(`账号未知 ${p.unresolvedAuth}`);
+  node.textContent = parts.length ? parts.join(" · ") : "";
+  node.title = parts.length
+    ? "本进程累计：请求到达注入阶段 / 实际注入 / 从流量捕获 / 自愈失效 / 账号无法识别"
+    : "本进程尚未处理任何请求；请求经 CPA 转发后这里会出现计数";
 }
 
 async function loadAll() {

@@ -27,6 +27,8 @@ type Collector struct {
 	// serverErrors counts consecutive 5xx per pair. The threshold is a per-pair
 	// run, not a per-request one, because a retry arrives with a fresh request
 	// id.
+	stats *Stats
+
 	failMu       sync.Mutex
 	serverErrors map[states.Pair]int
 }
@@ -37,15 +39,20 @@ type CollectorConfig struct {
 	States   *states.Registry
 	Corr     *CorrelationManager
 	Log      func(hostapi.LogLevel, string, map[string]any)
+	Stats    *Stats
 }
 
 // NewCollector builds a collector.
 func NewCollector(cfg CollectorConfig) *Collector {
+	if cfg.Stats == nil {
+		cfg.Stats = &Stats{}
+	}
 	return &Collector{
 		settings:     cfg.Settings,
 		states:       cfg.States,
 		corr:         cfg.Corr,
 		logf:         cfg.Log,
+		stats:        cfg.Stats,
 		serverErrors: map[states.Pair]int{},
 	}
 }
@@ -147,11 +154,13 @@ func (c *Collector) capture(
 
 	if sameValue {
 		// Same value seen again: TTL extended, no history row.
+		c.stats.capturedReused.Add(1)
 		return CaptureResult{
 			Action: CaptureRefreshed, AuthIndex: authIndex,
 			StateLen: len(value), Refreshed: true,
 		}
 	}
+	c.stats.captured.Add(1)
 	c.log(hostapi.LogInfo, "state captured from traffic", map[string]any{
 		"authIndex": authIndex, "model": model, "length": len(value),
 	})
@@ -227,6 +236,7 @@ func (c *Collector) ObserveCompletion(ctx context.Context, comp hostapi.Completi
 		})
 		return FailureSignal{}
 	}
+	c.stats.invalidated.Add(1)
 	c.resetServerErrors(pair)
 	c.corr.Forget(comp.RequestID)
 	c.log(hostapi.LogWarn, "binding invalidated after request failure; will re-probe", map[string]any{

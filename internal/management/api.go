@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/intercept"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/probe"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
@@ -37,6 +38,7 @@ type Service interface {
 	ProbeScheduler() *probe.Scheduler
 
 	Catalog() *models.Catalog
+	PipelineStats() intercept.StatsSnapshot
 
 	SyncAccounts(ctx context.Context) (int, error)
 	TriggerProbe(ctx context.Context, authIndex, model string) error
@@ -151,6 +153,10 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 			"route":   caps.Route,
 		},
 		"proxies": map[string]int{"total": len(proxies), "healthy": healthy},
+		// Counters rather than log lines: this is how the panel can say whether
+		// the plugin has ever actually injected, which a header rewrite
+		// otherwise leaves no trace of.
+		"pipeline": a.svc.PipelineStats(),
 	})
 }
 
