@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Turn State Manager</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <h1>Codex Turn State Manager</h1>
+  </div>
+  <div class="topbar-right">
+    <span id="conn" class="pill pill-idle">未连接</span>
+    <span id="version" class="muted"></span>
+  </div>
+</header>
+
+<section class="gate" id="gate">
+  <div class="gate-card">
+    <h2>管理密钥</h2>
+    <p class="muted">密钥仅保存在当前页面内存中，不会写入浏览器存储或插件日志。</p>
+    <form id="gate-form" autocomplete="off">
+      <input id="key" type="password" placeholder="Management key" autocomplete="off" spellcheck="false">
+      <button type="submit">连接</button>
+    </form>
+    <p id="gate-error" class="error" hidden></p>
+  </div>
+</section>
+
+<main id="panel" hidden>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>全局设置</h2>
+      <div class="card-actions">
+        <button id="save-settings" class="btn btn-primary" type="button">保存设置</button>
+      </div>
+    </div>
+
+    <div class="switch-row">
+      <label class="switch">
+        <input type="checkbox" id="s-global">
+        <span class="slider"></span>
+      </label>
+      <div class="switch-text">
+        <strong>全局总开关</strong>
+        <span class="muted">关闭后探测、请求注入、响应捕获、账号调度干预四项能力全部旁路</span>
+      </div>
+    </div>
+
+    <div class="switch-row">
+      <label class="switch">
+        <input type="checkbox" id="s-probe">
+        <span class="slider"></span>
+      </label>
+      <div class="switch-text">
+        <strong>定时探测</strong>
+        <span class="muted">在全局总开关开启时生效，受时间窗口限制</span>
+      </div>
+    </div>
+
+    <div class="switch-row">
+      <label class="switch">
+        <input type="checkbox" id="s-reverse">
+        <span class="slider"></span>
+      </label>
+      <div class="switch-text">
+        <strong>反向绑定</strong>
+        <span class="muted">从正常业务流量响应头中捕获 State 并绑定</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <label>扫描间隔 (秒)<input type="number" id="s-scan" min="5" step="5"></label>
+      <label>探测并发数<input type="number" id="s-concurrency" min="1" max="32"></label>
+      <label>State TTL (分钟)<input type="number" id="s-ttl" min="1"></label>
+      <label>刷新阈值 (%)<input type="number" id="s-threshold" min="0" max="90"></label>
+      <label>目标长度<input type="number" id="s-length" min="1"></label>
+      <label>单次探测总超时 (秒)<input type="number" id="s-maxprobe" min="5"></label>
+    </div>
+
+    <div class="strategy">
+      <span class="label">账号路由策略</span>
+      <label class="radio"><input type="radio" name="strategy" value="respect_cpa_priority"> 优先遵循 CPA priority</label>
+      <label class="radio"><input type="radio" name="strategy" value="state_first"> State 优先</label>
+    </div>
+
+    <div class="windows">
+      <div class="card-head sub">
+        <h3>探测时间窗口</h3>
+        <button id="add-window" class="btn" type="button">+ 添加窗口</button>
+      </div>
+      <p class="muted small">未配置任何启用窗口时表示全天可探测。窗口支持跨天，例如 22:00–06:00。</p>
+      <table class="table" id="windows-table">
+        <thead>
+          <tr><th>标签</th><th>星期</th><th>开始</th><th>结束</th><th>启用</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>账号与模型</h2>
+      <div class="card-actions">
+        <button id="sync-accounts" class="btn" type="button">同步账号</button>
+      </div>
+    </div>
+    <div id="accounts"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>代理池</h2>
+      <div class="card-actions">
+        <button id="save-proxies" class="btn btn-primary" type="button">保存代理池</button>
+        <button id="add-proxy" class="btn" type="button">+ 添加节点</button>
+      </div>
+    </div>
+    <p class="muted small">每行一个节点。探测时按「最久未使用优先」顺序遍历，直到命中目标长度或遍历完毕。</p>
+    <div id="proxies"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>最近探测记录</h2>
+      <div class="card-actions">
+        <label class="inline">条数 <input type="number" id="probe-limit" value="50" min="10" max="500" step="10"></label>
+        <button id="refresh-probes" class="btn" type="button">刷新</button>
+      </div>
+    </div>
+    <div id="probes"></div>
+  </section>
+
+</main>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="modal-title">绑定历史</h2>
+      <button id="modal-close" class="btn btn-ghost" type="button">关闭</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <button id="modal-clear" class="btn btn-danger" type="button">清除历史</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,588 @@
+// Package management implements the plugin's Management API.
+//
+// Every data operation the panel performs goes through here. The panel's own
+// assets are served from a Resource route, which bypasses CPA's management
+// auth, so no secret may ever be returned from there (NF-05, design doc 4.7).
+package management
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/probe"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
+)
+
+// Service is the app surface the API needs. Implemented by app.App so this
+// package does not depend on the composition root.
+type Service interface {
+	Settings() *settings.Manager
+	Accounts() *accounts.Registry
+	Models() *models.Registry
+	States() *states.Registry
+	Proxies() *proxies.Pool
+	Windows() *probe.WindowManager
+	ProbeHistory() probe.HistoryStore
+	ProbeScheduler() *probe.Scheduler
+
+	SyncAccounts(ctx context.Context) (int, error)
+	TriggerProbe(ctx context.Context, authIndex, model string) error
+}
+
+// API serves the Management API.
+type API struct {
+	svc Service
+	now func() time.Time
+}
+
+// New builds the API.
+func New(svc Service) *API { return &API{svc: svc, now: time.Now} }
+
+// Register mounts every route on mux under the plugin's management prefix.
+func (a *API) Register(mux *http.ServeMux) {
+	base := version.ManagementBasePath
+
+	mux.HandleFunc("GET "+base+"/status", a.status)
+
+	mux.HandleFunc("GET "+base+"/settings", a.getSettings)
+	mux.HandleFunc("PUT "+base+"/settings", a.putSettings)
+
+	mux.HandleFunc("GET "+base+"/time-windows", a.listWindows)
+	mux.HandleFunc("POST "+base+"/time-windows", a.createWindow)
+	mux.HandleFunc("PUT "+base+"/time-windows/{id}", a.updateWindow)
+	mux.HandleFunc("DELETE "+base+"/time-windows/{id}", a.deleteWindow)
+
+	mux.HandleFunc("GET "+base+"/accounts", a.listAccounts)
+	mux.HandleFunc("POST "+base+"/accounts/sync", a.syncAccounts)
+	mux.HandleFunc("GET "+base+"/accounts/{authIndex}/models", a.listAccountModels)
+	mux.HandleFunc("PUT "+base+"/accounts/{authIndex}/models/{model}/probe", a.setProbeEnabled)
+
+	mux.HandleFunc("GET "+base+"/bindings", a.listBindings)
+	mux.HandleFunc("DELETE "+base+"/bindings/{authIndex}/{model}", a.deleteBinding)
+	mux.HandleFunc("GET "+base+"/bindings/{authIndex}/{model}/history", a.bindingHistory)
+	mux.HandleFunc("DELETE "+base+"/bindings/{authIndex}/{model}/history", a.clearBindingHistory)
+
+	mux.HandleFunc("GET "+base+"/proxy-nodes", a.listProxies)
+	mux.HandleFunc("PUT "+base+"/proxy-nodes", a.replaceProxies)
+
+	mux.HandleFunc("GET "+base+"/probe-history", a.probeHistory)
+}
+
+// ---------------------------------------------------------------------------
+// status
+
+func (a *API) status(w http.ResponseWriter, r *http.Request) {
+	values := a.svc.Settings().Current()
+	caps := values.Capabilities()
+	proxies := a.svc.Proxies().All()
+
+	healthy := 0
+	now := a.now()
+	for _, p := range proxies {
+		if p.Healthy(now) {
+			healthy++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version":  version.Version,
+		"now":      now.UTC(),
+		"settings": toSettingsDTO(values),
+		"capabilities": map[string]bool{
+			"enabled": caps.Enabled,
+			"probe":   caps.Probe,
+			"inject":  caps.Inject,
+			"capture": caps.Capture,
+			"route":   caps.Route,
+		},
+		"proxies": map[string]int{"total": len(proxies), "healthy": healthy},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// settings
+
+type settingsDTO struct {
+	GlobalEnabled            bool   `json:"globalEnabled"`
+	GlobalProbeEnabled       bool   `json:"globalProbeEnabled"`
+	GlobalReverseBindEnabled bool   `json:"globalReverseBindEnabled"`
+	ScanIntervalSec          int    `json:"scanIntervalSec"`
+	ProbeConcurrency         int    `json:"probeConcurrency"`
+	StateTTLMin              int    `json:"stateTtlMin"`
+	RefreshThresholdPct      int    `json:"refreshThresholdPct"`
+	TargetStateLength        int    `json:"targetStateLength"`
+	MaxProbeDurationSec      int    `json:"maxProbeDurationSec"`
+	RoutingStrategy          string `json:"routingStrategy"`
+	AccountSyncIntervalSec   int    `json:"accountSyncIntervalSec"`
+}
+
+func toSettingsDTO(v *settings.Values) settingsDTO {
+	return settingsDTO{
+		GlobalEnabled:            v.GlobalEnabled,
+		GlobalProbeEnabled:       v.GlobalProbeEnabled,
+		GlobalReverseBindEnabled: v.GlobalReverseBindEnabled,
+		ScanIntervalSec:          int(v.ScanInterval / time.Second),
+		ProbeConcurrency:         v.ProbeConcurrency,
+		StateTTLMin:              int(v.StateTTL / time.Minute),
+		RefreshThresholdPct:      v.RefreshThresholdPct,
+		TargetStateLength:        v.TargetStateLength,
+		MaxProbeDurationSec:      int(v.MaxProbeDuration / time.Second),
+		RoutingStrategy:          string(v.RoutingStrategy),
+		AccountSyncIntervalSec:   int(v.AccountSyncInterval / time.Second),
+	}
+}
+
+func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, toSettingsDTO(a.svc.Settings().Current()))
+}
+
+// settingsPatchDTO uses pointers so an omitted field means "leave unchanged".
+type settingsPatchDTO struct {
+	GlobalEnabled            *bool   `json:"globalEnabled"`
+	GlobalProbeEnabled       *bool   `json:"globalProbeEnabled"`
+	GlobalReverseBindEnabled *bool   `json:"globalReverseBindEnabled"`
+	ScanIntervalSec          *int    `json:"scanIntervalSec"`
+	ProbeConcurrency         *int    `json:"probeConcurrency"`
+	StateTTLMin              *int    `json:"stateTtlMin"`
+	RefreshThresholdPct      *int    `json:"refreshThresholdPct"`
+	TargetStateLength        *int    `json:"targetStateLength"`
+	MaxProbeDurationSec      *int    `json:"maxProbeDurationSec"`
+	RoutingStrategy          *string `json:"routingStrategy"`
+	AccountSyncIntervalSec   *int    `json:"accountSyncIntervalSec"`
+}
+
+func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
+	var dto settingsPatchDTO
+	if !decodeJSON(w, r, &dto) {
+		return
+	}
+
+	patch := settings.Patch{
+		GlobalEnabled:            dto.GlobalEnabled,
+		GlobalProbeEnabled:       dto.GlobalProbeEnabled,
+		GlobalReverseBindEnabled: dto.GlobalReverseBindEnabled,
+		ProbeConcurrency:         dto.ProbeConcurrency,
+		RefreshThresholdPct:      dto.RefreshThresholdPct,
+		TargetStateLength:        dto.TargetStateLength,
+	}
+	if dto.ScanIntervalSec != nil {
+		d := time.Duration(*dto.ScanIntervalSec) * time.Second
+		patch.ScanInterval = &d
+	}
+	if dto.StateTTLMin != nil {
+		d := time.Duration(*dto.StateTTLMin) * time.Minute
+		patch.StateTTL = &d
+	}
+	if dto.MaxProbeDurationSec != nil {
+		d := time.Duration(*dto.MaxProbeDurationSec) * time.Second
+		patch.MaxProbeDuration = &d
+	}
+	if dto.AccountSyncIntervalSec != nil {
+		d := time.Duration(*dto.AccountSyncIntervalSec) * time.Second
+		patch.AccountSyncInterval = &d
+	}
+	if dto.RoutingStrategy != nil {
+		strategy, err := settings.ParseRoutingStrategy(*dto.RoutingStrategy)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		patch.RoutingStrategy = &strategy
+	}
+
+	updated, err := a.svc.Settings().Update(r.Context(), patch)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toSettingsDTO(updated))
+}
+
+// ---------------------------------------------------------------------------
+// time windows
+
+func (a *API) listWindows(w http.ResponseWriter, r *http.Request) {
+	windows := probe.SortWindows(a.svc.Windows().All())
+	if windows == nil {
+		windows = []probe.TimeWindow{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"windows": windows})
+}
+
+func (a *API) createWindow(w http.ResponseWriter, r *http.Request) {
+	var win probe.TimeWindow
+	if !decodeJSON(w, r, &win) {
+		return
+	}
+	if win.ID == "" {
+		win.ID = fmt.Sprintf("w%d", a.now().UnixNano())
+	}
+	if err := a.svc.Windows().Upsert(r.Context(), win); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, win)
+}
+
+func (a *API) updateWindow(w http.ResponseWriter, r *http.Request) {
+	var win probe.TimeWindow
+	if !decodeJSON(w, r, &win) {
+		return
+	}
+	win.ID = r.PathValue("id")
+	if err := a.svc.Windows().Upsert(r.Context(), win); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, win)
+}
+
+func (a *API) deleteWindow(w http.ResponseWriter, r *http.Request) {
+	if err := a.svc.Windows().Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+// ---------------------------------------------------------------------------
+// accounts
+
+func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
+	list := a.svc.Accounts().All()
+	if list == nil {
+		list = []accounts.Account{}
+	}
+
+	type accountView struct {
+		accounts.Account
+		Bindings int `json:"bindings"`
+	}
+	out := make([]accountView, 0, len(list))
+	for _, acc := range list {
+		bound := 0
+		for _, m := range acc.Models {
+			if _, status := a.svc.States().Lookup(acc.AuthIndex, m); status.Usable() {
+				bound++
+			}
+		}
+		out = append(out, accountView{Account: acc, Bindings: bound})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
+
+func (a *API) syncAccounts(w http.ResponseWriter, r *http.Request) {
+	n, err := a.svc.SyncAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"accounts": n})
+}
+
+func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
+	authIndex := r.PathValue("authIndex")
+	modelStates, ok := a.svc.Accounts().Models(authIndex)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("unknown account %q", authIndex))
+		return
+	}
+
+	type modelView struct {
+		accounts.ModelState
+		Status       string     `json:"status"`
+		StateLength  int        `json:"stateLength,omitempty"`
+		Source       string     `json:"source,omitempty"`
+		ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
+		BoundAt      *time.Time `json:"boundAt,omitempty"`
+		NextProbeAt  *time.Time `json:"nextProbeAt,omitempty"`
+		InFlight     bool       `json:"inFlight"`
+		MinReasoning string     `json:"minReasoning"`
+	}
+	out := make([]modelView, 0, len(modelStates))
+	for _, ms := range modelStates {
+		view := modelView{
+			ModelState:   ms,
+			Status:       states.StatusMissing.String(),
+			MinReasoning: string(a.svc.Models().MinReasoning(ms.Model)),
+		}
+		pair := states.Pair{AuthIndex: authIndex, Model: ms.Model}
+		if b, status := a.svc.States().Lookup(authIndex, ms.Model); status != states.StatusMissing {
+			view.Status = status.String()
+			view.StateLength = b.StateLength
+			view.Source = string(b.Source)
+			expires, bound := b.ExpiresAt, b.BoundAt
+			view.ExpiresAt, view.BoundAt = &expires, &bound
+		}
+		if at, ok := a.svc.ProbeScheduler().NextProbeAt(pair); ok && !at.IsZero() {
+			view.NextProbeAt = &at
+		}
+		view.InFlight = a.svc.ProbeScheduler().InFlight(pair)
+		out = append(out, view)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": out})
+}
+
+func (a *API) setProbeEnabled(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	authIndex := r.PathValue("authIndex")
+	model := r.PathValue("model")
+	if err := a.svc.Accounts().SetProbeEnabled(r.Context(), authIndex, model, body.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authIndex": authIndex, "model": model, "probeEnabled": body.Enabled,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// bindings
+
+// bindingView deliberately truncates the state value. The full value is
+// available only through the history endpoint's explicit expand parameter, so
+// it is not fanned out to every render of the account list.
+type bindingView struct {
+	AuthIndex    string    `json:"authIndex"`
+	Model        string    `json:"model"`
+	StatePrefix  string    `json:"statePrefix"`
+	StateLength  int       `json:"stateLength"`
+	Source       string    `json:"source"`
+	ProxyID      string    `json:"proxyId,omitempty"`
+	BoundAt      time.Time `json:"boundAt"`
+	ExpiresAt    time.Time `json:"expiresAt"`
+	Status       string    `json:"status"`
+	RemainingSec int       `json:"remainingSec"`
+}
+
+func (a *API) listBindings(w http.ResponseWriter, r *http.Request) {
+	now := a.now()
+	all := a.svc.States().All()
+	out := make([]bindingView, 0, len(all))
+	for _, b := range all {
+		out = append(out, a.toBindingView(b, now))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bindings": out})
+}
+
+func (a *API) toBindingView(b states.Binding, now time.Time) bindingView {
+	status := a.svc.States().StatusOf(b, now)
+	remaining := int(b.ExpiresAt.Sub(now).Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return bindingView{
+		AuthIndex:    b.AuthIndex,
+		Model:        b.Model,
+		StatePrefix:  prefix(b.StateValue, 8),
+		StateLength:  b.StateLength,
+		Source:       string(b.Source),
+		ProxyID:      b.ProxyID,
+		BoundAt:      b.BoundAt,
+		ExpiresAt:    b.ExpiresAt,
+		Status:       status.String(),
+		RemainingSec: remaining,
+	}
+}
+
+func (a *API) deleteBinding(w http.ResponseWriter, r *http.Request) {
+	pair := states.Pair{
+		AuthIndex: r.PathValue("authIndex"),
+		Model:     r.PathValue("model"),
+	}
+	if err := a.svc.States().Delete(r.Context(), pair, states.SourceManual); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Deleting a binding is an operator saying "this value is wrong"; re-probe
+	// it as soon as the next scan runs rather than waiting out the old backoff.
+	a.svc.ProbeScheduler().ProbeNow(pair)
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+func (a *API) bindingHistory(w http.ResponseWriter, r *http.Request) {
+	store, ok := a.svc.States().HistoryStore().(interface {
+		ListHistory(ctx context.Context, p states.Pair, limit, offset int) ([]states.HistoryEntry, error)
+	})
+	if !ok {
+		writeError(w, http.StatusNotImplemented, errors.New("history store unavailable"))
+		return
+	}
+	pair := states.Pair{
+		AuthIndex: r.PathValue("authIndex"),
+		Model:     r.PathValue("model"),
+	}
+	limit := intQuery(r, "limit", 50)
+	offset := intQuery(r, "offset", 0)
+
+	entries, err := store.ListHistory(r.Context(), pair, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	expand := r.URL.Query().Get("expand") == "1"
+	type historyView struct {
+		ID          int64     `json:"id"`
+		StatePrefix string    `json:"statePrefix"`
+		StateValue  string    `json:"stateValue,omitempty"`
+		StateLength int       `json:"stateLength"`
+		Source      string    `json:"source"`
+		Action      string    `json:"action"`
+		ProxyID     string    `json:"proxyId,omitempty"`
+		BoundAt     time.Time `json:"boundAt"`
+		CreatedAt   time.Time `json:"createdAt"`
+	}
+	out := make([]historyView, 0, len(entries))
+	for _, e := range entries {
+		view := historyView{
+			ID:          e.ID,
+			StatePrefix: prefix(e.StateValue, 8),
+			StateLength: e.StateLength,
+			Source:      string(e.Source),
+			Action:      string(e.Action),
+			ProxyID:     e.ProxyID,
+			BoundAt:     e.BoundAt,
+			CreatedAt:   e.CreatedAt,
+		}
+		if expand {
+			view.StateValue = e.StateValue
+		}
+		out = append(out, view)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"history": out, "limit": limit, "offset": offset})
+}
+
+func (a *API) clearBindingHistory(w http.ResponseWriter, r *http.Request) {
+	store, ok := a.svc.States().HistoryStore().(interface {
+		ClearHistory(ctx context.Context, p states.Pair) (int64, error)
+	})
+	if !ok {
+		writeError(w, http.StatusNotImplemented, errors.New("history store unavailable"))
+		return
+	}
+	pair := states.Pair{
+		AuthIndex: r.PathValue("authIndex"),
+		Model:     r.PathValue("model"),
+	}
+	n, err := store.ClearHistory(r.Context(), pair)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"deleted": n})
+}
+
+// ---------------------------------------------------------------------------
+// proxies
+
+type proxyView struct {
+	proxies.Node
+	Status string `json:"status"`
+}
+
+func (a *API) listProxies(w http.ResponseWriter, r *http.Request) {
+	now := a.now()
+	nodes := a.svc.Proxies().All()
+	out := make([]proxyView, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, proxyView{Node: n, Status: n.Status(now)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"proxies": out})
+}
+
+func (a *API) replaceProxies(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Proxies []proxies.Node `json:"proxies"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if err := a.svc.Proxies().ReplaceAll(r.Context(), body.Proxies); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.listProxies(w, r)
+}
+
+// ---------------------------------------------------------------------------
+// probe history
+
+func (a *API) probeHistory(w http.ResponseWriter, r *http.Request) {
+	limit := intQuery(r, "limit", 50)
+	offset := intQuery(r, "offset", 0)
+	if limit > 500 {
+		limit = 500
+	}
+
+	entries, err := a.svc.ProbeHistory().ListProbes(r.Context(), limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if entries == nil {
+		entries = []probe.HistoryEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"probes": entries, "limit": limit, "offset": offset})
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+		return false
+	}
+	return true
+}
+
+func intQuery(r *http.Request, key string, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
+// prefix returns the first n characters of s, used so the panel shows a
+// recognisable stub instead of the whole token.
+func prefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}

@@ -1,0 +1,666 @@
+package intercept
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/yangshoulai/codex-turn-state-manager/internal/headers"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
+)
+
+const targetLength = 292
+
+// ---------------------------------------------------------------------------
+// doubles
+
+type memSettingsStore struct {
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func (s *memSettingsStore) All(context.Context) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string, len(s.values))
+	for k, v := range s.values {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (s *memSettingsStore) PutMany(_ context.Context, values map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, v := range values {
+		s.values[k] = v
+	}
+	return nil
+}
+
+type memStateStore struct {
+	mu       sync.Mutex
+	bindings map[states.Pair]states.Binding
+	history  []states.HistoryEntry
+}
+
+func newMemStateStore() *memStateStore {
+	return &memStateStore{bindings: map[states.Pair]states.Binding{}}
+}
+
+func (s *memStateStore) UpsertBinding(_ context.Context, b states.Binding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bindings[b.Pair] = b
+	return nil
+}
+
+func (s *memStateStore) DeleteBinding(_ context.Context, p states.Pair) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.bindings, p)
+	return nil
+}
+
+func (s *memStateStore) ListBindings(context.Context) ([]states.Binding, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]states.Binding, 0, len(s.bindings))
+	for _, b := range s.bindings {
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+func (s *memStateStore) AppendHistory(_ context.Context, e states.HistoryEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.history = append(s.history, e)
+	return nil
+}
+
+func (s *memStateStore) ListHistory(context.Context, states.Pair, int, int) ([]states.HistoryEntry, error) {
+	return nil, nil
+}
+
+func (s *memStateStore) ClearHistory(context.Context, states.Pair) (int64, error) { return 0, nil }
+
+func (s *memStateStore) historyCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.history)
+}
+
+type fixedPolicy struct{ p states.Policy }
+
+func (f fixedPolicy) StatePolicy() states.Policy { return f.p }
+
+type resolver map[string]string
+
+func (r resolver) ResolveAuthID(authID string) (string, bool) {
+	idx, ok := r[authID]
+	return idx, ok
+}
+
+type harness struct {
+	settings  *settings.Manager
+	states    *states.Registry
+	store     *memStateStore
+	corr      *CorrelationManager
+	injector  *Injector
+	collector *Collector
+	clock     *time.Time
+}
+
+func newHarness(t *testing.T) *harness {
+	t.Helper()
+	ctx := context.Background()
+
+	manager, err := settings.NewManager(ctx, &memSettingsStore{values: map[string]string{}}, nil)
+	if err != nil {
+		t.Fatalf("settings.NewManager: %v", err)
+	}
+
+	store := newMemStateStore()
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	clock := &now
+
+	registry := states.NewRegistry(store, store, fixedPolicy{p: states.Policy{
+		TTL: time.Hour, RefreshThresholdPct: 15, TargetStateLength: targetLength,
+	}})
+	registry.SetClock(func() time.Time { return *clock })
+
+	corr := NewCorrelationManager(time.Hour)
+	corr.SetClock(func() time.Time { return *clock })
+
+	return &harness{
+		settings: manager,
+		states:   registry,
+		store:    store,
+		corr:     corr,
+		injector: NewInjector(InjectorConfig{
+			Settings: manager, States: registry,
+			Auth: resolver{"auth-id-1": "codex-auth-1"}, Corr: corr,
+		}),
+		collector: NewCollector(CollectorConfig{
+			Settings: manager, States: registry, Corr: corr,
+		}),
+		clock: clock,
+	}
+}
+
+func (h *harness) bind(t *testing.T, authIndex, model, value string) {
+	t.Helper()
+	if _, err := h.states.Bind(context.Background(), states.Binding{
+		Pair:       states.Pair{AuthIndex: authIndex, Model: model},
+		StateValue: value, Source: states.SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+}
+
+func stateOf(n int) string { return strings.Repeat("s", n) }
+
+func request(model string) *hostapi.InterceptedRequest {
+	return &hostapi.InterceptedRequest{
+		Stage:     hostapi.StageBeforeAuth,
+		RequestID: "req-1",
+		Provider:  hostapi.ProviderCodex,
+		Model:     model,
+		Headers:   http.Header{},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// correlation
+
+func TestCorrelation_RecordsAndCompletes(t *testing.T) {
+	c := NewCorrelationManager(time.Minute)
+	c.Begin("req-1", "gpt-5-codex", hostapi.ProviderCodex)
+	c.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+	c.MarkInjected("req-1", "value")
+
+	rec, ok := c.Get("req-1")
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if rec.AuthIndex != "codex-auth-1" || rec.AuthID != "auth-id-1" {
+		t.Errorf("auth = %s/%s, want codex-auth-1/auth-id-1", rec.AuthIndex, rec.AuthID)
+	}
+	if !rec.Injected || rec.StateValue != "value" {
+		t.Errorf("Injected = %v, state = %q", rec.Injected, rec.StateValue)
+	}
+
+	if _, ok := c.Complete("req-1"); !ok {
+		t.Error("Complete should return the record")
+	}
+	if _, ok := c.Get("req-1"); ok {
+		t.Error("the record should be gone after Complete")
+	}
+	if c.Len() != 0 {
+		t.Errorf("Len = %d, want 0", c.Len())
+	}
+}
+
+func TestCorrelation_SweepDropsExpiredEntries(t *testing.T) {
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	clock := &now
+	c := NewCorrelationManager(10 * time.Minute)
+	c.SetClock(func() time.Time { return *clock })
+
+	c.Begin("old", "m", hostapi.ProviderCodex)
+	*clock = clock.Add(11 * time.Minute)
+	c.Begin("fresh", "m", hostapi.ProviderCodex)
+
+	if dropped := c.Sweep(); dropped != 1 {
+		t.Errorf("Sweep dropped %d, want 1", dropped)
+	}
+	if _, ok := c.Get("old"); ok {
+		t.Error("the expired record should be gone")
+	}
+	if _, ok := c.Get("fresh"); !ok {
+		t.Error("the fresh record should survive")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BeforeAuth
+
+func TestBeforeAuth_InjectsOnlyTheCorrelationMarker(t *testing.T) {
+	h := newHarness(t)
+	req := request("gpt-5-codex")
+
+	got := h.injector.BeforeAuth(req)
+	if got.Action != ActionCorrelated {
+		t.Errorf("action = %s, want correlated", got.Action)
+	}
+	if req.Headers.Get(headers.Correlation) != "req-1" {
+		t.Errorf("correlation header = %q, want req-1", req.Headers.Get(headers.Correlation))
+	}
+	// State must not be injected yet: BeforeAuth runs before CPA picks an
+	// account, so there is no binding to look up.
+	if req.Headers.Get(headers.TurnState) != "" {
+		t.Error("BeforeAuth must not inject turn state")
+	}
+}
+
+func TestBeforeAuth_PassesThroughWhenMasterSwitchOff(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	off := false
+	if _, err := h.settings.Update(ctx, settings.Patch{GlobalEnabled: &off}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	req := request("gpt-5-codex")
+	if got := h.injector.BeforeAuth(req); got.Action != ActionPassthrough {
+		t.Errorf("action = %s, want passthrough", got.Action)
+	}
+	if req.Headers.Get(headers.Correlation) != "" {
+		t.Error("no correlation marker may be added while the master switch is off")
+	}
+	if h.corr.Len() != 0 {
+		t.Error("no correlation state may be written while the master switch is off")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AfterAuth
+
+func TestAfterAuth_InjectsBoundStateAndStripsTheMarker(t *testing.T) {
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	got := h.injector.AfterAuth(req)
+	if got.Action != ActionInjected {
+		t.Fatalf("action = %s, want injected", got.Action)
+	}
+	if len(req.Headers.Get(headers.TurnState)) != targetLength {
+		t.Errorf("injected state length = %d, want %d", len(req.Headers.Get(headers.TurnState)), targetLength)
+	}
+	// The marker is internal and must never reach upstream, even when state is
+	// injected.
+	if req.Headers.Get(headers.Correlation) != "" {
+		t.Error("the correlation header must be stripped before the request leaves")
+	}
+
+	rec, ok := h.corr.Get("req-1")
+	if !ok || !rec.Injected {
+		t.Error("the injection must be recorded, since self-healing depends on it")
+	}
+}
+
+func TestAfterAuth_StripsMarkerEvenWithoutState(t *testing.T) {
+	h := newHarness(t)
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	got := h.injector.AfterAuth(req)
+	if got.Action != ActionNoBinding {
+		t.Errorf("action = %s, want no_binding", got.Action)
+	}
+	if req.Headers.Get(headers.Correlation) != "" {
+		t.Error("the correlation header must be stripped even when nothing is injected")
+	}
+}
+
+func TestAfterAuth_ResolvesAuthIDWhenCorrelationIsMissing(t *testing.T) {
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	req.Stage = hostapi.StageAfterAuth
+	req.AuthID = "auth-id-1" // no BeforeAuth ran
+
+	got := h.injector.AfterAuth(req)
+	if got.Action != ActionInjected {
+		t.Fatalf("action = %s, want injected via AuthID resolution", got.Action)
+	}
+	if got.AuthIndex != "codex-auth-1" {
+		t.Errorf("resolved authIndex = %q, want codex-auth-1", got.AuthIndex)
+	}
+}
+
+func TestAfterAuth_IgnoresExpiredBinding(t *testing.T) {
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+	*h.clock = h.clock.Add(2 * time.Hour)
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	if got := h.injector.AfterAuth(req); got.Action != ActionNoBinding {
+		t.Errorf("action = %s, want no_binding for an expired state", got.Action)
+	}
+	if req.Headers.Get(headers.TurnState) != "" {
+		t.Error("expired state must not be injected")
+	}
+}
+
+func TestAfterAuth_DoesNotInjectWhenMasterSwitchOff(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	off := false
+	if _, err := h.settings.Update(ctx, settings.Patch{GlobalEnabled: &off}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if got := h.injector.AfterAuth(req); got.Action != ActionPassthrough {
+		t.Errorf("action = %s, want passthrough", got.Action)
+	}
+	if req.Headers.Get(headers.TurnState) != "" {
+		t.Error("state must not be injected while the master switch is off")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// response capture
+
+func response(model string, value string) hostapi.ResponseHeaders {
+	h := http.Header{}
+	if value != "" {
+		h.Set(headers.TurnState, value)
+	}
+	return hostapi.ResponseHeaders{
+		RequestID: "req-1", Model: model, Status: 200, Header: h,
+	}
+}
+
+func TestObserve_BindsTargetLengthFromTraffic(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	got := h.collector.Observe(ctx, response("gpt-5-codex", stateOf(targetLength)))
+	if got.Action != CaptureBound || !got.Bound {
+		t.Fatalf("action = %s (bound %v), want bound", got.Action, got.Bound)
+	}
+
+	binding, status := h.states.Lookup("codex-auth-1", "gpt-5-codex")
+	if !status.Usable() {
+		t.Fatalf("status = %s, want a usable binding", status)
+	}
+	if len(binding.StateValue) != targetLength {
+		t.Errorf("bound length = %d, want %d", len(binding.StateValue), targetLength)
+	}
+	if binding.Source != states.SourceTraffic {
+		t.Errorf("source = %s, want traffic", binding.Source)
+	}
+	if h.store.historyCount() != 1 {
+		t.Errorf("history rows = %d, want 1", h.store.historyCount())
+	}
+}
+
+// TestObserve_RefreshesWithoutRecordingHistory pins the rule that normal
+// traffic must not flood the history table.
+func TestObserve_RefreshesWithoutRecordingHistory(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	value := stateOf(targetLength)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", value)
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+	if got := h.injector.AfterAuth(req); got.Action != ActionInjected {
+		t.Fatalf("setup: action = %s, want injected", got.Action)
+	}
+
+	before := h.store.historyCount()
+	*h.clock = h.clock.Add(10 * time.Minute)
+
+	got := h.collector.Observe(ctx, response("gpt-5-codex", value))
+	if got.Action != CaptureRefreshed || !got.Refreshed {
+		t.Fatalf("action = %s, want refreshed", got.Action)
+	}
+	if h.store.historyCount() != before {
+		t.Error("a same-value refresh must not append a history row")
+	}
+
+	// The TTL moved forward even though the value did not.
+	binding, _ := h.states.Lookup("codex-auth-1", "gpt-5-codex")
+	if !binding.BoundAt.Equal(*h.clock) {
+		t.Errorf("BoundAt = %v, want %v (the TTL should have been extended)", binding.BoundAt, *h.clock)
+	}
+}
+
+// TestObserve_RejectsNonTargetLength is F-15: record it, never bind it.
+func TestObserve_RejectsNonTargetLength(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	for _, n := range []int{0, 100, targetLength - 1, targetLength + 1} {
+		*h.clock = h.clock.Add(time.Second)
+		req := request("gpt-5-codex")
+		h.injector.BeforeAuth(req)
+		h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+		got := h.collector.Observe(ctx, response("gpt-5-codex", stateOf(n)))
+		if n == 0 {
+			if got.Action != CaptureIgnored {
+				t.Errorf("length 0: action = %s, want ignored", got.Action)
+			}
+		} else if got.Action != CaptureNonTarget {
+			t.Errorf("length %d: action = %s, want non_target", n, got.Action)
+		}
+	}
+
+	if _, status := h.states.Lookup("codex-auth-1", "gpt-5-codex"); status != states.StatusMissing {
+		t.Error("a non-target length must never create a binding")
+	}
+	if h.store.historyCount() != 0 {
+		t.Errorf("history rows = %d, want 0", h.store.historyCount())
+	}
+}
+
+func TestObserve_IgnoredWhenCaptureSwitchOff(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	off := false
+	if _, err := h.settings.Update(ctx, settings.Patch{GlobalReverseBindEnabled: &off}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	got := h.collector.Observe(ctx, response("gpt-5-codex", stateOf(targetLength)))
+	if got.Action != CaptureSkipped {
+		t.Errorf("action = %s, want skipped", got.Action)
+	}
+	if _, status := h.states.Lookup("codex-auth-1", "gpt-5-codex"); status != states.StatusMissing {
+		t.Error("no binding may be created while reverse binding is off")
+	}
+}
+
+// TestObserve_DoesNotRefreshExistingBindingWhenCaptureOff covers the subtler
+// half of the switch: an existing binding must not have its TTL extended
+// either, or "off" would still mean "partially on".
+func TestObserve_DoesNotRefreshExistingBindingWhenCaptureOff(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	value := stateOf(targetLength)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", value)
+
+	before, _ := h.states.Lookup("codex-auth-1", "gpt-5-codex")
+
+	off := false
+	if _, err := h.settings.Update(ctx, settings.Patch{GlobalReverseBindEnabled: &off}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := h.injector.BeforeAuth(&hostapi.InterceptedRequest{
+		RequestID: "req-1", Model: "gpt-5-codex", Headers: http.Header{},
+	}); got.Action != ActionPassthrough {
+		t.Logf("note: BeforeAuth action = %s", got.Action)
+	}
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+
+	*h.clock = h.clock.Add(20 * time.Minute)
+	h.collector.Observe(ctx, response("gpt-5-codex", value))
+
+	after, _ := h.states.Lookup("codex-auth-1", "gpt-5-codex")
+	if !after.BoundAt.Equal(before.BoundAt) {
+		t.Errorf("BoundAt moved from %v to %v; the TTL must not be refreshed while capture is off",
+			before.BoundAt, after.BoundAt)
+	}
+}
+
+func TestObserve_WithoutCorrelationIsIgnored(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	got := h.collector.Observe(ctx, response("gpt-5-codex", stateOf(targetLength)))
+	if got.Action != CaptureNoAuth {
+		t.Errorf("action = %s, want no_auth", got.Action)
+	}
+	if _, status := h.states.Lookup("codex-auth-1", "gpt-5-codex"); status != states.StatusMissing {
+		t.Error("no binding may be created without a known account")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// self-healing
+
+func TestObserveFailure_InvalidatesInjectedState(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+	if got := h.injector.AfterAuth(req); got.Action != ActionInjected {
+		t.Fatalf("setup: action = %s, want injected", got.Action)
+	}
+
+	got := h.collector.ObserveFailure(ctx, "req-1", 400,
+		[]byte(`{"error":{"code":"previous_response_not_found"}}`))
+	if !got.Invalidated {
+		t.Fatal("expected the binding to be invalidated")
+	}
+	if _, status := h.states.Lookup("codex-auth-1", "gpt-5-codex"); status != states.StatusMissing {
+		t.Error("the bad binding should be gone")
+	}
+}
+
+// TestObserveFailure_IgnoresRequestsThatCarriedNoInjectedState is the
+// precondition in design doc 3.12: an unrelated failure must not throw away
+// good state.
+func TestObserveFailure_IgnoresRequestsThatCarriedNoInjectedState(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+	// AfterAuth is deliberately not called, so nothing was injected.
+
+	got := h.collector.ObserveFailure(ctx, "req-1", 400,
+		[]byte(`{"error":{"code":"previous_response_not_found"}}`))
+	if got.Invalidated {
+		t.Error("a request without injected state must not invalidate a binding")
+	}
+	if _, status := h.states.Lookup("codex-auth-1", "gpt-5-codex"); !status.Usable() {
+		t.Error("the binding should have survived")
+	}
+}
+
+func TestObserveFailure_RequiresARepeatableSignal(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	for i := 1; i <= consecutive5xxLimit; i++ {
+		id := "req-" + string(rune('0'+i))
+
+		req := request("gpt-5-codex")
+		req.RequestID = id
+		h.injector.BeforeAuth(req)
+		h.corr.AttachAuth(id, "auth-id-1", "codex-auth-1")
+		if got := h.injector.AfterAuth(req); got.Action != ActionInjected {
+			t.Fatalf("iteration %d: setup expected injection, got %s", i, got.Action)
+		}
+
+		got := h.collector.ObserveFailure(ctx, id, 503, nil)
+		if i < consecutive5xxLimit {
+			if got.Invalidated {
+				t.Fatalf("failure %d of %d invalidated too early", i, consecutive5xxLimit)
+			}
+			continue
+		}
+		if !got.Invalidated {
+			t.Fatalf("failure %d should have invalidated the binding", i)
+		}
+	}
+}
+
+func TestObserveFailure_IgnoresUnrelatedErrors(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+	h.injector.AfterAuth(req)
+
+	// A 400 that does not mention the routing failure is not evidence that the
+	// injected state is bad.
+	got := h.collector.ObserveFailure(ctx, "req-1", 400, []byte(`{"error":{"code":"invalid_request"}}`))
+	if got.Invalidated {
+		t.Error("an unrelated 400 must not invalidate the binding")
+	}
+	if _, status := h.states.Lookup("codex-auth-1", "gpt-5-codex"); !status.Usable() {
+		t.Error("the binding should have survived")
+	}
+}
+
+func TestObserveFailure_SkippedWhenMasterSwitchOff(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.bind(t, "codex-auth-1", "gpt-5-codex", stateOf(targetLength))
+
+	req := request("gpt-5-codex")
+	h.injector.BeforeAuth(req)
+	h.corr.AttachAuth("req-1", "auth-id-1", "codex-auth-1")
+	h.injector.AfterAuth(req)
+
+	off := false
+	if _, err := h.settings.Update(ctx, settings.Patch{GlobalEnabled: &off}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if got := h.collector.ObserveFailure(ctx, "req-1", 400,
+		[]byte("previous_response_not_found")); got.Invalidated {
+		t.Error("self-healing must not run while the master switch is off")
+	}
+}

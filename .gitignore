@@ -1,0 +1,23 @@
+# Build output
+/dist/
+*.so
+*.dylib
+*.dll
+*.h
+
+# Plugin runtime data (SQLite database, WAL sidecars, backups)
+plugin-data/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+
+# Local dev harness scratch space
+/tmp/
+.local/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
