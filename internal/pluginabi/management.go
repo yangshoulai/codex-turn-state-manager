@@ -88,6 +88,13 @@ func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 		})
 	}
 
+	p.mu.Lock()
+	p.resourceBase = strings.TrimSuffix(strings.TrimSpace(req.ResourceBasePath), "/")
+	if p.resourceBase == "" {
+		p.resourceBase = version.ResourceBasePath
+	}
+	p.mu.Unlock()
+
 	p.logf(hostapi.LogInfo, "management routes registered", map[string]any{
 		"basePath": req.BasePath, "prefix": prefix,
 		"routes": len(routes), "resources": len(resources),
@@ -108,11 +115,13 @@ func resourceMenuLabel(path string) string {
 	return ""
 }
 
-// handleManagement dispatches one Management API request.
+// handleManagement dispatches one Management API or resource request.
 //
-// The plugin's existing handlers are ordinary net/http handlers, so the request
-// is replayed through them and the recorded response is handed back. That keeps
-// one implementation of every endpoint rather than a second, ABI-specific copy.
+// The host uses management.handle for both a plugin's management routes and its
+// browser-navigable resources, so the path decides which handler runs. Resource
+// paths must not be replayed through the management mux: that mux is mounted at
+// the management base path, so a resource path falls through it and the panel
+// gets a 404 even though the host dispatched correctly.
 func (p *Plugin) handleManagement(request []byte) ([]byte, error) {
 	a := p.current()
 	if a == nil {
@@ -124,6 +133,10 @@ func (p *Plugin) handleManagement(request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, fmt.Errorf("decode management request: %w", err)
 		}
+	}
+
+	if base := p.resourceBasePath(); pathIsUnder(req.Path, base) {
+		return serveResource(req.Path, base, req.Method)
 	}
 
 	// The plugin's mux is mounted at the management base path, and the host
@@ -158,6 +171,46 @@ func (p *Plugin) handleManagement(request []byte) ([]byte, error) {
 		Body:       body,
 	}
 	return okEnvelope(resp)
+}
+
+// pathIsUnder reports whether path names base itself or something below it.
+func pathIsUnder(path, base string) bool {
+	if base == "" {
+		return false
+	}
+	return path == base || strings.HasPrefix(path, base+"/")
+}
+
+// serveResource answers a browser-navigable resource request from the embedded
+// panel assets.
+func serveResource(path, base, method string) ([]byte, error) {
+	if method != "" && !strings.EqualFold(method, http.MethodGet) {
+		return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusMethodNotAllowed})
+	}
+
+	name := strings.TrimPrefix(path, base)
+	if name == "" || name == "/" {
+		// The host rejects a bare "/" resource route, so this is only reached
+		// if a caller asks for the directory directly.
+		name = "/index.html"
+	}
+
+	raw, err := web.ReadAsset(name)
+	if err != nil {
+		return okEnvelope(pluginapi.ManagementResponse{
+			StatusCode: http.StatusNotFound,
+			Body:       []byte("not found"),
+		})
+	}
+
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers: http.Header{
+			"Content-Type":  []string{web.ContentType(name)},
+			"Cache-Control": []string{"no-cache"},
+		},
+		Body: raw,
+	})
 }
 
 func cloneHeader(in http.Header) http.Header {

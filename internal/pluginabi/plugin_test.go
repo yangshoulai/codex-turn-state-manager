@@ -617,3 +617,69 @@ func TestManagementHandle_QueryParametersSurvive(t *testing.T) {
 		t.Errorf("limit = %d, want 5; query parameters were dropped in the bridge", payload.Limit)
 	}
 }
+
+// TestManagementHandleServesResourcePaths covers the path that made the panel
+// unreachable in a real instance.
+//
+// The host uses management.handle for both a plugin's management routes and its
+// browser-navigable resources. Replaying a resource path through the management
+// mux, which is mounted at the management base path, yields a 404 -- and the
+// host reports the dispatch as successful, so the failure is invisible from the
+// plugin side.
+func TestManagementHandleServesResourcePaths(t *testing.T) {
+	p := newTestPlugin(t, authListCaller())
+
+	// Registration tells the plugin where its resources live.
+	regBody, _ := json.Marshal(pluginapi.ManagementRegistrationRequest{
+		BasePath:         version.ManagementBasePath[:len("/v0/management")],
+		ResourceBasePath: version.ResourceBasePath,
+	})
+	if _, err := p.Handle(pluginabi.MethodManagementRegister, regBody); err != nil {
+		t.Fatalf("management.register: %v", err)
+	}
+
+	for _, asset := range web.Assets {
+		t.Run(asset, func(t *testing.T) {
+			body, _ := json.Marshal(pluginapi.ManagementRequest{
+				Method: http.MethodGet,
+				Path:   version.ResourceBasePath + asset,
+			})
+			raw, err := p.Handle(pluginabi.MethodManagementHandle, body)
+			if err != nil {
+				t.Fatalf("management.handle: %v", err)
+			}
+
+			var resp pluginapi.ManagementResponse
+			if err := json.Unmarshal(resultOf(t, raw), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 for resource %s", resp.StatusCode, asset)
+			}
+			if len(resp.Body) == 0 {
+				t.Fatalf("resource %s served an empty body", asset)
+			}
+			if got := resp.Headers.Get("Content-Type"); got != web.ContentType(asset) {
+				t.Errorf("Content-Type = %q, want %q", got, web.ContentType(asset))
+			}
+		})
+	}
+
+	// A path under the resource base that is not an asset is a 404, not a
+	// management lookup.
+	body, _ := json.Marshal(pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   version.ResourceBasePath + "/nope.js",
+	})
+	raw, err := p.Handle(pluginabi.MethodManagementHandle, body)
+	if err != nil {
+		t.Fatalf("management.handle: %v", err)
+	}
+	var resp pluginapi.ManagementResponse
+	if err := json.Unmarshal(resultOf(t, raw), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for an unknown asset", resp.StatusCode)
+	}
+}

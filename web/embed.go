@@ -10,6 +10,7 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html app.js style.css
@@ -17,6 +18,12 @@ var assets embed.FS
 
 // FS returns the panel's static file system.
 func FS() fs.FS { return assets }
+
+// ReadAsset returns one embedded asset by its route path (leading slash
+// optional).
+func ReadAsset(name string) ([]byte, error) {
+	return assets.ReadFile(strings.TrimPrefix(name, "/"))
+}
 
 // Assets lists the files the panel is made of.
 //
@@ -53,12 +60,13 @@ func serveAsset(w http.ResponseWriter, r *http.Request, name string) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", contentType(name))
+	w.Header().Set("Content-Type", ContentType(name))
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(raw)
 }
 
-func contentType(name string) string {
+// ContentType maps an asset name to its Content-Type.
+func ContentType(name string) string {
 	switch {
 	case len(name) > 5 && name[len(name)-5:] == ".html":
 		return "text/html; charset=utf-8"

@@ -344,13 +344,8 @@ records each one with its evidence. Only one item is still genuinely unverified.
   interceptors, the scheduler and response capture have never been driven by an
   actual request. That is the remaining gap before this can be called
   production-ready.
-- **Resource route serving.** On v7.3.7 the panel's asset routes register but
-  answer 404, for this plugin and for CPA's own `examples/plugin/management-api`
-  alike, so it is host-side rather than a defect here. The panel is not reachable
-  until that is understood.
-
-Two host behaviours that cost debugging time and are easy to trip over again,
-both of which fail silently from the plugin's side:
+Three host behaviours that cost debugging time, all of which fail silently from
+the plugin's side and none of which are visible without a real instance:
 
 - CPA's `validPlugin` rejects a registration whose Name, Version, **Author** or
   GitHubRepository is blank, and it rejects it by discarding *every* declared
@@ -358,6 +353,9 @@ both of which fail silently from the plugin's side:
 - Management route paths must include the `plugins/<pluginID>` segment, because
   the host resolves them as `<BasePath> + <Path>`. Resource routes are the
   opposite: the host inserts that segment itself.
+- `management.handle` carries **both** management and resource requests, so the
+  plugin must branch on the path. Replaying a resource path through the
+  management mux returns 404 while the host reports the dispatch as successful.
 
 ---
 

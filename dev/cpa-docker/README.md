@@ -19,8 +19,9 @@ make cpa-docker-down    # stop and remove the container
 
 Then:
 
-* panel: <http://127.0.0.1:18317/v0/resource/plugins/codex-turn-state-manager/index.html>
-  (see the caveat below — this currently 404s on v7.3.7)
+* panel: <http://127.0.0.1:18317/v0/resource/plugins/codex-turn-state-manager/index.html>,
+  or through the host's management UI at
+  <http://127.0.0.1:18317/management.html#/plugin-pages/codex-turn-state-manager/0>
 * the plugin's own API:
   `curl -H 'Authorization: Bearer local-dev-key' http://127.0.0.1:18317/v0/management/plugins/codex-turn-state-manager/status`
 
@@ -44,10 +45,13 @@ own side:
   never called. CPA requires Name, Version, Author and GitHubRepository to be
   non-empty. Both of those have been the cause at least once.
 * A route that answers 404 despite being listed in
-  `GET /v0/management/plugins`. Management routes must carry the
-  `plugins/<pluginID>` segment themselves, because the host resolves them as
-  `<BasePath> + <Path>`. Resource routes are the opposite — the host adds the
-  segment for those.
+  `GET /v0/management/plugins`. Two separate causes have been hit here:
+  * Management route paths must carry the `plugins/<pluginID>` segment
+    themselves, because the host resolves them as `<BasePath> + <Path>`.
+    Resource routes are the opposite — the host adds the segment for those.
+  * `management.handle` carries **both** management and resource requests, so
+    the plugin has to branch on the path. Replaying a resource path through the
+    management mux 404s while the host reports the dispatch as successful.
 
 ## Adding a Codex account
 
@@ -59,10 +63,10 @@ selected). To exercise probing end to end, drop a Codex auth JSON into
 Without one you can still verify the load, the registration handshake, the
 capability declaration, the management routes, and the panel's asset routes.
 
-## Caveat: resource routes
+## Diagnosing a route that 404s
 
-On v7.3.7 the resource routes currently 404, for this plugin and for CPA's own
-`examples/plugin/management-api` alike. They register correctly — the host lists
-them under `menus` in `GET /v0/management/plugins` — and are then not served.
-That is a host-side behaviour, not something the plugin can fix; the plugin's
-management API, which is the part that carries the data, works.
+When a plugin route 404s, the host log alone will not tell you which side failed:
+the dispatch is reported as successful either way. Build CPA with a debug print
+at the dispatch point to find out — that is how the `management.handle` branch
+above was found. `/tmp/cpa-src` in this repo's history is a clone of
+`router-for-me/CLIProxyAPI` at the version the image runs.

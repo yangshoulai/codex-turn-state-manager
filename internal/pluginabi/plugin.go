@@ -51,6 +51,9 @@ type Plugin struct {
 	host *HostClient
 	// caller is retained so a reconfigure can rebuild the host facade.
 	caller Caller
+	// resourceBase is the browser-navigable resource prefix the host handed
+	// over at registration, used to tell resource requests from management ones.
+	resourceBase string
 
 	logf func(hostapi.LogLevel, string, map[string]any)
 }
@@ -103,6 +106,17 @@ func (p *Plugin) Handle(method string, request []byte) ([]byte, error) {
 	default:
 		return errorEnvelope("unknown_method", "unsupported method: "+method), nil
 	}
+}
+
+// resourceBasePath returns the resource prefix, falling back to the documented
+// layout if registration has not supplied one.
+func (p *Plugin) resourceBasePath() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.resourceBase != "" {
+		return p.resourceBase
+	}
+	return version.ResourceBasePath
 }
 
 // Stop shuts the plugin down. Safe to call more than once.
