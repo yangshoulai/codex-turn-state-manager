@@ -51,16 +51,51 @@ function decodePanelStorage(raw) {
   return JSON.parse(text);
 }
 
-// readInheritedKey returns the management key the management center is holding,
-// or an empty string when there is nothing usable to inherit.
+/*
+ * readInheritedKey reports what could be inherited, and why not when it could
+ * not. The distinction matters to the operator: the management center only
+ * persists the key when "remember password" was ticked at login, so a session
+ * that exists but carries no key is a different problem from no session at all,
+ * and the panel should say which one it hit rather than silently showing a
+ * login form.
+ */
 function readInheritedKey() {
+  let raw = null;
   try {
-    const parsed = decodePanelStorage(localStorage.getItem(CPA_SESSION_KEY));
-    const state = parsed && parsed.state ? parsed.state : parsed;
-    const value = state && state.managementKey;
-    return typeof value === "string" ? value.trim() : "";
+    raw = localStorage.getItem(CPA_SESSION_KEY);
   } catch {
-    return "";
+    return { key: "", reason: "storage-unavailable" };
+  }
+  if (!raw) return { key: "", reason: "no-session" };
+
+  let state;
+  try {
+    const parsed = decodePanelStorage(raw);
+    state = parsed && parsed.state ? parsed.state : parsed;
+  } catch {
+    return { key: "", reason: "undecodable" };
+  }
+  if (!state) return { key: "", reason: "undecodable" };
+
+  const value = state.managementKey;
+  if (typeof value !== "string" || !value.trim()) {
+    // The session was found but the key was not persisted with it.
+    return { key: "", reason: "session-without-key" };
+  }
+  return { key: value.trim(), reason: "ok" };
+}
+
+// inheritHint turns a failure reason into something the operator can act on.
+function inheritHint(reason) {
+  switch (reason) {
+    case "session-without-key":
+      return "检测到管理面板会话，但其中没有保存密钥 —— 登录管理面板时需勾选「记住密码」，否则密钥只存在于页面内存中，插件无法读取。你也可以直接在此输入。";
+    case "undecodable":
+      return "检测到管理面板会话，但格式无法识别（CPA 可能更改了存储格式）。请在此手动输入密钥。";
+    case "storage-unavailable":
+      return "浏览器禁止访问本地存储，无法沿用管理面板会话。请手动输入密钥。";
+    default:
+      return "";
   }
 }
 
@@ -252,17 +287,19 @@ $("gate-form").addEventListener("submit", async (event) => {
 // and only ask when that is unavailable or no longer valid.
 (async function bootstrap() {
   const inherited = readInheritedKey();
-  if (inherited) {
+  if (inherited.key) {
     try {
-      await connectWith(inherited);
+      await connectWith(inherited.key);
       return;
     } catch {
       // The inherited key was rejected, or the API is unreachable. Fall through
       // to asking rather than leaving the operator with an error they cannot act on.
       managementKey = "";
+      showGate("沿用的管理面板会话已失效，请重新输入密钥。");
+      return;
     }
   }
-  showGate();
+  showGate(inheritHint(inherited.reason));
 })();
 
 /* ------------------------------------------------------------- settings */

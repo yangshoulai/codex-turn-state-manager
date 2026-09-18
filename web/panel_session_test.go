@@ -47,21 +47,40 @@ if (start < 0 || end < 0) { console.error('panel decode helpers not found'); pro
 const build = new Function('location', 'navigator', 'localStorage', 'atob', 'btoa',
   src.slice(start, end) + '\nreturn { readInheritedKey };');
 
-const blob = encode(JSON.stringify({ state: { managementKey: 'local-key' } }));
-const fromBlob = build({ host: 'example.test:8317' }, { userAgent: 'Mozilla/5.0 (Test)' },
-  { getItem: () => blob }, atob, btoa).readInheritedKey();
-if (fromBlob !== 'local-key') { console.error('obfuscated session decoded to ' + JSON.stringify(fromBlob)); process.exit(1); }
+function inherit(store) {
+  return build({ host: 'example.test:8317' }, { userAgent: 'Mozilla/5.0 (Test)' },
+    store, atob, btoa).readInheritedKey();
+}
+function expect(name, got, want) {
+  if (got.key !== want.key || got.reason !== want.reason) {
+    console.error(name + ': got ' + JSON.stringify(got) + ', want ' + JSON.stringify(want));
+    process.exit(1);
+  }
+}
 
-// Plain JSON must still work, so a change of format degrades to the login
-// prompt instead of breaking outright.
-const fromPlain = build({ host: 'example.test:8317' }, { userAgent: 'Mozilla/5.0 (Test)' },
-  { getItem: () => JSON.stringify({ managementKey: 'plain-key' }) }, atob, btoa).readInheritedKey();
-if (fromPlain !== 'plain-key') { console.error('plain session decoded to ' + JSON.stringify(fromPlain)); process.exit(1); }
+// A remembered session carries the key.
+expect('remembered session',
+  inherit({ getItem: () => encode(JSON.stringify({ state: { managementKey: 'local-key' } })) }),
+  { key: 'local-key', reason: 'ok' });
 
-// A foreign or corrupt blob yields nothing rather than throwing.
-const fromJunk = build({ host: 'example.test:8317' }, { userAgent: 'Mozilla/5.0 (Test)' },
-  { getItem: () => 'enc::v1::not-valid-base64!!' }, atob, btoa).readInheritedKey();
-if (fromJunk !== '') { console.error('corrupt session decoded to ' + JSON.stringify(fromJunk)); process.exit(1); }
+// Plain JSON still works, so a format change degrades to the login prompt
+// rather than breaking outright.
+expect('plain session',
+  inherit({ getItem: () => JSON.stringify({ managementKey: 'plain-key' }) }),
+  { key: 'plain-key', reason: 'ok' });
+
+// The management center only persists the key when "remember password" was
+// ticked. That case must be reported distinctly, or the operator sees a login
+// form with no idea why.
+expect('session without key',
+  inherit({ getItem: () => encode(JSON.stringify({ state: { apiBase: '/v0/management', rememberPassword: false } })) }),
+  { key: '', reason: 'session-without-key' });
+
+expect('no session', inherit({ getItem: () => null }), { key: '', reason: 'no-session' });
+
+expect('corrupt session',
+  inherit({ getItem: () => 'enc::v1::not-valid-base64!!' }),
+  { key: '', reason: 'undecodable' });
 
 process.exit(0);
 `
