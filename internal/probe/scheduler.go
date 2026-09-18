@@ -67,6 +67,9 @@ type Scheduler struct {
 	// lastScanAt is stamped at the top of every scan, before any gate. Zero
 	// means the loop has never ticked.
 	lastScanAt time.Time
+	// syncTimeout bounds the in-scan account sync. Field rather than constant so
+	// a test can shrink it.
+	syncTimeout time.Duration
 
 	// sem is the probe concurrency limit. It is re-sized when the configured
 	// value changes, which is why it is rebuilt rather than fixed at start.
@@ -97,12 +100,16 @@ type SchedulerConfig struct {
 // NewScheduler builds a scheduler.
 func NewScheduler(cfg SchedulerConfig) *Scheduler {
 	return &Scheduler{
-		src:    cfg.Source,
-		logf:   cfg.Log,
-		now:    time.Now,
-		pairs:  map[states.Pair]*pairState{},
-		stop:   make(chan struct{}),
-		jitter: func(n time.Duration) time.Duration { return time.Duration(time.Now().UnixNano() % int64(max(n, 1))) }}
+		src:  cfg.Source,
+		logf: cfg.Log,
+		now:  time.Now,
+		// Matches the initial sync in app.Start. Zero would make every in-scan
+		// sync expire before it was sent, which is why it is set here and not
+		// left to the field's zero value.
+		syncTimeout: 30 * time.Second,
+		pairs:       map[states.Pair]*pairState{},
+		stop:        make(chan struct{}),
+		jitter:      func(n time.Duration) time.Duration { return time.Duration(time.Now().UnixNano() % int64(max(n, 1))) }}
 }
 
 // SetClock overrides the time source. Tests only.
@@ -187,9 +194,18 @@ func (s *Scheduler) Scan(ctx context.Context) {
 	// CPA host API, and the account list changes far less often than the probe
 	// schedule does.
 	if now.Sub(s.lastSyncAt()) >= settingsNow.AccountSyncInterval {
-		if n, err := s.src.EnabledPairSource().Sync(ctx); err != nil {
+		// Bounded, and this is the only thing here that talks to the host. The
+		// sync runs on the scan goroutine, so a call that never returns stops
+		// every future scan: no pair is ever scheduled again, with no error and
+		// no log line. The initial sync in app.Start already carries a timeout;
+		// this one did not, which is an asymmetry rather than a decision.
+		syncCtx, cancelSync := context.WithTimeout(ctx, s.syncTimeout)
+		n, err := s.src.EnabledPairSource().Sync(syncCtx)
+		cancelSync()
+		switch {
+		case err != nil:
 			s.log(hostapi.LogWarn, "account sync failed", map[string]any{"error": err.Error()})
-		} else {
+		default:
 			s.log(hostapi.LogDebug, "account sync complete", map[string]any{"accounts": n})
 			s.markSynced(now)
 		}

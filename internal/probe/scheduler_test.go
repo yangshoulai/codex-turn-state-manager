@@ -86,6 +86,9 @@ type fakePairs struct {
 	pairs   []states.Pair
 	syncs   int
 	syncErr error
+	// syncBlocks, when set, holds Sync until the channel is closed or the
+	// caller's context expires. It stands in for a host call that hangs.
+	syncBlocks chan struct{}
 }
 
 func (f *fakePairs) EnabledPairs() []states.Pair {
@@ -96,11 +99,23 @@ func (f *fakePairs) EnabledPairs() []states.Pair {
 	return out
 }
 
-func (f *fakePairs) Sync(context.Context) (int, error) {
+func (f *fakePairs) Sync(ctx context.Context) (int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	blocks := f.syncBlocks
 	f.syncs++
-	return len(f.pairs), f.syncErr
+	n := len(f.pairs)
+	f.mu.Unlock()
+
+	if blocks != nil {
+		select {
+		case <-blocks:
+		case <-ctx.Done():
+			// A real host call is expected to honour the context; the test is
+			// that the caller bounded it at all.
+			return 0, ctx.Err()
+		}
+	}
+	return n, f.syncErr
 }
 
 func (f *fakePairs) syncCount() int {
@@ -513,5 +528,36 @@ func TestSchedulerScanHealthStampsEveryTick(t *testing.T) {
 	}
 	if !stamped.Equal(h.clock.Now()) {
 		t.Errorf("LastScanAt = %v, want the scheduler clock %v", stamped, h.clock.Now())
+	}
+}
+
+// TestSchedulerScanSurvivesASlowSync is the guard for a scan loop that stops
+// forever.
+//
+// The account sync runs on the scan goroutine and is the only thing in a scan
+// that talks to the host. Unbounded, a call that never returns ends every future
+// scan: no pair is scheduled again, nothing is logged, and the panel shows
+// overdue pairs that simply never run. The initial sync carried a timeout and
+// this one did not.
+func TestSchedulerScanSurvivesASlowSync(t *testing.T) {
+	h := newSchedHarness(t, nil)
+	// Short enough to keep the test fast, long enough to be a real wait.
+	h.scheduler.syncTimeout = 20 * time.Millisecond
+
+	// Hold the sync far past the timeout, then release it.
+	release := make(chan struct{})
+	h.pairs.syncBlocks = release
+	defer close(release)
+
+	done := make(chan struct{})
+	go func() {
+		h.scheduler.Scan(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Scan did not return while the account sync was blocked; the scan loop would stop permanently")
 	}
 }
