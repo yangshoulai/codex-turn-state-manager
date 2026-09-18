@@ -3,8 +3,11 @@ package accounts
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 )
 
 // jwtWithClaims builds a token shaped like a Codex id_token. The signature is
@@ -152,5 +155,59 @@ func TestParsePlanAcceptsPaddedPayload(t *testing.T) {
 	got := ParsePlanFromCredential(map[string]any{"id_token": token})
 	if got.Type != "pro" {
 		t.Errorf("Type = %q, want pro", got.Type)
+	}
+}
+
+// TestBlockedReason covers which accounts the probe scheduler skips.
+//
+// CPA already knows more about an account's health than the plugin can infer,
+// and probing one it has already written off spends a request to relearn it --
+// and in the quota case spends part of the very budget that is exhausted.
+func TestBlockedReason(t *testing.T) {
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	later := now.Add(30 * time.Minute)
+	past := now.Add(-time.Minute)
+
+	cases := []struct {
+		name    string
+		account Account
+		blocked bool
+	}{
+		{"active account is probeable", Account{Status: hostapi.AccountStatusActive}, false},
+		{"disabled flag", Account{Status: hostapi.AccountStatusActive, Disabled: true}, true},
+		{"disabled status", Account{Status: hostapi.AccountStatusDisabled}, true},
+		{"quota exhausted", Account{Status: hostapi.AccountStatusActive, Unavailable: true,
+			StatusMessage: "account quota exhausted"}, true},
+		{"cooling down", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &later}, true},
+		{"cooldown elapsed", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &past}, false},
+		{"error status", Account{Status: hostapi.AccountStatusError}, true},
+		{"awaiting mfa", Account{Status: hostapi.AccountStatusPending}, true},
+		{"refreshing", Account{Status: hostapi.AccountStatusRefreshing}, true},
+		// An unknown state is not evidence of a fault; one cheap request is how
+		// it becomes known.
+		{"unknown status", Account{Status: hostapi.AccountStatusUnknown}, false},
+		{"empty status", Account{}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := BlockedReason(tc.account, now)
+			if got := reason != ""; got != tc.blocked {
+				t.Errorf("BlockedReason = %q, blocked = %v, want %v", reason, got, tc.blocked)
+			}
+		})
+	}
+}
+
+// TestBlockedReasonSurfacesTheProviderMessage pins that CPA's own explanation
+// reaches the operator rather than being flattened into a generic "unavailable".
+func TestBlockedReasonSurfacesTheProviderMessage(t *testing.T) {
+	acc := Account{
+		Status:        hostapi.AccountStatusActive,
+		Unavailable:   true,
+		StatusMessage: "5h limit reached",
+	}
+	if got := BlockedReason(acc, time.Now()); !strings.Contains(got, "5h limit reached") {
+		t.Errorf("BlockedReason = %q, want it to carry the provider's message", got)
 	}
 }

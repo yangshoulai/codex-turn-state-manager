@@ -62,7 +62,7 @@ func (h *MockHost) AddAccount(a Account) {
 		a.Provider = ProviderCodex
 	}
 	if a.Status == "" {
-		a.Status = AccountStatusAvailable
+		a.Status = AccountStatusActive
 	}
 	h.accounts = append(h.accounts, a)
 	h.creds[a.AuthIndex] = Credential{

@@ -56,7 +56,7 @@ func main() {
 			AuthID:    authIDFor(i),
 			Provider:  hostapi.ProviderCodex,
 			Label:     labelFor(i),
-			Status:    hostapi.AccountStatusAvailable,
+			Status:    hostapi.AccountStatusActive,
 			Priority:  10 - i,
 		})
 	}

@@ -60,7 +60,7 @@ func authListCaller() *fakeCaller {
 				AuthIndex: "codex-auth-1",
 				Provider:  "codex",
 				Label:     "user1@example.com",
-				Status:    hostapi.AccountStatusAvailable,
+				Status:    hostapi.AccountStatusActive,
 				Priority:  10,
 			}},
 		}, nil

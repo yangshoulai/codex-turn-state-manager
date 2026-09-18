@@ -191,7 +191,7 @@ func newExecHarness(t *testing.T) *execHarness {
 		AuthID:    "auth-id-1",
 		Provider:  hostapi.ProviderCodex,
 		Label:     "user1",
-		Status:    hostapi.AccountStatusAvailable,
+		Status:    hostapi.AccountStatusActive,
 	})
 	pool := proxies.NewPool(newMemProxyStore())
 	history := &recordingHistory{}

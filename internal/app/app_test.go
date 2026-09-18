@@ -43,7 +43,7 @@ func mockHost(accounts int) *hostapi.MockHost {
 			AuthID:    "auth-id-" + string(rune('1'+i)),
 			Provider:  hostapi.ProviderCodex,
 			Label:     "user" + string(rune('1'+i)),
-			Status:    hostapi.AccountStatusAvailable,
+			Status:    hostapi.AccountStatusActive,
 			Priority:  10 - i,
 		})
 	}
@@ -779,7 +779,7 @@ func TestApp_AccountSyncEndpoint(t *testing.T) {
 	host.SetAccounts([]hostapi.Account{{
 		AuthIndex: "codex-auth-1", AuthID: "auth-id-1",
 		Provider: hostapi.ProviderCodex, Label: "user1",
-		Status: hostapi.AccountStatusAvailable, Priority: 10,
+		Status: hostapi.AccountStatusActive, Priority: 10,
 	}})
 	if code, body := api.do(http.MethodPost, "/accounts/sync", ""); code != http.StatusOK {
 		t.Fatalf("POST sync = %d (%s)", code, body)

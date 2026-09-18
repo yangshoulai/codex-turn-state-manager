@@ -180,7 +180,7 @@ func candidate(letter string, priority int) hostapi.Candidate {
 		ID:       "auth-id-" + letter,
 		Provider: hostapi.ProviderCodex,
 		Priority: priority,
-		Status:   hostapi.AccountStatusAvailable,
+		Status:   hostapi.AccountStatusActive,
 	}
 }
 

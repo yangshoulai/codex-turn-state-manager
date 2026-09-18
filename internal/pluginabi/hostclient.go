@@ -57,13 +57,16 @@ func (c *HostClient) ListAccounts(ctx context.Context) ([]hostapi.Account, error
 	out := make([]hostapi.Account, 0, len(payload.Files))
 	for _, f := range payload.Files {
 		out = append(out, hostapi.Account{
-			AuthIndex: f.AuthIndex,
-			AuthID:    f.ID,
-			Provider:  strings.ToLower(strings.TrimSpace(f.Provider)),
-			Label:     firstNonEmpty(f.Label, f.Email, f.Name),
-			Status:    f.Status,
-			Priority:  f.Priority,
-			Disabled:  f.Disabled,
+			AuthIndex:      f.AuthIndex,
+			AuthID:         f.ID,
+			Provider:       strings.ToLower(strings.TrimSpace(f.Provider)),
+			Label:          firstNonEmpty(f.Label, f.Email, f.Name),
+			Status:         f.Status,
+			StatusMessage:  f.StatusMessage,
+			Priority:       f.Priority,
+			Disabled:       f.Disabled,
+			Unavailable:    f.Unavailable,
+			NextRetryAfter: f.NextRetryAfter,
 		})
 	}
 	return out, nil

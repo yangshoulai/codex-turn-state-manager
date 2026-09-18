@@ -36,8 +36,15 @@ type Account struct {
 	AuthID    string `json:"authId"`
 	Label     string `json:"label"`
 	Status    string `json:"status"`
-	Priority  int    `json:"priority"`
-	Disabled  bool   `json:"disabled"`
+	// StatusMessage is CPA's own explanation when it has one.
+	StatusMessage string `json:"statusMessage,omitempty"`
+	Priority      int    `json:"priority"`
+	Disabled      bool   `json:"disabled"`
+	// Unavailable marks transient provider unavailability, quota exhaustion
+	// being the case that matters here.
+	Unavailable bool `json:"unavailable,omitempty"`
+	// NextRetryAfter is when CPA considers another attempt worthwhile.
+	NextRetryAfter *time.Time `json:"nextRetryAfter,omitempty"`
 
 	// Plan is the subscription tier, read from the credential's id_token.
 	// Empty when the credential does not carry the claim -- shown as unknown
@@ -129,13 +136,19 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 		}
 		count++
 		synced := Account{
-			AuthIndex: a.AuthIndex,
-			AuthID:    a.AuthID,
-			Label:     a.Label,
-			Status:    a.Status,
-			Priority:  a.Priority,
-			Disabled:  a.Disabled,
-			SyncedAt:  now,
+			AuthIndex:     a.AuthIndex,
+			AuthID:        a.AuthID,
+			Label:         a.Label,
+			Status:        a.Status,
+			StatusMessage: a.StatusMessage,
+			Priority:      a.Priority,
+			Disabled:      a.Disabled,
+			Unavailable:   a.Unavailable,
+			SyncedAt:      now,
+		}
+		if !a.NextRetryAfter.IsZero() {
+			retryAfter := a.NextRetryAfter
+			synced.NextRetryAfter = &retryAfter
 		}
 		next[a.AuthIndex] = synced
 		if a.AuthID != "" {
@@ -194,6 +207,23 @@ func (r *Registry) resolvePlans(ctx context.Context, authIndexes []string) {
 		}
 		r.mu.Unlock()
 	}
+}
+
+// AllWithBlockReason returns tracked accounts paired with the reason probing is
+// being skipped, so the panel can show why an account is idle.
+func (r *Registry) AllWithBlockReason(now time.Time) []AccountView {
+	accounts := r.All()
+	out := make([]AccountView, 0, len(accounts))
+	for _, acc := range accounts {
+		out = append(out, AccountView{Account: acc, BlockedReason: BlockedReason(acc, now)})
+	}
+	return out
+}
+
+// AccountView is an account plus the derived reason it is not being probed.
+type AccountView struct {
+	Account
+	BlockedReason string `json:"blockedReason,omitempty"`
 }
 
 // All returns tracked accounts sorted by label then authIndex.
@@ -294,8 +324,13 @@ func (r *Registry) ForgetModel(ctx context.Context, authIndex, model string) err
 }
 
 // EnabledPairs returns every (authIndex, model) with probing switched on.
-// Pairs whose account is gone or disabled are skipped.
+//
+// Accounts CPA reports as unhealthy are filtered out here, which is the single
+// gate the probe scheduler draws from: an account that is disabled, refreshing,
+// awaiting MFA, or cooling down after a quota rejection is not worth a request.
 func (r *Registry) EnabledPairs() []Config {
+	now := time.Now()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]Config, 0, len(r.configs))
@@ -304,7 +339,7 @@ func (r *Registry) EnabledPairs() []Config {
 			continue
 		}
 		acc, ok := r.byIndex[k.authIndex]
-		if !ok || acc.Disabled {
+		if !ok || BlockedReason(acc, now) != "" {
 			continue
 		}
 		out = append(out, Config{AuthIndex: k.authIndex, Model: k.model, ProbeEnabled: true})
@@ -341,6 +376,59 @@ func (r *Registry) Models(authIndex string) ([]ModelState, bool) {
 		})
 	}
 	return out, true
+}
+
+// BlockedReason explains why an account should not be probed, or returns an
+// empty string when it should.
+//
+// CPA already knows far more about an account's health than the plugin can
+// infer, and it reports it through host.auth.list: whether the account is
+// disabled, mid-refresh, waiting on an external step, or temporarily
+// unavailable because the provider said so -- quota exhaustion being the case
+// that matters here. Probing an account in any of those states spends a request
+// to learn what CPA already knew, and in the quota case it spends part of the
+// very budget that is exhausted.
+//
+// A blocked account is never dropped from the panel: the operator needs to see
+// that it exists and why it is idle.
+func BlockedReason(a Account, now time.Time) string {
+	switch {
+	case a.Disabled:
+		return "账号已禁用"
+	case a.Status == hostapi.AccountStatusDisabled:
+		return "账号已禁用"
+	case a.Unavailable:
+		if a.StatusMessage != "" {
+			return "账号暂时不可用：" + a.StatusMessage
+		}
+		return "账号暂时不可用（可能已达额度上限）"
+	case a.NextRetryAfter != nil && now.Before(*a.NextRetryAfter):
+		return "账号冷却中，可重试于 " + a.NextRetryAfter.Local().Format("15:04:05")
+	case a.Status == hostapi.AccountStatusError:
+		if a.StatusMessage != "" {
+			return "账号处于错误状态：" + a.StatusMessage
+		}
+		return "账号处于错误状态"
+	case a.Status == hostapi.AccountStatusPending:
+		return "账号等待外部操作（如 MFA）"
+	case a.Status == hostapi.AccountStatusRefreshing:
+		return "账号正在刷新凭证"
+	case a.Status == hostapi.AccountStatusUnknown || a.Status == "":
+		// An unknown state is not evidence of a fault. Probing costs one cheap
+		// request and is how the state becomes known.
+		return ""
+	}
+	return ""
+}
+
+// ProbeBlocked reports whether probing should be skipped for an account.
+func (r *Registry) ProbeBlocked(authIndex string, now time.Time) (bool, string) {
+	acc, ok := r.Get(authIndex)
+	if !ok {
+		return true, "账号不在 CPA 的账号池中"
+	}
+	reason := BlockedReason(acc, now)
+	return reason != "", reason
 }
 
 // ModelState is one row of the panel's per-account model table.

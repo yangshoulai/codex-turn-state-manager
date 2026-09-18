@@ -707,7 +707,8 @@ function renderAccounts() {
 
   for (const account of accountsState) {
     const open = expanded.has(account.authIndex);
-    const statusClass = account.status === "available" ? "pill-ok"
+    // CPA's ready state is "active"; anything else is worth a second look.
+    const statusClass = account.status === "active" && !account.disabled ? "pill-ok"
       : account.disabled ? "pill-idle" : "pill-warn";
 
     const body = el("div", { class: "account-body", dataset: { accountBody: account.authIndex } });
@@ -721,6 +722,9 @@ function renderAccounts() {
         el("strong", { text: account.label || account.authIndex }),
         planBadge(account.plan),
         el("span", { class: "pill " + statusClass, text: account.status || "unknown" }),
+        account.blockedReason
+          ? el("span", { class: "pill pill-warn", title: account.blockedReason, text: "已暂停探测" })
+          : null,
       ]),
       el("div", { class: "meta" }, [
         el("span", { text: `${account.bindings || 0} 个绑定` }),
@@ -730,7 +734,7 @@ function renderAccounts() {
     ]);
 
     const block = el("div", { class: "account" }, [head, body]);
-    if (open) loadModels(account.authIndex, body);
+    if (open) loadModels(account.authIndex, body, account.blockedReason);
     host.append(block);
   }
 }
@@ -769,7 +773,7 @@ async function addModel(authIndex, container, model) {
   }
 }
 
-async function loadModels(authIndex, container) {
+async function loadModels(authIndex, container, blockedReason) {
   clear(container);
   container.append(el("div", { class: "empty", text: "加载中…" }));
   let payload;
@@ -842,6 +846,13 @@ async function loadModels(authIndex, container) {
 
   // The list is maintained by the plugin from the same manifest CPA syncs, so
   // there is nothing to add by hand -- only per-model probe toggles.
+  if (blockedReason) {
+    container.append(el("p", { class: "notice" }, [
+      el("strong", { text: "该账号暂停探测。" }),
+      el("span", { text: blockedReason }),
+    ]));
+  }
+
   container.append(el("p", { class: "muted small",
     text: "模型清单自动同步自 CPA 的模型表，不需要手动维护；" +
           "账号不支持某个模型时，探测会返回 MODEL_UNSUPPORTED。" }));

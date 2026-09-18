@@ -342,13 +342,13 @@ func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
-	list := a.svc.Accounts().All()
+	list := a.svc.Accounts().AllWithBlockReason(a.now())
 	if list == nil {
-		list = []accounts.Account{}
+		list = []accounts.AccountView{}
 	}
 
 	type accountView struct {
-		accounts.Account
+		accounts.AccountView
 		Bindings int `json:"bindings"`
 	}
 	// Count from the binding table rather than from the model list: bindings
@@ -363,7 +363,7 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]accountView, 0, len(list))
 	for _, acc := range list {
-		out = append(out, accountView{Account: acc, Bindings: bound[acc.AuthIndex]})
+		out = append(out, accountView{AccountView: acc, Bindings: bound[acc.AuthIndex]})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }

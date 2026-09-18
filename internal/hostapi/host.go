@@ -22,11 +22,18 @@ const (
 	ProviderCodex = "codex"
 )
 
-// Account lifecycle states as reported by CPA.
+// Account lifecycle states as reported by CPA (sdk/cliproxy/auth/status.go).
+//
+// The values are CPA's own spellings: "active" is the ready state, not
+// "available". Getting that wrong would have made every real account look
+// non-ready while the mock agreed with the mistake.
 const (
-	AccountStatusAvailable   = "available"
-	AccountStatusUnavailable = "unavailable"
-	AccountStatusDisabled    = "disabled"
+	AccountStatusUnknown    = "unknown"
+	AccountStatusActive     = "active"
+	AccountStatusPending    = "pending"
+	AccountStatusRefreshing = "refreshing"
+	AccountStatusError      = "error"
+	AccountStatusDisabled   = "disabled"
 )
 
 // Metadata keys the host populates on the after-auth request payload and on the
@@ -52,8 +59,16 @@ type Account struct {
 	Provider  string
 	Label     string
 	Status    string
-	Priority  int
-	Disabled  bool
+	// StatusMessage is CPA's own explanation when it has one.
+	StatusMessage string
+	Priority      int
+	Disabled      bool
+	// Unavailable marks transient provider unavailability -- quota exceeded
+	// being the case this plugin cares about.
+	Unavailable bool
+	// NextRetryAfter is the earliest moment another attempt is worthwhile.
+	// Zero when CPA has not imposed a cooldown.
+	NextRetryAfter time.Time
 }
 
 // Credential is the credential material CPA holds for an account.
