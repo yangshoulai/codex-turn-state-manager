@@ -9,6 +9,61 @@
 
 const BASE = "/v0/management/plugins/codex-turn-state-manager";
 
+/*
+ * The management key can be inherited rather than typed.
+ *
+ * CPA's management center keeps its session in localStorage under
+ * "cli-proxy-auth", obfuscated with a prefix plus an XOR key derived from the
+ * origin and user agent. Because this panel is served from the same origin, it
+ * can read that session and skip asking for a key the operator has already
+ * entered.
+ *
+ * Read-only on purpose: this panel never writes the key anywhere. Persisting it
+ * is CPA's decision, made in the management center, not ours.
+ *
+ * The format is not a published contract -- it was read out of the shipped
+ * management bundle and cross-checked against a plugin that does the same. If
+ * it ever changes, decoding fails and the panel falls back to asking.
+ */
+const CPA_SESSION_KEY = "cli-proxy-auth";
+const CPA_OBFUSCATION_PREFIX = "enc::v1::";
+const CPA_OBFUSCATION_SALT = "cli-proxy-api-webui::secure-storage";
+
+function xorBytes(bytes, keyBytes) {
+  const out = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ keyBytes[i % keyBytes.length];
+  return out;
+}
+
+// decodePanelStorage accepts either an obfuscated blob or plain JSON.
+function decodePanelStorage(raw) {
+  if (!raw) return null;
+  let text = raw;
+  if (text.startsWith(CPA_OBFUSCATION_PREFIX)) {
+    const binary = atob(text.slice(CPA_OBFUSCATION_PREFIX.length));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const keyBytes = new TextEncoder().encode(
+      `${CPA_OBFUSCATION_SALT}|${location.host}|${navigator.userAgent}`
+    );
+    text = new TextDecoder().decode(xorBytes(bytes, keyBytes));
+  }
+  return JSON.parse(text);
+}
+
+// readInheritedKey returns the management key the management center is holding,
+// or an empty string when there is nothing usable to inherit.
+function readInheritedKey() {
+  try {
+    const parsed = decodePanelStorage(localStorage.getItem(CPA_SESSION_KEY));
+    const state = parsed && parsed.state ? parsed.state : parsed;
+    const value = state && state.managementKey;
+    return typeof value === "string" ? value.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 let managementKey = "";
 let settingsState = null;
 let proxiesState = [];
@@ -159,23 +214,56 @@ function table(headers, rows, emptyText) {
 
 /* ------------------------------------------------------------------ gate */
 
+function enterPanel() {
+  $("gate").hidden = true;
+  $("panel").hidden = false;
+  setConn("已连接", "pill-ok");
+}
+
+function showGate(message) {
+  $("gate").hidden = false;
+  $("panel").hidden = true;
+  setConn("未连接", "pill-idle");
+  if (message) {
+    $("gate-error").textContent = message;
+    $("gate-error").hidden = false;
+  }
+}
+
+async function connectWith(key) {
+  managementKey = key;
+  await loadAll();
+  enterPanel();
+}
+
 $("gate-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const key = $("key").value.trim();
   if (!key) return;
-  managementKey = key;
   try {
-    await loadAll();
-    $("gate").hidden = true;
-    $("panel").hidden = false;
-    setConn("已连接", "pill-ok");
+    await connectWith(key);
   } catch (err) {
     managementKey = "";
-    $("gate-error").textContent = err.message;
-    $("gate-error").hidden = false;
-    setConn("未连接", "pill-idle");
+    showGate(err.message);
   }
 });
+
+// Bootstrap: try to inherit the session the management center already holds,
+// and only ask when that is unavailable or no longer valid.
+(async function bootstrap() {
+  const inherited = readInheritedKey();
+  if (inherited) {
+    try {
+      await connectWith(inherited);
+      return;
+    } catch {
+      // The inherited key was rejected, or the API is unreachable. Fall through
+      // to asking rather than leaving the operator with an error they cannot act on.
+      managementKey = "";
+    }
+  }
+  showGate();
+})();
 
 /* ------------------------------------------------------------- settings */
 

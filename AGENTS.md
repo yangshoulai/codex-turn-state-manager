@@ -124,8 +124,13 @@ The embedded panel (`web/`, served under `ResourceBasePath`) bypasses CPA's
 management auth. It may serve only static HTML/JS/CSS. Every data operation goes
 through a Management API route under `ManagementBasePath`. Never render a token,
 a proxy password, a full auth JSON blob, or a complete state value into a
-resource response. The management key lives in browser session memory only — not
-in `localStorage`, not in plugin state, not in logs.
+resource response.
+
+The panel never *writes* the management key anywhere: not to `localStorage`, not
+to plugin state, not to logs. It does *read* the key CPA's own management center
+already stored, so an operator who is signed in to the panel is not asked for it
+again. That is a read of someone else's session, not our persistence — see
+`readInheritedKey` in `web/app.js`. Do not "fix" it into a write.
 
 ### 2.7 A failure to classify is not a reason to evict a proxy
 
