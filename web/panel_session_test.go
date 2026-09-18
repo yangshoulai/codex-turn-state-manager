@@ -421,3 +421,64 @@ func dedupe(in []string) []string {
 	}
 	return out
 }
+
+// TestStylesheetCoversEveryControlType keeps the panel's controls on one shared
+// shape.
+//
+// Two defects shipped here, both invisible to a DOM check and obvious on screen.
+// The select in the probe-history header was left out of the rule that styles
+// text/number/password inputs, so it rendered as a raw native control at a
+// different height and radius from everything beside it. Separately, a CJK
+// button label has no spaces to break at, so a narrow flex row wrapped
+// "同步账号" onto two lines -- each container was patched on its own before the
+// rule was put on .btn where it belongs.
+func TestStylesheetCoversEveryControlType(t *testing.T) {
+	css, err := ReadAsset("style.css")
+	if err != nil {
+		t.Fatalf("read style.css: %v", err)
+	}
+	sheet := stripCSSComments(string(css))
+
+	// The shared control rule is the one that styles text inputs; every other
+	// control type the panel renders has to be in the same selector list.
+	rule := ruleForSelector(sheet, `input[type="text"]`)
+	if rule == "" {
+		t.Fatal("no shared control rule styles text inputs")
+	}
+	for _, selector := range []string{`input[type="number"]`, `input[type="password"]`, "select"} {
+		if !strings.Contains(rule, selector) {
+			t.Errorf("%s is not in the shared control rule; it will render at native metrics", selector)
+		}
+	}
+
+	btn := ruleForSelector(sheet, ".btn")
+	if btn == "" {
+		t.Fatal("no .btn rule")
+	}
+	if !strings.Contains(btn, "white-space: nowrap") {
+		t.Error(".btn does not set white-space: nowrap; a CJK label in a flex row wraps mid-word")
+	}
+}
+
+// ruleForSelector returns the declaration block whose selector list contains
+// want as a whole selector, so callers assert on the rule as a unit. Matching
+// the raw text instead would treat ".btn" as present inside ".btn-primary".
+func ruleForSelector(sheet, want string) string {
+	for _, block := range strings.Split(sheet, "}") {
+		open := strings.Index(block, "{")
+		if open < 0 {
+			continue
+		}
+		for _, sel := range strings.Split(block[:open], ",") {
+			// Drop a leading comment remnant and the selector's own line breaks.
+			sel = strings.TrimSpace(sel)
+			if i := strings.LastIndex(sel, "*/"); i >= 0 {
+				sel = strings.TrimSpace(sel[i+2:])
+			}
+			if sel == want {
+				return block + "}"
+			}
+		}
+	}
+	return ""
+}

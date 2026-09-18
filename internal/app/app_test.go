@@ -16,6 +16,8 @@ import (
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
+	"github.com/yangshoulai/codex-turn-state-manager/web"
 )
 
 const targetLength = 292
@@ -1182,4 +1184,50 @@ func TestApp_BackgroundWorkSurvivesStartup(t *testing.T) {
 func durPtrSeconds(n int) *time.Duration {
 	d := time.Duration(n) * time.Second
 	return &d
+}
+
+// TestApp_PanelMountServesTheEntryPoint guards the harness panel's two routing
+// seams at once, because both are silent when wrong: the bare base path has to
+// redirect *into* the mount, and a real asset path has to reach the asset
+// handler with the prefix stripped. Stripping the trailing slash together with
+// the prefix made the bare path strip to "", which the inner mux redirected to
+// the harness root -- so the panel 404'd at its own advertised URL.
+func TestApp_PanelMountServesTheEntryPoint(t *testing.T) {
+	a := newTestApp(t, mockHost(1))
+	srv := httptest.NewServer(a.Handler(web.Handler()))
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	resp, err := client.Get(srv.URL + version.ResourceBasePath + "/")
+	if err != nil {
+		t.Fatalf("GET bare base path: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("bare base path: got %d, want %d", resp.StatusCode, http.StatusFound)
+	}
+	loc := resp.Header.Get("Location")
+	if loc != version.ResourceBasePath+"/index.html" {
+		t.Errorf("bare base path redirects to %q, want %q", loc, version.ResourceBasePath+"/index.html")
+	}
+
+	// The redirect target must actually serve, not bounce again.
+	resp2, err := client.Get(srv.URL + version.ResourceBasePath + "/index.html")
+	if err != nil {
+		t.Fatalf("GET index.html: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("index.html: got %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	if !strings.Contains(string(body), "<html") {
+		t.Errorf("index.html did not serve the panel document (%d bytes)", len(body))
+	}
 }

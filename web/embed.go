@@ -39,7 +39,8 @@ var Assets = []string{"/index.html", "/app.js", "/style.css"}
 // more permissive one. The bare base path is not a route in production either:
 // CPA trims a trailing "/" and rejects the empty result, so the panel's entry
 // point is <ResourceBasePath>/index.html. The harness redirects the bare base
-// there for convenience, which is the one deliberate difference.
+// there for convenience, which is the one deliberate difference -- and it does
+// so at the mount, in app.Handler, not here.
 func Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, name := range Assets {
@@ -48,9 +49,6 @@ func Handler() http.Handler {
 			serveAsset(w, r, file)
 		})
 	}
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/index.html", http.StatusFound)
-	})
 	return mux
 }
 

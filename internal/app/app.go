@@ -435,7 +435,14 @@ func (a *App) Handler(assets http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	a.api.Register(mux)
 	if assets != nil {
-		mux.Handle(version.ResourceBasePath+"/", http.StripPrefix(version.ResourceBasePath+"/", assets))
+		// The harness is the only caller that mounts these. Issue the bare-base
+		// redirect here rather than inside the asset handler: StripPrefix
+		// rewrites r.URL.Path to "/", so a relative redirect computed at that
+		// layer would resolve against the harness root instead of this mount.
+		mux.HandleFunc("GET "+version.ResourceBasePath+"/{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, version.ResourceBasePath+"/index.html", http.StatusFound)
+		})
+		mux.Handle(version.ResourceBasePath+"/", http.StripPrefix(version.ResourceBasePath, assets))
 	}
 	return mux
 }
