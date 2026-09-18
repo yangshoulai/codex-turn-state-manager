@@ -9,6 +9,7 @@
       "version": "0.1.0",
       "repository": "https://github.com/yangshoulai/codex-turn-state-manager",
       "homepage": "https://github.com/yangshoulai/codex-turn-state-manager",
+      "license": "MIT",
       "tags": [
         "Codex",
         "Routing",

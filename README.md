@@ -392,4 +392,4 @@ database written by a newer plugin build refuses to start rather than risk corru
 
 ## Licence
 
-Not yet specified.
+MIT — see [LICENSE](./LICENSE).
