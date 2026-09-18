@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
-	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
@@ -989,46 +989,60 @@ func TestApp_ManagementRoutesCarryNoPathParameters(t *testing.T) {
 	}
 }
 
-// TestApp_ModelListIsConfiguredOnly covers what the panel shows per account.
+// TestApp_ModelListComesFromTheCatalog covers where the account model list
+// comes from.
 //
-// The plugin cannot read CPA's model registry, so it must not present a guess
-// as fact. An earlier version unioned a hardcoded seed list into every account
-// and duly claimed the account served gpt-5-codex, which no current model is
-// called. The list is now exactly what an operator configured; the seed list
-// survives only as suggestions on the add control.
-func TestApp_ModelListIsConfiguredOnly(t *testing.T) {
+// Two rejected designs came first: a hardcoded table (which went stale and put
+// gpt-5-codex on screen) and operator-managed entries (which pushed the work
+// onto the operator for data the plugin should be able to obtain). The list now
+// comes from the shared manifest CPA itself syncs, and the operator only
+// toggles probing per model.
+func TestApp_ModelListComesFromTheCatalog(t *testing.T) {
 	ctx := context.Background()
 	a := newTestApp(t, mockHost(1))
 	if _, err := a.SyncAccounts(ctx); err != nil {
 		t.Fatalf("SyncAccounts: %v", err)
 	}
 
-	modelsFor := func() map[string]bool {
-		t.Helper()
-		list, ok := a.Accounts().Models("codex-auth-1")
-		if !ok {
-			t.Fatal("account missing")
-		}
-		out := map[string]bool{}
-		for _, m := range list {
-			out[m.Model] = true
-		}
-		return out
+	list, ok := a.Accounts().Models("codex-auth-1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+	if len(list) == 0 {
+		t.Fatal("no models offered; the catalog should always seed something")
 	}
 
-	if got := len(modelsFor()); got != 0 {
-		t.Errorf("a fresh account lists %d models, want 0 until configured", got)
+	// Every catalog entry is offered, and every one starts with probing off:
+	// nothing should probe until an operator chooses it.
+	for _, m := range list {
+		if m.ProbeEnabled {
+			t.Errorf("%s probes by default; it should be opt-in", m.Model)
+		}
 	}
 
-	const custom = "gpt-5.6-luna"
-	if err := a.Accounts().SetProbeEnabled(ctx, "codex-auth-1", custom, true); err != nil {
+	// A toggle is visible immediately, without waiting for a sync.
+	const model = "gpt-5.6-luna"
+	if !a.Accounts().CatalogHas(model) {
+		t.Skipf("%s is not in the fallback catalog", model)
+	}
+	if err := a.Accounts().SetProbeEnabled(ctx, "codex-auth-1", model, true); err != nil {
 		t.Fatalf("SetProbeEnabled: %v", err)
 	}
-	if got := modelsFor(); !got[custom] || len(got) != 1 {
-		t.Errorf("models = %v, want exactly the configured one", got)
+	found := false
+	for _, m := range mustModels(t, a, "codex-auth-1") {
+		if m.Model == model {
+			found, _ = true, m
+			if !m.ProbeEnabled {
+				t.Error("the toggle did not take effect")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("%s disappeared from the list after being toggled", model)
 	}
 
-	// And it survives a restart, because it is read back from the store.
+	// And it survives a restart, because the toggle is persisted while the list
+	// is re-derived.
 	dir := a.cfg.DataDir
 	a.Stop()
 	restarted, err := New(ctx, Config{DataDir: dir, Host: mockHost(1)})
@@ -1039,45 +1053,20 @@ func TestApp_ModelListIsConfiguredOnly(t *testing.T) {
 	if _, err := restarted.SyncAccounts(ctx); err != nil {
 		t.Fatalf("SyncAccounts after restart: %v", err)
 	}
-	list, _ := restarted.Accounts().Models("codex-auth-1")
-	if len(list) != 1 || list[0].Model != custom {
-		t.Errorf("after restart models = %v, want [%s]", list, custom)
-	}
-	if !list[0].ProbeEnabled {
-		t.Error("the probe toggle did not survive the restart")
+	for _, m := range mustModels(t, restarted, "codex-auth-1") {
+		if m.Model == model && !m.ProbeEnabled {
+			t.Error("the probe toggle did not survive the restart")
+		}
 	}
 }
 
-// TestModelSuggestionsAreCurrent guards the seed list against going stale the
-// way the old hardcoded table did. It is checked against the manifest CPA
-// itself syncs, so the two cannot drift apart silently.
-func TestModelSuggestionsAreCurrent(t *testing.T) {
-	want := []string{
-		"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra",
-		"gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex-spark",
+func mustModels(t *testing.T, a *App, authIndex string) []accounts.ModelState {
+	t.Helper()
+	list, ok := a.Accounts().Models(authIndex)
+	if !ok {
+		t.Fatalf("account %s missing", authIndex)
 	}
-	registry := models.NewRegistry()
-	have := map[string]bool{}
-	for _, e := range registry.All() {
-		have[e.Model] = true
-	}
-	for _, slug := range want {
-		if !have[slug] {
-			t.Errorf("seed list is missing %s", slug)
-		}
-	}
-	// The retired slugs must not come back.
-	for _, retired := range []string{"gpt-5-codex", "gpt-5-mini", "gpt-5-nano", "codex-mini-latest"} {
-		if have[retired] {
-			t.Errorf("seed list still carries the retired slug %s", retired)
-		}
-	}
-
-	// An unknown model must still get a usable reasoning floor, or an
-	// operator-supplied name would produce an invalid probe.
-	if got := registry.MinReasoning("some-future-model"); got == "" {
-		t.Error("an unknown model has no reasoning floor")
-	}
+	return list
 }
 
 func TestApp_ForgetModelRemovesBindingAndConfig(t *testing.T) {
@@ -1120,9 +1109,12 @@ func TestApp_ForgetModelRemovesBindingAndConfig(t *testing.T) {
 		t.Error("configured model survived removal")
 	}
 
-	// Removal is permanent: the model does not reappear from a seed list.
-	if list, _ := a.Accounts().Models("codex-auth-1"); len(list) != 0 {
-		t.Errorf("models after removal = %v, want none", list)
+	// The model stays listed -- the catalog is the authority on what exists --
+	// but it is no longer configured to probe.
+	for _, m := range mustModels(t, a, "codex-auth-1") {
+		if m.Model == model && m.ProbeEnabled {
+			t.Error("the probe toggle survived removal")
+		}
 	}
 
 	// Missing parameters are a 400, not a silent no-op.

@@ -132,7 +132,8 @@ const modelCache = new Map();
 // Seed model names for the add control. Suggestions only: the plugin cannot
 // read an account's real model list from CPA, so nothing here is probed until
 // an operator adds it.
-let modelSuggestions = [];
+let modelCatalog = [];
+let modelCatalogNote = "";
 
 /* ------------------------------------------------------------------ utils */
 
@@ -194,6 +195,24 @@ function el(tag, attrs, children) {
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
+
+/*
+ * Redraw only when the data actually changed.
+ *
+ * The panel polls every 15s. Rebuilding a section regardless of whether
+ * anything moved made the page flicker and drop text selection twice a minute,
+ * which is why these sections keep a fingerprint of what they last rendered.
+ */
+const rendered = new Map();
+
+function changed(key, payload) {
+  const next = JSON.stringify(payload);
+  if (rendered.get(key) === next) return false;
+  rendered.set(key, next);
+  return true;
+}
+
+function invalidate(key) { rendered.delete(key); }
 
 let toastTimer = null;
 function toast(message, bad) {
@@ -665,6 +684,7 @@ on("add-window", "click", async () => {
 
 function renderAccounts() {
   const host = $("accounts");
+  if (!changed("accounts", [accountsState, [...expanded]])) return;
   clear(host);
 
   if (!accountsState.length) {
@@ -707,12 +727,18 @@ function toggleAccount(authIndex) {
   renderAccounts();
 }
 
-async function loadModelSuggestions() {
+// loadModelCatalog reads the account model list the plugin maintains from the
+// same manifest CPA syncs.
+async function loadModelCatalog() {
   try {
     const payload = await api("GET", "/models");
-    modelSuggestions = (payload.models || []).map((m) => m.model);
+    modelCatalog = payload.models || [];
+    modelCatalogNote = payload.fetchedAt
+      ? `模型清单拉取于 ${fmtTime(payload.fetchedAt)}`
+      : (payload.note || "");
   } catch {
-    modelSuggestions = [];
+    modelCatalog = [];
+    modelCatalogNote = "";
   }
 }
 
@@ -744,7 +770,6 @@ async function loadModels(authIndex, container) {
   if (!expanded.has(authIndex)) return; // collapsed while loading
 
   clear(container);
-  const configured = new Set((payload.models || []).map((m) => m.model));
   const rows = (payload.models || []).map((m) => {
     const probeToggle = el("input", { type: "checkbox", checked: m.probeEnabled });
     probeToggle.addEventListener("change", async () => {
@@ -760,8 +785,8 @@ async function loadModels(authIndex, container) {
     });
 
     const actions = el("div", { class: "row-actions" }, [
-      el("button", { class: "btn btn-sm btn-danger", type: "button", text: "移除",
-        onclick: () => removeModel(authIndex, m.model) }),
+      el("button", { class: "btn btn-sm", type: "button", text: "删除绑定",
+        onclick: () => deleteBinding(authIndex, m.model) }),
       el("button", { class: "btn btn-sm", type: "button", text: "历史",
         onclick: () => showHistory(authIndex, m.model) }),
     ]);
@@ -787,71 +812,13 @@ async function loadModels(authIndex, container) {
   container.append(table(
     [{ label: "模型" }, { label: "探测" }, { label: "State" }, { label: "剩余" },
      { label: "长度" }, { label: "下次探测" }, { label: "" }],
-    rows, "该账号没有配置任何模型"));
+    rows, "该账号的模型清单为空"));
 
-  // The list is seeded from the plugin and extended by hand: the plugin cannot
-  // read CPA's model registry, so an account's real model set only exists
-  // because an operator typed it.
-  const listId = `model-suggestions-${authIndex}`;
-  const input = el("input", {
-    type: "text", placeholder: "例如 gpt-5.6-luna", spellcheck: "false",
-    "aria-label": "添加模型", list: listId, autocomplete: "off",
-  });
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addModel(authIndex, container, input.value);
-    }
-  });
-
-  const actions = [
-    input,
-    el("datalist", { id: listId }, modelSuggestions.map((m) => el("option", { value: m }))),
-    el("button", {
-      class: "btn", type: "button", text: "添加",
-      onclick: () => addModel(authIndex, container, input.value),
-    }),
-  ];
-
-  // One click to reach a usable starting point, since the plugin cannot fill
-  // the list in itself and an empty list probes nothing.
-  const missing = modelSuggestions.filter((m) => !configured.has(m));
-  if (missing.length) {
-    actions.push(el("button", {
-      class: "btn", type: "button", text: "添加常用模型",
-      title: missing.join("、"),
-      onclick: async () => {
-        for (const name of missing) {
-          await api("PUT", `/accounts/models/probe?${qs({ authIndex, model: name })}`, { enabled: true })
-            .catch(() => {});
-        }
-        await loadModels(authIndex, container);
-        await loadAccounts();
-        toast(`已添加 ${missing.length} 个常用模型`);
-      },
-    }));
-  }
-
-  container.append(el("div", { class: "add-model" }, actions));
+  // The list is maintained by the plugin from the same manifest CPA syncs, so
+  // there is nothing to add by hand -- only per-model probe toggles.
   container.append(el("p", { class: "muted small",
-    text: "插件读不到 CPA 的模型清单，这里只列出你已配置的模型。" }));
-}
-
-// removeModel drops a model from the account and with it any binding, which is
-// what "this account does not serve this model" means in practice.
-async function removeModel(authIndex, model) {
-  if (!confirm(`从 ${authIndex} 移除模型 ${model}？\n\n同时会删除它的绑定 State。`)) return;
-  try {
-    await api("DELETE", `/accounts/models?${qs({ authIndex, model })}`);
-    toast(`已移除 ${model}`);
-    await refresh();
-    if (expanded.has(authIndex)) {
-      const body = document.querySelector(`[data-account-body="${CSS.escape(authIndex)}"]`);
-      if (body) await loadModels(authIndex, body);
-    }
-  } catch (err) {
-    toast(err.message, true);
-  }
+    text: "模型清单自动同步自 CPA 的模型表，不需要手动维护；" +
+          "账号不支持某个模型时，探测会返回 MODEL_UNSUPPORTED。" }));
 }
 
 async function deleteBinding(authIndex, model) {
@@ -889,9 +856,12 @@ async function showHistory(authIndex, model) {
         text: h.action,
       })),
       el("td", null, el("span", { class: "pill pill-idle", text: h.source })),
-      el("td", { class: "mono", text: h.statePrefix ? h.statePrefix + "…" : "—" }),
+      el("td", { class: "mono" }, [
+        el("span", { text: h.statePrefix ? h.statePrefix + "…" : "—" }),
+        h.stateLength ? copyButton(authIndex, model, h.id) : null,
+      ]),
       el("td", { class: "num", text: h.stateLength || "—" }),
-      el("td", { class: "mono", text: h.proxyId || "—" }),
+      el("td", { class: "mono", text: proxyLabel(h.proxyId) }),
     ]));
     clear(body);
     body.append(table(
@@ -900,7 +870,7 @@ async function showHistory(authIndex, model) {
       rows, "暂无历史记录"));
     if (rows.length) {
       body.append(el("p", { class: "muted small",
-        text: "仅显示 State 值前 8 位；完整值只保存在数据库中。" }));
+        text: "列表只显示 State 值前 8 位；点复制图标取回完整值到剪贴板，不会写进页面。" }));
     }
   } catch (err) {
     clear(body);
@@ -929,6 +899,7 @@ on("modal-clear", "click", async () => {
 
 function renderProxies() {
   const host = $("proxies");
+  if (!changed("proxies", proxiesState)) return;
   clear(host);
 
   if (!proxiesState.length) {
@@ -939,16 +910,22 @@ function renderProxies() {
   const rows = proxiesState.map((node, index) => {
     const statusCls = node.status === "healthy" ? "pill-ok"
       : node.status === "cooldown" ? "pill-warn" : "pill-idle";
-    const set = (k, v) => { proxiesState[index][k] = v; };
+    const set = (k, v) => {
+      proxiesState[index][k] = v;
+      invalidate("proxies");
+    };
 
     return el("tr", null, [
       el("td", null, el("input", {
         type: "text", value: node.url, placeholder: "http://host:port",
         oninput: (e) => set("url", e.target.value.trim()),
+        // Persist on blur rather than per keystroke: a save on every character
+        // would rewrite the pool mid-word.
+        onblur: () => saveProxies(),
       })),
       el("td", null, el("input", {
         type: "checkbox", checked: node.enabled,
-        onchange: (e) => set("enabled", e.target.checked),
+        onchange: (e) => { set("enabled", e.target.checked); saveProxies(); },
       })),
       el("td", null, el("span", { class: "pill " + statusCls, text: node.status })),
       el("td", { class: "num", text: node.lastLatencyMs ? node.lastLatencyMs + "ms" : "—" }),
@@ -956,7 +933,12 @@ function renderProxies() {
       el("td", { class: "muted small", text: fmtAgo(node.lastUsedAt) }),
       el("td", null, el("div", { class: "row-actions" },
         el("button", { class: "btn btn-sm btn-danger", type: "button", text: "移除",
-          onclick: () => { proxiesState.splice(index, 1); renderProxies(); } }))),
+          onclick: () => {
+          proxiesState.splice(index, 1);
+          invalidate("proxies");
+          renderProxies();
+          saveProxies();
+        } }))),
     ]);
   });
 
@@ -974,6 +956,43 @@ on("add-proxy", "click", () => {
   });
   renderProxies();
 });
+
+// proxyID derives a stable, readable identifier from the address so the probe
+// history names a node the operator recognises.
+function proxyID(url, fallback) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.host) return parsed.host;
+  } catch { /* not a usable URL yet */ }
+  return fallback;
+}
+
+async function saveProxies() {
+  const payload = proxiesState
+    .filter((n) => n.url)
+    .map((n) => ({
+      id: proxyID(n.url, n.id),
+      url: n.url,
+      enabled: n.enabled,
+      successCount: n.successCount || 0,
+      failureCount: n.failureCount || 0,
+      consecutiveFailures: n.consecutiveFailures || 0,
+      cooldownUntil: n.cooldownUntil || null,
+      lastLatencyMs: n.lastLatencyMs || null,
+      lastUsedAt: n.lastUsedAt || null,
+      lastSuccess: n.lastSuccess || null,
+      lastFailure: n.lastFailure || null,
+    }));
+  if (!payload.length) return;
+  try {
+    const resp = await api("PUT", "/proxy-nodes", { proxies: payload });
+    proxiesState = resp.proxies || [];
+    invalidate("proxies");
+    renderProxies();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
 
 on("save-proxies", "click", async () => {
   const payload = proxiesState
@@ -1004,15 +1023,64 @@ on("save-proxies", "click", async () => {
 
 /* ---------------------------------------------------------- probe history */
 
+/*
+ * copyButton copies a history entry's full state value.
+ *
+ * The value is fetched on demand and handed straight to the clipboard; it never
+ * enters the DOM, so it is not sitting in the page for anything else to read.
+ * The list view shows only a prefix for the same reason.
+ */
+function copyButton(authIndex, model, id) {
+  const button = el("button", {
+    class: "btn btn-sm btn-icon", type: "button", title: "复制完整 State 值",
+    "aria-label": "复制完整 State 值",
+  });
+  button.innerHTML = COPY_ICON;
+
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      const payload = await api("GET",
+        `/bindings/history?${qs({ authIndex, model, limit: 200, expand: 1 })}`);
+      const entry = (payload.history || []).find((h) => h.id === id);
+      if (!entry || !entry.stateValue) {
+        toast("没有取到该记录的完整值", true);
+        return;
+      }
+      await navigator.clipboard.writeText(entry.stateValue);
+      toast(`已复制完整 State 值（${entry.stateValue.length} 字符）`);
+    } catch (err) {
+      toast("复制失败：" + describeError(err), true);
+    }
+  });
+  return button;
+}
+
+const COPY_ICON =
+  '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" ' +
+  'stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">' +
+  '<rect x="5.5" y="5.5" width="8" height="9" rx="1.5"/>' +
+  '<path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4a1.5 1.5 0 0 0-1.5 1.5V10"/>' +
+  '</svg>';
+
+// proxyLabel resolves a probe record's proxy id to the node's address, which is
+// what the operator configured. The id itself is internal.
+function proxyLabel(id) {
+  if (!id) return "—";
+  const node = proxiesState.find((n) => n.id === id);
+  return node ? node.url : id;
+}
+
 function renderProbes(probes) {
   const host = $("probes");
+  if (!changed("probes", probes)) return;
   clear(host);
 
   const rows = (probes || []).map((p) => el("tr", null, [
     el("td", { class: "mono", text: fmtTime(p.probedAt) }),
     el("td", { class: "mono", text: p.authIndex }),
     el("td", { class: "mono", text: p.model }),
-    el("td", { class: "mono", text: p.proxyId || "—" }),
+    el("td", { class: "mono", text: proxyLabel(p.proxyId) }),
     el("td", null, el("span", {
       class: "pill " + (OUTCOME_PILL[p.result] || "pill-idle"),
       text: p.result,
@@ -1071,7 +1139,7 @@ async function loadStatus() {
 
 async function loadAll() {
   await loadStatus();
-  await loadModelSuggestions();
+  await loadModelCatalog();
   await loadSettings();
   // A failing subsystem must not block the panel; each section reports its own
   // error so the operator can still reach the settings that would fix it.

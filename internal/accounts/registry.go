@@ -39,10 +39,6 @@ type Account struct {
 	Priority  int    `json:"priority"`
 	Disabled  bool   `json:"disabled"`
 
-	// Models is the model list observed for this account, unioned with any
-	// model the operator has enabled explicitly.
-	Models []string `json:"models"`
-
 	SyncedAt time.Time `json:"syncedAt"`
 }
 
@@ -50,8 +46,10 @@ type Account struct {
 type Registry struct {
 	host  hostapi.Host
 	store ConfigStore
-	// knownModels supplies the candidate model list per account.
-	knownModels func() []string
+	// catalogModels supplies the account model list, refreshed from the same
+	// manifest CPA syncs. The plugin cannot read CPA's own registry, so this is
+	// the nearest authoritative source it can obtain by itself.
+	catalogModels func() []string
 
 	mu sync.RWMutex
 	// byIndex is keyed by AuthIndex; byAuthID is the reverse mapping the
@@ -67,17 +65,17 @@ type modelKey struct {
 }
 
 // NewRegistry builds an empty registry. Call Load then Sync.
-func NewRegistry(host hostapi.Host, store ConfigStore, knownModels func() []string) *Registry {
-	if knownModels == nil {
-		knownModels = func() []string { return nil }
+func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []string) *Registry {
+	if catalogModels == nil {
+		catalogModels = func() []string { return nil }
 	}
 	return &Registry{
-		host:        host,
-		store:       store,
-		knownModels: knownModels,
-		byIndex:     map[string]Account{},
-		byAuthID:    map[string]string{},
-		configs:     map[modelKey]bool{},
+		host:          host,
+		store:         store,
+		catalogModels: catalogModels,
+		byIndex:       map[string]Account{},
+		byAuthID:      map[string]string{},
+		configs:       map[modelKey]bool{},
 	}
 }
 
@@ -125,7 +123,6 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 			Disabled:  a.Disabled,
 			SyncedAt:  now,
 		}
-		synced.Models = r.configuredModels(a.AuthIndex)
 		next[a.AuthIndex] = synced
 		if a.AuthID != "" {
 			nextAuthID[a.AuthID] = a.AuthIndex
@@ -139,52 +136,12 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	for idx, acc := range next {
 		if prev, ok := r.byIndex[idx]; ok {
 			acc.SyncedAt = prev.SyncedAt
-			// Keep operator-enabled models that CPA has not reported yet.
-			acc.Models = union(acc.Models, prev.Models)
 			next[idx] = acc
 		}
 	}
 	r.byIndex = next
 	r.byAuthID = nextAuthID
 	return count, nil
-}
-
-// configuredModels returns the models an operator has explicitly configured for
-// an account, including ones absent from the seed list.
-//
-// CPA's account record does not enumerate models and the host exposes no
-// callback for its model registry, so a custom model name only exists because
-// someone entered it. Those entries have to survive a restart, which is why
-// they are read back from the persisted per-pair configuration rather than
-// remembered in memory.
-func (r *Registry) configuredModels(authIndex string) []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.configuredModelsLocked(authIndex)
-}
-
-func (r *Registry) configuredModelsLocked(authIndex string) []string {
-	var out []string
-	for key := range r.configs {
-		if key.authIndex == authIndex {
-			out = append(out, key.model)
-		}
-	}
-	return out
-}
-
-// SuggestModels is the seed list offered as suggestions when adding a model.
-//
-// It is advice, not configuration: nothing is probed because it appears here.
-func SuggestModels(known []string) []string {
-	out := make([]string, 0, len(known))
-	for _, m := range known {
-		if m != "" {
-			out = append(out, m)
-		}
-	}
-	sort.Strings(out)
-	return out
 }
 
 // All returns tracked accounts sorted by label then authIndex.
@@ -235,6 +192,16 @@ func (r *Registry) ProbeEnabled(authIndex, model string) bool {
 	return r.configs[modelKey{authIndex, model}]
 }
 
+// CatalogHas reports whether the model list offers a name.
+func (r *Registry) CatalogHas(model string) bool {
+	for _, m := range r.catalogModels() {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
 // ModelConfigured reports whether a model has an explicit configuration row for
 // this account, as opposed to merely appearing in the seed list. Removal needs
 // the distinction: dropping a seed entry has to be remembered, or the next sync
@@ -261,8 +228,9 @@ func (r *Registry) SetProbeEnabled(ctx context.Context, authIndex, model string,
 	return nil
 }
 
-// ForgetModel removes an operator-added model from an account, along with its
-// probe toggle. Bindings for the pair are the caller's concern.
+// ForgetModel clears any stored state for a model, returning the pair to its
+// unconfigured default. The model itself stays listed: the catalog is the
+// authority on what exists, not the toggle table.
 func (r *Registry) ForgetModel(ctx context.Context, authIndex, model string) error {
 	if err := r.store.DeleteAccountModel(ctx, authIndex, model); err != nil {
 		return err
@@ -298,23 +266,21 @@ func (r *Registry) EnabledPairs() []Config {
 	return out
 }
 
-// Models returns the models configured for an account, with their probe toggles.
+// Models returns the model list for an account, with per-model probe toggles.
 //
-// Deliberately only what is configured, not a seed list unioned in.
-//
-// The plugin cannot read CPA's model registry, so it does not know which models
-// an account serves. Listing a guessed set as if it were fact is how a stale
-// hardcoded table ended up on screen claiming an account had gpt-5-codex. The
-// seed list survives as suggestions for the add control, where being out of
-// date costs nothing.
+// The list comes from the shared manifest rather than from operator input or a
+// hardcoded table. The plugin has no way to read CPA's own model registry, so
+// this is the nearest authoritative source: the same file CPA syncs, parsed the
+// same way. Which of the models an account can actually serve is answered by
+// probing, not by guessing.
 func (r *Registry) Models(authIndex string) ([]ModelState, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if _, ok := r.byIndex[authIndex]; !ok {
+	if _, ok := r.Get(authIndex); !ok {
 		return nil, false
 	}
-	models := r.configuredModelsLocked(authIndex)
-	sort.Strings(models)
+	models := r.catalogModels()
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]ModelState, 0, len(models))
 	for _, m := range models {
 		out = append(out, ModelState{
@@ -329,20 +295,4 @@ func (r *Registry) Models(authIndex string) ([]ModelState, bool) {
 type ModelState struct {
 	Model        string `json:"model"`
 	ProbeEnabled bool   `json:"probeEnabled"`
-}
-
-func union(a, b []string) []string {
-	seen := make(map[string]bool, len(a)+len(b))
-	out := make([]string, 0, len(a)+len(b))
-	for _, list := range [][]string{a, b} {
-		for _, s := range list {
-			if s == "" || seen[s] {
-				continue
-			}
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	sort.Strings(out)
-	return out
 }

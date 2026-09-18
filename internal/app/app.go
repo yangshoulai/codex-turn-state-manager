@@ -32,6 +32,8 @@ type Config struct {
 	DataDir string
 	// UpstreamBaseURL overrides the Codex backend host. Empty uses the default.
 	UpstreamBaseURL string
+	// CatalogURL overrides the model manifest. Empty uses the shared default.
+	CatalogURL string
 	// Host is the CPA adapter. Required.
 	Host hostapi.Host
 	// Log receives plugin log lines. Optional.
@@ -46,6 +48,7 @@ type App struct {
 	settings  *settings.Manager
 	accounts  *accounts.Registry
 	models    *models.Registry
+	catalog   *models.Catalog
 	states    *states.Registry
 	proxies   *proxies.Pool
 	windows   *probe.WindowManager
@@ -115,17 +118,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 
 	a.models = models.NewRegistry()
-
-	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), func() []string {
-		entries := a.models.All()
-		out := make([]string, 0, len(entries))
-		for _, e := range entries {
-			if e.Probeable {
-				out = append(out, e.Model)
-			}
-		}
-		return out
+	a.catalog = models.NewCatalog(cfg.CatalogURL, func(format string, args ...any) {
+		logf(hostapi.LogInfo, fmt.Sprintf(format, args...), nil)
 	})
+
+	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), a.catalog.Models)
 	if err := a.accounts.Load(ctx); err != nil {
 		return nil, a.fail(err)
 	}
@@ -224,6 +221,7 @@ func (a *App) Start() {
 		}()
 
 		a.scheduler.Start(ctx)
+		a.catalog.Start(ctx)
 
 		a.wg.Add(1)
 		go func() {
@@ -280,6 +278,9 @@ func (a *App) Accounts() *accounts.Registry { return a.accounts }
 
 // Models returns the model capability registry.
 func (a *App) Models() *models.Registry { return a.models }
+
+// Catalog returns the account model list source.
+func (a *App) Catalog() *models.Catalog { return a.catalog }
 
 // States returns the binding registry.
 func (a *App) States() *states.Registry { return a.states }

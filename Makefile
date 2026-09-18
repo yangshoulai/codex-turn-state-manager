@@ -65,6 +65,7 @@ cpa-docker-up: build-linux ## Build for linux and start a throwaway CPA with the
 		-v "$$PWD/auths":/root/.cli-proxy-api \
 		-v "$$PWD/logs":/CLIProxyAPI/logs \
 		-v "$$PWD/plugins":/CLIProxyAPI/plugins \
+		-v "$$PWD/plugin-data":/CLIProxyAPI/plugin-data \
 		eceasy/cli-proxy-api:latest
 	@sleep 6
 	@echo "CPA on http://127.0.0.1:18317 (management key: local-dev-key)"

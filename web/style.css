@@ -486,3 +486,18 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* Icon-only control: square, no label, still a full-size hit target. */
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin-left: 6px;
+  vertical-align: middle;
+  color: var(--ink-soft);
+}
+.btn-icon:hover { color: var(--ink); background: var(--accent-soft); border-color: transparent; }
+.btn-icon svg { display: block; }

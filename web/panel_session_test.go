@@ -2,6 +2,7 @@ package web
 
 import (
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -346,4 +347,77 @@ func TestStylesheetSeparatesGroupsOnce(t *testing.T) {
 	if !strings.Contains(sheet, ".switch-row {") {
 		t.Error("switch rows lost their separator entirely")
 	}
+}
+
+// TestPanelCallsOnlyDefinedFunctions guards against a rename leaving a stale
+// call behind.
+//
+// Renaming loadModelSuggestions to loadModelCatalog left one call site behind,
+// which surfaced in the browser as "loadModelSuggestions is not defined" and
+// only because the panel reports its own bootstrap failure. A static check is
+// cheaper than that round trip.
+//
+// Declarations have to be collected without assuming where they appear: the
+// panel declares helpers inside other functions (`const pad = ...`, `const set = ...`)
+// and uses a named function expression for its bootstrap, none of which an
+// anchored pattern finds.
+func TestPanelCallsOnlyDefinedFunctions(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := string(js)
+
+	declared := map[string]bool{}
+	patterns := []string{
+		`(?:async\s+)?function\s+([A-Za-z_$][\w$]*)`,                      // declarations and named expressions
+		`(?m)^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)`,                  // bindings, however indented
+		`(?m)^\s*([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|[A-Za-z_$])`, // bare assignment
+	}
+	for _, pattern := range patterns {
+		for _, m := range regexp.MustCompile(pattern).FindAllStringSubmatch(src, -1) {
+			declared[m[1]] = true
+		}
+	}
+	if len(declared) < 30 {
+		t.Fatalf("only %d declarations found; the patterns are not reading the file", len(declared))
+	}
+
+	// Browser and language builtins the panel is entitled to call.
+	allowed := map[string]bool{
+		"atob": true, "btoa": true, "fetch": true, "setTimeout": true, "clearTimeout": true,
+		"setInterval": true, "clearInterval": true, "confirm": true, "alert": true, "prompt": true,
+		"parseInt": true, "parseFloat": true, "isNaN": true, "isFinite": true,
+		"decodeURIComponent": true, "encodeURIComponent": true, "structuredClone": true,
+		"if": true, "for": true, "while": true, "switch": true, "catch": true, "return": true,
+		"typeof": true, "function": true, "await": true, "async": true, "new": true,
+		"case": true, "do": true, "delete": true, "void": true, "in": true, "of": true,
+		"TextEncoder": true, "TextDecoder": true, "Uint8Array": true, "URL": true,
+		"URLSearchParams": true, "MutationObserver": true, "Event": true,
+	}
+
+	var missing []string
+	// A call is a name followed by "(" that is not a property access.
+	for _, m := range regexp.MustCompile(`(?:^|[^.\w$])([a-z_$][\w$]*)\s*\(`).FindAllStringSubmatch(src, -1) {
+		name := m[1]
+		if declared[name] || allowed[name] {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	if len(missing) > 0 {
+		t.Errorf("calls to undeclared functions: %s", strings.Join(dedupe(missing), ", "))
+	}
+}
+
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }

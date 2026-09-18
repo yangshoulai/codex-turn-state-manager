@@ -36,6 +36,8 @@ type Service interface {
 	ProbeHistory() probe.HistoryStore
 	ProbeScheduler() *probe.Scheduler
 
+	Catalog() *models.Catalog
+
 	SyncAccounts(ctx context.Context) (int, error)
 	TriggerProbe(ctx context.Context, authIndex, model string) error
 }
@@ -88,7 +90,7 @@ func Routes() []Route {
 		{http.MethodPut, "/time-windows", func(a *API) http.HandlerFunc { return a.updateWindow }},
 		{http.MethodDelete, "/time-windows", func(a *API) http.HandlerFunc { return a.deleteWindow }},
 
-		{http.MethodGet, "/models", func(a *API) http.HandlerFunc { return a.listModelSuggestions }},
+		{http.MethodGet, "/models", func(a *API) http.HandlerFunc { return a.listModels }},
 		{http.MethodGet, "/accounts", func(a *API) http.HandlerFunc { return a.listAccounts }},
 		{http.MethodPost, "/accounts/sync", func(a *API) http.HandlerFunc { return a.syncAccounts }},
 		{http.MethodGet, "/accounts/models", func(a *API) http.HandlerFunc { return a.listAccountModels }},
@@ -314,24 +316,29 @@ func (a *API) deleteWindow(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // accounts
 
-// listModelSuggestions returns the plugin's seed model list.
+// listModels returns the account model list and where it came from.
 //
-// These are names the add control can offer, not models the plugin claims any
-// account serves: the host exposes no callback for its model registry, so the
-// per-account list is whatever the operator configured.
-func (a *API) listModelSuggestions(w http.ResponseWriter, r *http.Request) {
-	entries := a.svc.Models().All()
-	out := make([]map[string]any, 0, len(entries))
-	for _, e := range entries {
-		if !e.Probeable {
-			continue
-		}
+// The list is read from the same manifest CLIProxyAPI syncs. The plugin has no
+// callback for CPA's own registry, so this is the nearest authoritative source;
+// whether an account can actually serve a model is answered by probing.
+func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
+	registry := a.svc.Models()
+	names := a.svc.Catalog().Models()
+	out := make([]map[string]any, 0, len(names))
+	for _, name := range names {
 		out = append(out, map[string]any{
-			"model":        e.Model,
-			"minReasoning": string(e.MinReasoning),
+			"model":        name,
+			"minReasoning": string(registry.MinReasoning(name)),
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": out})
+	payload := map[string]any{"models": out}
+	if at := a.svc.Catalog().FetchedAt(); !at.IsZero() {
+		payload["fetchedAt"] = at.UTC()
+	} else {
+		payload["fetchedAt"] = nil
+		payload["note"] = "尚未成功拉取模型清单，当前为内置列表"
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
@@ -344,15 +351,19 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		accounts.Account
 		Bindings int `json:"bindings"`
 	}
+	// Count from the binding table rather than from the model list: bindings
+	// outlive a model disappearing from the catalog, and the count is about
+	// what is actually held, not about what is offered.
+	bound := map[string]int{}
+	for pair, binding := range a.svc.States().All() {
+		if a.svc.States().StatusOf(binding, a.now()).Usable() {
+			bound[pair.AuthIndex]++
+		}
+	}
+
 	out := make([]accountView, 0, len(list))
 	for _, acc := range list {
-		bound := 0
-		for _, m := range acc.Models {
-			if _, status := a.svc.States().Lookup(acc.AuthIndex, m); status.Usable() {
-				bound++
-			}
-		}
-		out = append(out, accountView{Account: acc, Bindings: bound})
+		out = append(out, accountView{Account: acc, Bindings: bound[acc.AuthIndex]})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }

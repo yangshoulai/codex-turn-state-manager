@@ -53,6 +53,16 @@ own side:
     the plugin has to branch on the path. Replaying a resource path through the
     management mux 404s while the host reports the dispatch as successful.
 
+## State survives a restart
+
+`plugin-data/` is a mounted volume, so the plugin's database — probe toggles,
+bindings, proxy pool, settings — persists across `make cpa-docker-down` /
+`cpa-docker-up`. Without that mount the database lives inside the container and
+every rebuild silently resets the configuration, which is exactly the kind of
+thing that makes a "did persistence work?" question unanswerable.
+
+Delete `dev/cpa-docker/plugin-data/` to start from scratch.
+
 ## Adding a Codex account
 
 The plugin lists accounts from CPA's auth pool, so with an empty `auths/`
