@@ -482,3 +482,38 @@ func ruleForSelector(sheet, want string) string {
 	}
 	return ""
 }
+
+// TestPanelAssetURLsCarryTheVersion pins the cache-busting that makes an update
+// take effect behind a CDN.
+//
+// Measured against a real deployment: the CDN cached app.js and style.css with
+// its own 4h TTL, overriding the no-cache this package sets, while index.html
+// passed through untouched. A browser refresh -- even a hard one, which only
+// bypasses the browser's cache -- therefore kept loading the previous release's
+// panel. The version in the URL is what makes each release a distinct resource.
+func TestPanelAssetURLsCarryTheVersion(t *testing.T) {
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	served := string(stampAssetReferences("/index.html", html))
+
+	for _, asset := range []string{"app.js", "style.css"} {
+		if strings.Contains(served, `"`+asset+`"`) {
+			t.Errorf("%s is referenced without a cache-busting version", asset)
+		}
+		if !strings.Contains(served, `"`+asset+`?v=`) {
+			t.Errorf("%s is not referenced with ?v=", asset)
+		}
+	}
+
+	// Non-HTML assets are served byte for byte; rewriting them would corrupt
+	// them, and there is nothing in them to rewrite.
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	if got := string(stampAssetReferences("/app.js", js)); got != string(js) {
+		t.Error("app.js was modified on the way out")
+	}
+}

@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+
+	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
 )
 
 //go:embed index.html app.js style.css
@@ -60,7 +62,33 @@ func serveAsset(w http.ResponseWriter, r *http.Request, name string) {
 	}
 	w.Header().Set("Content-Type", ContentType(name))
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(raw)
+	_, _ = w.Write(stampAssetReferences(name, raw))
+}
+
+// stampAssetReferences appends the build version to the panel's asset URLs.
+//
+// Cache-Control: no-cache is not enough. A CDN in front of CPA classifies by
+// file extension: .html passes through untouched, but .js and .css are cached
+// with the CDN's own TTL, which overrides this header. Measured against a real
+// deployment, app.js and style.css came back as max-age=14400 while index.html
+// kept no-cache, so a browser refresh -- even a hard one, which only bypasses
+// the browser's own cache -- kept loading the previous release's panel for four
+// hours. That is how an update left an open panel calling routes that no longer
+// existed.
+//
+// The version in the URL makes each release a distinct resource, which no cache
+// can confuse with the last one. index.html is the right place to do it because
+// it is the one asset the CDN leaves alone, so it is always the current copy
+// that decides which app.js and style.css to fetch.
+func stampAssetReferences(name string, raw []byte) []byte {
+	if !strings.HasSuffix(name, ".html") {
+		return raw
+	}
+	out := string(raw)
+	for _, asset := range []string{"app.js", "style.css"} {
+		out = strings.ReplaceAll(out, `"`+asset+`"`, `"`+asset+`?v=`+version.Version+`"`)
+	}
+	return []byte(out)
 }
 
 // ContentType maps an asset name to its Content-Type.
