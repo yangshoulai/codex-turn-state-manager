@@ -31,15 +31,16 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 | # | 阶段 | 内容 | 产出（验收标准） | 状态 |
 |:--:|---|---|---|:--:|
-| 0 | **P0 — CPA ABI 适配层** | `internal/pluginabi`：把 CPA 宿主 ABI 适配到 `hostapi.Host`，导出注册入口，打通 BeforeAuth → Scheduler → AfterAuth → 响应头的回调链路 | 插件可被真实 CPA 实例加载，端到端闭环跑通 | ⬜ |
+| 0 | **P0 — CPA ABI 适配层** | `internal/pluginabi`：把 CPA 宿主 ABI 适配到 `hostapi.Host`，导出注册入口，打通 Scheduler → AfterAuth → 响应头 → request.complete 的回调链路 | 插件可被真实 CPA 实例加载，端到端闭环跑通 | 🔄 |
 | 1 | **P0 — 基础框架** | 插件项目骨架、CGO 构建、SQLite 初始化、PersistenceManager + Schema 迁移框架、Management API 基础路由 | 可编译加载的插件，启动后可恢复配置 | 🔄 |
+| 1b | **P0 — 与 CPA v7.3.7 对齐** | 读 CPA 源码核对接口，修正 correlation、候选身份、优先级分档、路由注册、资源路由等设计偏差 | 设计文档与真实 ABI 一致 | ✅ |
 | 2 | **P0 — 账号同步** | AccountRegistry：定时同步 CPA Codex 账号 | 面板可展示账号列表 | ✅ |
 | 3 | **P0 — 代理池** | ProxyPool：节点增删改、健康状态、冷却排序、`last_used_at` 持久化 | 代理池可管理，选择顺序按冷却时间 | ✅ |
 | 4 | **P0 — 探测引擎** | ProbeScheduler + TimeWindowManager + ProbeExecutor（含遍历所有代理直到命中目标），探测并发数默认 2 且可配置 | 可对指定 `(账号, 模型)` 发起定时探测 | ✅ |
 | 5 | **P0 — 请求拦截** | CorrelationManager + RequestStateInjector + ResponseStateCollector | 请求头替换与响应头反向绑定全链路打通 | 🔄 |
 | 6 | **P0 — 全局开关** | 定时探测开关 + 反向绑定开关，独立控制，状态持久化 | 两个开关可独立启停 | ✅ |
 | 7 | **P0 — 绑定管理** | 绑定删除 + 历史记录 + Management API | 面板可删除绑定并查看历史 | ✅ |
-| 8 | **P1 — 调度干预** | CredentialScheduler | CPA 调度结果可被插件干预 | 🔄 |
+| 8 | **P1 — 调度干预** | CredentialScheduler + `state_priority_enabled` 开关 + `SchedulerAcrossPriorities` | CPA 调度结果可被插件干预 | 🔄 |
 | 9 | **P1 — 管理面板** | ResourceUI：简洁前端 + 时间窗口配置 + 历史弹窗 + 代理池展示 + 探测并发配置 | 可视化操作全部功能 | 🔄 |
 | 10 | **P1 — 自愈与退避** | State 失败自动失效、探测退避策略、被动续期 | 系统具备自愈能力 | ✅ |
 | 11 | **P2 — 可观测性** | 探测历史查询、代理健康统计、State 状态可视化 | 运维面板完善 | 🔄 |
@@ -69,10 +70,11 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 | # | 缺口 |
 |:--:|---|
-| 1 | 仅差「可被 CPA 加载」这一条：`c-shared` 产物已能构建通过（`nm` 可见导出符号），但 `internal/pluginabi` 尚不存在，见 #0。 |
-| 5 | 代码与单测完整，但 correlation 链路依赖设计文档 §9.2 第 1 条未决问题：BeforeAuth 阶段写入的自定义 header 能否被 Scheduler 与 AfterAuth 读到。未经真实环境验证。 |
-| 8 | 依赖 §9.2 第 2 条未决问题：`SchedulerPickResponse` 是否确实支持返回指定 `AuthID`，以及候选列表标识与 `host.auth.list` 的对应关系。 |
-| 9 | 前端功能齐全、静态资源可正常返回、JS 通过语法检查，但**未在浏览器中实际点击验证过**。另外承载「时间窗口配置」的三个端点 `createWindow`、`updateWindow`、`deleteWindow` 覆盖率仍为 **0.0%**（`probe.TimeWindowManager` 本身测试完整，缺的是 HTTP 层）。 |
+| 0 | 代码已就位：`cliproxy_plugin_init` / `cliproxyPluginCall` / `cliproxyPluginFree` / `cliproxyPluginShutdown` 四个符号均已导出，注册、拦截、调度、响应观察、自愈、Management 桥接都有测试。**差的是真实加载验证**——从未在 CPA 实例中加载过。 |
+| 1 | 仅差「可被 CPA 加载」这一条，见 #0。 |
+| 5 | correlation 机制已整体移除（CPA 在 `Metadata` 里直接给出选中账号），单测完整。剩余缺口是真实环境中的回调时序确认，随 #0 一并验证。 |
+| 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行。 |
+| 9 | 前端功能齐全、静态资源可正常返回、JS 通过语法检查，但**未在浏览器中实际点击验证过**。路由需改为查询参数形式（CPA 只接受精确路径，见设计文档 §5.5），带路径参数的两个端点 `GET /accounts/{a}/models`、`GET\|DELETE /bindings/{a}/{m}/history` 因此尚未注册；时间窗口的三个端点覆盖率仍为 0%。 |
 | 11 | API 侧（探测历史查询、代理健康统计）已完成并有测试；可视化部分随 #9 一并验证。 |
 
 ### 关于第 0 项
@@ -81,9 +83,9 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 ### 建议的推进顺序
 
-1. **#0 ABI 适配层**——当前唯一阻塞点，直接决定 #1、#5、#8 能否收口；设计文档 §8 的 12 项验证在这一步一并完成。
-2. **#9 管理面板浏览器实测**——补上时间窗口三个端点的 HTTP 层测试，并在浏览器里把面板点一遍，#11 随之收口。
-3. **#5、#8 最终验收**——在 #0 打通后，用真实 CPA 实例验证 correlation 链路与调度干预。
+1. **#9 管理 API 改为查询参数 + 补测**——把带路径参数的端点改成查询参数并注册，补上时间窗口端点的 HTTP 层测试。这一步不需要 CPA 实例。
+2. **#0 真实加载验证**——拿到实例后加载共享库，确认注册握手、拦截链路、调度干预、响应捕获的实际时序。
+3. **#5、#8、#11 收口**——随 #0 的实例验证一并完成，面板在浏览器里点一遍。
 
 ---
 

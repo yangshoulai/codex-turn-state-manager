@@ -51,14 +51,16 @@ Read the switch through **one atomic snapshot per request**
 (`settings.Manager.Current()`), never through a cached field. A toggle must take
 effect on the next request.
 
-The two sub-switches (`global_probe_enabled`, `global_reverse_bind_enabled`)
-are only consulted when the master switch is on. Derive this from
-`settings.Values.Capabilities()` rather than re-deriving the matrix at each call
-site — there is exactly one implementation of this truth.
+The three sub-switches (`global_probe_enabled`, `global_reverse_bind_enabled`,
+`state_priority_enabled`) are only consulted when the master switch is on. Derive
+this from `settings.Values.Capabilities()` rather than re-deriving the matrix at
+each call site — there is exactly one implementation of this truth.
 
-Note the asymmetry, which is intentional: with **both** sub-switches off but the
-master on, the plugin still injects state it already holds and still steers
-routing. Only the master switch stops injection.
+Note the asymmetry, which is intentional: with every sub-switch off but the
+master on, the plugin still injects state it already holds. Only the master
+switch stops injection. Routing is gated by the master switch **and**
+`state_priority_enabled`, because overriding the host's load balancing is more
+invasive than rewriting one request's headers.
 
 Probes already in flight when the master switch flips must have their results
 **discarded**, not written.
@@ -168,6 +170,11 @@ when the master switch was on *and* this specific request carried plugin-injecte
 state. `intercept.CorrelationManager` records whether injection happened — use
 that flag, do not infer it.
 
+The trigger is the host's `RequestCompletion` (outcome plus status), not a
+parsed response body. A `rejected` or `canceled` request is never blamed on the
+stored state, and a failure that cannot be attributed to the injected state does
+not evict it.
+
 ---
 
 ## 3. Repository layout
@@ -180,7 +187,11 @@ internal/
   hostapi/             the ONLY place CPA types are described
     host.go            Host interface, Account, Credential, scheduler DTOs
     mock.go            in-memory Host for tests and the dev harness
-  pluginabi/           adapter from the real CPA ABI onto hostapi.Host  [TODO]
+  pluginabi/           adapter from the real CPA C ABI onto hostapi.Host [ABI EDGE]
+    abi.go             cgo preamble, exported symbols, host callback client
+    plugin.go          JSON-RPC dispatch, registration, interceptors, scheduler
+    hostclient.go      hostapi.Host implemented over host.auth.* callbacks
+    management.go      Management API + resource route registration
   version/             build identity + route prefixes
   settings/            config keys, defaults, bounds, atomic runtime snapshot
   storage/             SQLite: connection, migrations, backup/restore, stores
@@ -208,9 +219,15 @@ This is what makes the whole domain testable against `hostapi.MockHost`. Keep it
 that way: when you add a host capability, add it to the `Host` interface and to
 `MockHost` in the same commit.
 
-`cmd/plugin/cshared.go` currently exports only an ABI version probe so the
-toolchain can be validated. The real registration calls land there once the CPA
-plugin SDK surface is confirmed — see section 7.
+`internal/pluginabi` is the only package that may reference CGO or a CPA SDK
+type. The plugin depends on `github.com/router-for-me/CLIProxyAPI/v7` directly
+so the wire structs come from the SDK rather than being re-declared — a field
+rename upstream is then a compile error instead of a silent mismatch.
+
+Two shape rules that are easy to get wrong: the registration **response** uses
+snake_case JSON keys while interceptor, scheduler and stream payloads use
+PascalCase (the Go field names), and `host.auth.get` returns the raw on-disk
+auth file rather than a parsed credential.
 
 ---
 
@@ -293,30 +310,38 @@ Use `hostapi.MockHost` and an in-memory/temp-file SQLite. Inject clocks
 
 ---
 
-## 7. Unverified assumptions — do not present these as working
+## 7. Verification status
 
-The design was written without access to CPA source, the plugin SDK, or a live
-instance. Section 8 and 9.2 of the design document list what still needs
-empirical confirmation. Until each is verified, treat the corresponding code as
-provisional and say so:
+Most of the original open questions were answered by reading the CPA v7.3.7
+source rather than by running an instance; chapter 10 of the design document
+records each one with its evidence. Only one item is still genuinely unverified.
 
-1. Can a custom header injected in `BeforeAuth` be read in the Scheduler and
-   `AfterAuth` stages? (The correlation mechanism depends on this.)
-2. Does `SchedulerPickResponse` really accept a specific `AuthID`, and how does
-   the candidate list correlate with `host.auth.list`?
-3. What is the exact shape of the `host.auth.get` credential JSON — specifically
-   the path to `access_token`?
-4. Does `StreamChunkInterceptor` at `HeaderInitIndex = -1` reliably deliver the
-   initial `X-Codex-Turn-State`?
-5. Does a `c-shared` build actually load into the target CPA version?
-6. Is SQLite WAL write concurrency stable under the plugin's threading,
-   especially concurrent `proxy_node.last_used_at` updates?
-7. Is the cross-midnight time-window logic correct against real clock/DST
-   behaviour?
-8. Can a `.so` be loaded at all, given the toolchain?
+**Answered from source:**
 
-**Do not mark any of the above as done, and do not remove this section, until
-the specific verification in the design document has actually been run.**
+1. ~~Can a header injected in BeforeAuth be read in Scheduler and AfterAuth?~~ —
+   the question is moot: the host publishes `selected_auth_id` /
+   `selected_auth_index` in `Metadata`, so nothing is injected.
+2. `SchedulerPickResponse` does accept a specific `AuthID`, and requires
+   `Handled: true`. Candidates carry the host's `auth.ID`, not `auth_index`.
+3. `host.auth.get` returns the raw on-disk auth file; `access_token` is a
+   provider convention, not a contract.
+4. `StreamChunkHeaderInitIndex == -1` is confirmed, and that call receives the
+   unfiltered upstream response headers.
+5. SQLite WAL concurrency, including concurrent `last_used_at` updates —
+   covered by tests in `internal/storage/wal_test.go`.
+6. Cross-midnight windows against DST — covered by
+   `internal/probe/window_dst_test.go`.
+
+**Still unverified — do not present as working:**
+
+- **Does the `c-shared` build actually load into a real CPA instance?** The
+  library exports the four symbols the loader expects and mirrors the official
+  example's struct layout, but it has never been loaded. Until it has, the
+  plugin is not production-ready, and behaviours that depend on the host calling
+  back correctly (interception, scheduling, capture) are unproven end to end.
+
+Do not remove this section until item 5 above has actually been exercised
+against a running CPA.
 
 ---
 
