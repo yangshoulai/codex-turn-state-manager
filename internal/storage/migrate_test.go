@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/probe"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
 )
@@ -525,3 +526,93 @@ func TestProxyStore_RoundTrip(t *testing.T) {
 }
 
 func contains(haystack, needle string) bool { return strings.Contains(haystack, needle) }
+
+// TestProbeStore_QueryAndRetention covers the probe history filters and the
+// age-based retention.
+//
+// Retention is by age rather than by row count on purpose: the panel reads the
+// recent past, and a row cap lets a burst of probes evict the last hour while
+// keeping days-old rows.
+func TestProbeStore_QueryAndRetention(t *testing.T) {
+	ctx := context.Background()
+	db, dir := openTemp(t)
+	if _, err := db.Migrate(ctx, filepath.Join(dir, "backups"), nil); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	store := db.Probes()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	seed := []probe.HistoryEntry{
+		{AuthIndex: "a1", Model: "m1", ProxyID: "p1", Result: probe.OutcomeSuccessTarget, StateLength: 292, ProbedAt: now.Add(-30 * time.Minute)},
+		{AuthIndex: "a1", Model: "m2", ProxyID: "p1", Result: probe.OutcomeSuccessNonTarget, StateLength: 312, ProbedAt: now.Add(-20 * time.Minute)},
+		{AuthIndex: "a2", Model: "m1", ProxyID: "p2", Result: probe.OutcomeSuccessTarget, StateLength: 292, ProbedAt: now.Add(-10 * time.Minute)},
+		{AuthIndex: "a1", Model: "m1", ProxyID: "p2", Result: probe.OutcomeSuccessTarget, StateLength: 292, ProbedAt: now.Add(-48 * time.Hour)},
+	}
+	for _, e := range seed {
+		if err := store.AppendProbe(ctx, e); err != nil {
+			t.Fatalf("AppendProbe: %v", err)
+		}
+	}
+
+	all, err := store.ListProbes(ctx, probe.ProbeQuery{})
+	if err != nil {
+		t.Fatalf("ListProbes: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("rows = %d, want 4", len(all))
+	}
+	// Newest first.
+	if !all[0].ProbedAt.Equal(seed[2].ProbedAt) {
+		t.Errorf("first row is %v, want the newest", all[0].ProbedAt)
+	}
+
+	// Filter by account.
+	byAccount, err := store.ListProbes(ctx, probe.ProbeQuery{AuthIndex: "a1"})
+	if err != nil {
+		t.Fatalf("ListProbes: %v", err)
+	}
+	if len(byAccount) != 3 {
+		t.Errorf("account filter returned %d rows, want 3", len(byAccount))
+	}
+
+	// Filter by pair.
+	byPair, err := store.ListProbes(ctx, probe.ProbeQuery{AuthIndex: "a1", Model: "m1"})
+	if err != nil {
+		t.Fatalf("ListProbes: %v", err)
+	}
+	if len(byPair) != 2 {
+		t.Errorf("pair filter returned %d rows, want 2", len(byPair))
+	}
+
+	// CountProbes ignores paging, which is what makes the page counter work.
+	total, err := store.CountProbes(ctx, probe.ProbeQuery{AuthIndex: "a1"})
+	if err != nil {
+		t.Fatalf("CountProbes: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("CountProbes = %d, want 3", total)
+	}
+	page, err := store.ListProbes(ctx, probe.ProbeQuery{AuthIndex: "a1", Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("ListProbes paged: %v", err)
+	}
+	if len(page) != 1 {
+		t.Errorf("paged rows = %d, want 1", len(page))
+	}
+
+	// Age-based retention drops the 48-hour-old row and keeps the rest.
+	removed, err := store.PruneProbesBefore(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("PruneProbesBefore: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("pruned %d rows, want 1", removed)
+	}
+	left, err := store.ListProbes(ctx, probe.ProbeQuery{})
+	if err != nil {
+		t.Fatalf("ListProbes after prune: %v", err)
+	}
+	if len(left) != 3 {
+		t.Errorf("rows after prune = %d, want 3", len(left))
+	}
+}

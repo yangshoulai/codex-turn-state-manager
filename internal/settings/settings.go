@@ -30,6 +30,7 @@ const (
 	KeyMaxProbeDurationSec    = "max_probe_duration_sec"
 	KeyAccountRoutingStrategy = "account_routing_strategy"
 	KeyAccountSyncSec         = "account_sync_interval_sec"
+	KeyProbeRetentionHours    = "probe_history_retention_hours"
 )
 
 // RoutingStrategy selects how the credential scheduler picks among candidates.
@@ -77,6 +78,10 @@ type Values struct {
 	MaxProbeDuration     time.Duration
 	RoutingStrategy      RoutingStrategy
 	AccountSyncInterval  time.Duration
+	// ProbeRetention bounds how long a probe_history row is kept. Probe
+	// history is operational telemetry, not an audit log: the panel reads the
+	// last day and older rows are cost without benefit.
+	ProbeRetention time.Duration
 }
 
 // Defaults returns the documented default configuration (design doc 3.3/3.5).
@@ -94,6 +99,7 @@ func Defaults() Values {
 		MaxProbeDuration:         90 * time.Second,
 		RoutingStrategy:          StrategyRespectCPAPriority,
 		AccountSyncInterval:      5 * time.Minute,
+		ProbeRetention:           24 * time.Hour,
 	}
 }
 
@@ -106,6 +112,8 @@ const (
 	MinTargetStateLength = 1
 	MaxTargetStateLength = 8192
 	MinMaxProbeDuration  = 5 * time.Second
+	MinProbeRetention    = time.Hour
+	MaxProbeRetention    = 365 * 24 * time.Hour
 )
 
 // Store persists settings. Implemented by storage.SettingsStore.
@@ -204,6 +212,7 @@ type Patch struct {
 	MaxProbeDuration         *time.Duration
 	RoutingStrategy          *RoutingStrategy
 	AccountSyncInterval      *time.Duration
+	ProbeRetention           *time.Duration
 }
 
 // Update applies a patch, validates it, persists it and publishes a new
@@ -250,6 +259,9 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	if p.AccountSyncInterval != nil {
 		next.AccountSyncInterval = *p.AccountSyncInterval
 	}
+	if p.ProbeRetention != nil {
+		next.ProbeRetention = *p.ProbeRetention
+	}
 
 	if err := next.Validate(); err != nil {
 		return nil, err
@@ -287,6 +299,10 @@ func (v *Values) Validate() error {
 		return fmt.Errorf("settings: target_state_length must be between %d and %d, got %d",
 			MinTargetStateLength, MaxTargetStateLength, v.TargetStateLength)
 	}
+	if v.ProbeRetention < MinProbeRetention || v.ProbeRetention > MaxProbeRetention {
+		return fmt.Errorf("settings: probe_history_retention_hours must be between %s and %s, got %s",
+			MinProbeRetention, MaxProbeRetention, v.ProbeRetention)
+	}
 	if v.MaxProbeDuration < MinMaxProbeDuration {
 		return fmt.Errorf("settings: max_probe_duration must be at least %s, got %s", MinMaxProbeDuration, v.MaxProbeDuration)
 	}
@@ -315,6 +331,7 @@ func encode(v Values) (map[string]string, error) {
 		KeyMaxProbeDurationSec:    strconv.Itoa(int(v.MaxProbeDuration / time.Second)),
 		KeyAccountRoutingStrategy: string(v.RoutingStrategy),
 		KeyAccountSyncSec:         strconv.Itoa(int(v.AccountSyncInterval / time.Second)),
+		KeyProbeRetentionHours:    strconv.Itoa(int(v.ProbeRetention / time.Hour)),
 	}, nil
 }
 
@@ -361,6 +378,18 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 		}
 		*dst = time.Duration(n) * time.Second
 	}
+	hoursAt := func(key string, dst *time.Duration) {
+		s, ok := raw[key]
+		if !ok {
+			return
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil || n <= 0 {
+			problems = append(problems, fmt.Sprintf("%s=%q", key, s))
+			return
+		}
+		*dst = time.Duration(n) * time.Hour
+	}
 	minsAt := func(key string, dst *time.Duration) {
 		s, ok := raw[key]
 		if !ok {
@@ -385,6 +414,7 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	intAt(KeyTargetStateLength, &v.TargetStateLength)
 	secsAt(KeyMaxProbeDurationSec, &v.MaxProbeDuration)
 	secsAt(KeyAccountSyncSec, &v.AccountSyncInterval)
+	hoursAt(KeyProbeRetentionHours, &v.ProbeRetention)
 
 	if s, ok := raw[KeyAccountRoutingStrategy]; ok && strings.TrimSpace(s) != "" {
 		strategy, err := ParseRoutingStrategy(strings.TrimSpace(s))

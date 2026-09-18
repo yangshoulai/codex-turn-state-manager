@@ -129,6 +129,10 @@
           <input type="number" id="s-maxprobe" min="5">
           <span class="field-hint">默认 90。一个 pair 遍历全部代理的上限</span>
         </label>
+        <label>探测记录保留（小时）
+          <input type="number" id="s-retention" min="1">
+          <span class="field-hint">默认 24。更早的记录会被清理</span>
+        </label>
       </div>
 
       <div class="strategy">
@@ -176,6 +180,8 @@
         <span class="muted small" id="accounts-summary">—</span>
       </span>
       <span class="actions">
+        <input id="account-filter" type="text" class="filter-input" placeholder="筛选账号"
+               autocomplete="off" spellcheck="false" aria-label="筛选账号">
         <button id="sync-accounts" class="btn" type="button">同步账号</button>
       </span>
     </div>
@@ -188,7 +194,8 @@
         <h2>最近探测记录</h2>
       </span>
       <span class="actions">
-        <label class="inline">条数 <input type="number" id="probe-limit" value="50" min="10" max="500" step="10"></label>
+        <select id="probe-account-filter" class="filter-select" aria-label="按账号筛选"></select>
+        <label class="inline">每页 <input type="number" id="probe-limit" value="50" min="10" max="500" step="10"></label>
         <button id="refresh-probes" class="btn" type="button">刷新</button>
       </span>
     </div>

@@ -17,6 +17,11 @@ const (
 	Logo       = ""
 )
 
+// MenuLabel is what CPA's menu bar shows for this plugin. The plugin id stays
+// as-is -- it must match the library name and the plugins.configs key -- so the
+// readable name lives here instead.
+const MenuLabel = "Codex Turn State"
+
 // ManagementBasePath is the prefix for every Management API route.
 const ManagementBasePath = "/v0/management/plugins/" + PluginName
 

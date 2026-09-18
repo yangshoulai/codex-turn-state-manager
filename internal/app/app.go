@@ -255,23 +255,29 @@ func (a *App) Stop() {
 	})
 }
 
-// pruneLoop keeps probe_history bounded.
+// pruneLoop drops probe history past its retention.
+//
+// It wakes more often than the retention window so a day-long setting is
+// enforced within the hour rather than up to two days late.
 func (a *App) pruneLoop(ctx context.Context) {
-	const (
-		interval = time.Hour
-		keepRows = 20000
-	)
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if n, err := a.db.Probes().PruneProbes(ctx, keepRows); err != nil {
+			retention := a.settings.Current().ProbeRetention
+			cutoff := time.Now().Add(-retention)
+			n, err := a.db.Probes().PruneProbesBefore(ctx, cutoff)
+			if err != nil {
 				a.log(hostapi.LogWarn, "probe history prune failed", map[string]any{"error": err.Error()})
-			} else if n > 0 {
-				a.log(hostapi.LogDebug, "probe history pruned", map[string]any{"rows": n})
+				continue
+			}
+			if n > 0 {
+				a.log(hostapi.LogInfo, "probe history pruned", map[string]any{
+					"rows": n, "olderThan": cutoff.UTC().Format(time.RFC3339),
+				})
 			}
 		}
 	}

@@ -27,12 +27,41 @@ type HistoryEntry struct {
 	ProbedAt    time.Time `json:"probedAt"`
 }
 
+// ProbeQuery filters and pages probe history.
+//
+// Zero-valued fields mean "no constraint", so the default query is the newest
+// page of everything.
+type ProbeQuery struct {
+	AuthIndex string
+	Model     string
+	Limit     int
+	Offset    int
+}
+
+// Normalise applies the defaults a caller may leave unset.
+func (q ProbeQuery) Normalise() ProbeQuery {
+	if q.Limit <= 0 {
+		q.Limit = 50
+	}
+	if q.Limit > 500 {
+		q.Limit = 500
+	}
+	if q.Offset < 0 {
+		q.Offset = 0
+	}
+	return q
+}
+
 // HistoryStore persists probe history. Implemented by storage.ProbeStore.
 type HistoryStore interface {
 	AppendProbe(ctx context.Context, e HistoryEntry) error
-	ListProbes(ctx context.Context, limit, offset int) ([]HistoryEntry, error)
-	ListProbesFor(ctx context.Context, authIndex, model string, limit int) ([]HistoryEntry, error)
-	PruneProbes(ctx context.Context, keep int) (int64, error)
+	ListProbes(ctx context.Context, q ProbeQuery) ([]HistoryEntry, error)
+	// CountProbes returns how many rows match the query's filters, ignoring
+	// paging, so the panel can show a page count.
+	CountProbes(ctx context.Context, q ProbeQuery) (int, error)
+	// PruneProbesBefore deletes rows probed before the cutoff and reports how
+	// many went.
+	PruneProbesBefore(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // Result is the aggregate outcome of probing one pair across the pool.

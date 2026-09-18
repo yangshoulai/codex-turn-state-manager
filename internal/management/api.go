@@ -176,6 +176,7 @@ type settingsDTO struct {
 	MaxProbeDurationSec      int    `json:"maxProbeDurationSec"`
 	RoutingStrategy          string `json:"routingStrategy"`
 	AccountSyncIntervalSec   int    `json:"accountSyncIntervalSec"`
+	ProbeRetentionHours      int    `json:"probeHistoryRetentionHours"`
 }
 
 func toSettingsDTO(v *settings.Values) settingsDTO {
@@ -192,6 +193,7 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		MaxProbeDurationSec:      int(v.MaxProbeDuration / time.Second),
 		RoutingStrategy:          string(v.RoutingStrategy),
 		AccountSyncIntervalSec:   int(v.AccountSyncInterval / time.Second),
+		ProbeRetentionHours:      int(v.ProbeRetention / time.Hour),
 	}
 }
 
@@ -213,6 +215,7 @@ type settingsPatchDTO struct {
 	MaxProbeDurationSec      *int    `json:"maxProbeDurationSec"`
 	RoutingStrategy          *string `json:"routingStrategy"`
 	AccountSyncIntervalSec   *int    `json:"accountSyncIntervalSec"`
+	ProbeRetentionHours      *int    `json:"probeHistoryRetentionHours"`
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +248,10 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	if dto.AccountSyncIntervalSec != nil {
 		d := time.Duration(*dto.AccountSyncIntervalSec) * time.Second
 		patch.AccountSyncInterval = &d
+	}
+	if dto.ProbeRetentionHours != nil {
+		d := time.Duration(*dto.ProbeRetentionHours) * time.Hour
+		patch.ProbeRetention = &d
 	}
 	if dto.RoutingStrategy != nil {
 		strategy, err := settings.ParseRoutingStrategy(*dto.RoutingStrategy)
@@ -660,13 +667,14 @@ func (a *API) replaceProxies(w http.ResponseWriter, r *http.Request) {
 // probe history
 
 func (a *API) probeHistory(w http.ResponseWriter, r *http.Request) {
-	limit := intQuery(r, "limit", 50)
-	offset := intQuery(r, "offset", 0)
-	if limit > 500 {
-		limit = 500
-	}
+	q := probe.ProbeQuery{
+		AuthIndex: strings.TrimSpace(r.URL.Query().Get("authIndex")),
+		Model:     strings.TrimSpace(r.URL.Query().Get("model")),
+		Limit:     intQuery(r, "limit", 50),
+		Offset:    intQuery(r, "offset", 0),
+	}.Normalise()
 
-	entries, err := a.svc.ProbeHistory().ListProbes(r.Context(), limit, offset)
+	entries, err := a.svc.ProbeHistory().ListProbes(r.Context(), q)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -674,7 +682,21 @@ func (a *API) probeHistory(w http.ResponseWriter, r *http.Request) {
 	if entries == nil {
 		entries = []probe.HistoryEntry{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"probes": entries, "limit": limit, "offset": offset})
+
+	// The total is what makes paging usable; without it the panel can only
+	// offer "next" and hope.
+	total, err := a.svc.ProbeHistory().CountProbes(r.Context(), q)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"probes": entries,
+		"limit":  q.Limit,
+		"offset": q.Offset,
+		"total":  total,
+	})
 }
 
 // ---------------------------------------------------------------------------

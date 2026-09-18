@@ -157,15 +157,15 @@ func (h *recordingHistory) AppendProbe(_ context.Context, e HistoryEntry) error 
 	return nil
 }
 
-func (h *recordingHistory) ListProbes(context.Context, int, int) ([]HistoryEntry, error) {
+func (h *recordingHistory) ListProbes(context.Context, ProbeQuery) ([]HistoryEntry, error) {
 	return nil, nil
 }
 
-func (h *recordingHistory) ListProbesFor(context.Context, string, string, int) ([]HistoryEntry, error) {
-	return nil, nil
-}
+func (h *recordingHistory) CountProbes(context.Context, ProbeQuery) (int, error) { return 0, nil }
 
-func (h *recordingHistory) PruneProbes(context.Context, int) (int64, error) { return 0, nil }
+func (h *recordingHistory) PruneProbesBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
 
 func (h *recordingHistory) all() []HistoryEntry {
 	h.mu.Lock()

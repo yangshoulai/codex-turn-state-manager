@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/probe"
 )
@@ -30,52 +32,68 @@ func (s *ProbeStore) AppendProbe(ctx context.Context, e probe.HistoryEntry) erro
 	})
 }
 
-// ListProbes implements probe.HistoryStore, newest first.
-func (s *ProbeStore) ListProbes(ctx context.Context, limit, offset int) ([]probe.HistoryEntry, error) {
-	if limit <= 0 {
-		limit = 50
+// probeWhere builds the shared filter clause.
+func probeWhere(q probe.ProbeQuery) (string, []any) {
+	var (
+		clauses []string
+		args    []any
+	)
+	if q.AuthIndex != "" {
+		clauses = append(clauses, "auth_index = ?")
+		args = append(args, q.AuthIndex)
 	}
+	if q.Model != "" {
+		clauses = append(clauses, "model = ?")
+		args = append(args, q.Model)
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+// ListProbes implements probe.HistoryStore, newest first by probe time.
+//
+// Ordered by probed_at rather than by insertion id: the two agree when probes
+// are appended as they finish, and diverge the moment one is not. The table's
+// index is on probed_at for the same reason.
+func (s *ProbeStore) ListProbes(ctx context.Context, q probe.ProbeQuery) ([]probe.HistoryEntry, error) {
+	q = q.Normalise()
+	where, args := probeWhere(q)
+	args = append(args, q.Limit, q.Offset)
+
 	rows, err := s.db.sql.QueryContext(ctx, `
 		SELECT id, auth_index, model, COALESCE(proxy_id, ''), result,
 		       COALESCE(state_length, 0), COALESCE(latency_ms, 0), probed_at
-		FROM probe_history
-		ORDER BY id DESC
-		LIMIT ? OFFSET ?`, limit, offset)
+		FROM probe_history`+where+`
+		ORDER BY probed_at DESC, id DESC
+		LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list probe history: %w", err)
 	}
 	return scanProbes(rows)
 }
 
-// ListProbesFor returns probe history for one pair, newest first.
-func (s *ProbeStore) ListProbesFor(ctx context.Context, authIndex, model string, limit int) ([]probe.HistoryEntry, error) {
-	if limit <= 0 {
-		limit = 50
+// CountProbes implements probe.HistoryStore.
+func (s *ProbeStore) CountProbes(ctx context.Context, q probe.ProbeQuery) (int, error) {
+	where, args := probeWhere(q)
+	var n int
+	if err := s.db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM probe_history`+where, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("storage: count probe history: %w", err)
 	}
-	rows, err := s.db.sql.QueryContext(ctx, `
-		SELECT id, auth_index, model, COALESCE(proxy_id, ''), result,
-		       COALESCE(state_length, 0), COALESCE(latency_ms, 0), probed_at
-		FROM probe_history
-		WHERE auth_index = ? AND model = ?
-		ORDER BY id DESC
-		LIMIT ?`, authIndex, model, limit)
-	if err != nil {
-		return nil, fmt.Errorf("storage: list probe history for %s/%s: %w", authIndex, model, err)
-	}
-	return scanProbes(rows)
+	return n, nil
 }
 
-// PruneProbes keeps the newest `keep` rows and deletes the rest, bounding
-// table growth on a long-running instance.
-func (s *ProbeStore) PruneProbes(ctx context.Context, keep int) (int64, error) {
-	if keep <= 0 {
-		return 0, nil
-	}
+// PruneProbesBefore deletes rows older than the cutoff.
+//
+// Retention is by age rather than by row count: the panel reads the recent
+// past, and a row cap would let a burst of probes evict the last hour while
+// keeping days-old rows.
+func (s *ProbeStore) PruneProbesBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	var affected int64
 	err := s.db.Write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `
-			DELETE FROM probe_history
-			WHERE id NOT IN (SELECT id FROM probe_history ORDER BY id DESC LIMIT ?)`, keep)
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM probe_history WHERE probed_at < ?`, FormatTime(cutoff))
 		if err != nil {
 			return err
 		}

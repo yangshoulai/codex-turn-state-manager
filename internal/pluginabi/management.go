@@ -108,9 +108,12 @@ func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 
 // resourceMenuLabel labels the panel entry point; asset routes get no menu
 // entry so the management UI does not list app.js as a page.
+//
+// The label is what an operator reads in CPA's menu bar, so it is written for
+// reading rather than echoing the plugin id.
 func resourceMenuLabel(path string) string {
 	if path == "/index.html" {
-		return version.PluginName
+		return version.MenuLabel
 	}
 	return ""
 }

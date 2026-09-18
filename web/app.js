@@ -119,6 +119,7 @@ const DEFAULTS = {
   refreshThresholdPct: 15,
   targetStateLength: 292,
   maxProbeDurationSec: 90,
+  probeHistoryRetentionHours: 24,
   routingStrategy: "respect_cpa_priority",
 };
 
@@ -132,6 +133,10 @@ const modelCache = new Map();
 // Seed model names for the add control. Suggestions only: the plugin cannot
 // read an account's real model list from CPA, so nothing here is probed until
 // an operator adds it.
+let probeTotal = 0;
+let probeOffset = 0;
+let probeAccountFilter = "";
+let accountFilter = "";
 let modelCatalog = [];
 let modelCatalogNote = "";
 
@@ -542,6 +547,7 @@ function fillSettingsForm(values) {
   $("s-probe").checked = values.globalProbeEnabled;
   $("s-reverse").checked = values.globalReverseBindEnabled;
   $("s-routing").checked = values.statePriorityEnabled;
+  $("s-retention").value = values.probeHistoryRetentionHours;
   $("s-scan").value = values.scanIntervalSec;
   $("s-concurrency").value = values.probeConcurrency;
   $("s-ttl").value = values.stateTtlMin;
@@ -606,6 +612,7 @@ on("save-settings", "click", async () => {
     refreshThresholdPct: Number($("s-threshold").value),
     targetStateLength: Number($("s-length").value),
     maxProbeDurationSec: Number($("s-maxprobe").value),
+    probeHistoryRetentionHours: Number($("s-retention").value),
     routingStrategy: strategy ? strategy.value : undefined,
   };
   try {
@@ -719,7 +726,7 @@ on("add-window", "click", async () => {
 
 function renderAccounts() {
   const host = $("accounts");
-  if (!changed("accounts", [accountsState, [...expanded]])) return;
+  if (!changed("accounts", [accountsState, [...expanded], accountFilter])) return;
   clear(host);
 
   if (!accountsState.length) {
@@ -727,7 +734,20 @@ function renderAccounts() {
     return;
   }
 
-  for (const account of accountsState) {
+  const needle = accountFilter.trim().toLowerCase();
+  const visible = needle
+    ? accountsState.filter((a) =>
+        (a.label || "").toLowerCase().includes(needle) ||
+        (a.authIndex || "").toLowerCase().includes(needle) ||
+        (a.plan && a.plan.type || "").toLowerCase().includes(needle))
+    : accountsState;
+
+  if (!visible.length) {
+    host.append(el("div", { class: "empty", text: `没有匹配「${accountFilter}」的账号` }));
+    return;
+  }
+
+  for (const account of visible) {
     const open = expanded.has(account.authIndex);
     // CPA's ready state is "active"; anything else is worth a second look.
     const statusClass = account.status === "active" && !account.disabled ? "pill-ok"
@@ -797,8 +817,13 @@ async function addModel(authIndex, container, model) {
 }
 
 async function loadModels(authIndex, container, blockedReason) {
-  clear(container);
-  container.append(el("div", { class: "empty", text: "加载中…" }));
+  // Only show the loading state on a first load. Re-showing it on every poll
+  // is what made the panel flash: the table vanished and came back every 15
+  // seconds.
+  if (!container.hasChildNodes()) {
+    container.append(el("div", { class: "empty", text: "加载中…" }));
+  }
+
   let payload;
   try {
     payload = await api("GET", `/accounts/models?${qs({ authIndex })}`);
@@ -810,6 +835,10 @@ async function loadModels(authIndex, container, blockedReason) {
   modelCache.set(authIndex, payload.models || []);
   if (!expanded.has(authIndex)) return; // collapsed while loading
 
+  // Redraw only when something moved. A binding turning fresh, or a probe
+  // countdown changing, is exactly what the operator is watching for -- and
+  // rebuilding identical rows is what makes it flicker.
+  if (!changed(`models:${authIndex}`, [payload.models, blockedReason])) return;
   clear(container);
   const rows = (payload.models || []).map((m) => {
     const probeToggle = el("input", { type: "checkbox", checked: m.probeEnabled });
@@ -939,6 +968,13 @@ async function showHistory(authIndex, model) {
 }
 
 on("modal-close", "click", () => { $("modal").hidden = true; });
+
+// Escape closes the dialog, which is what anyone reaches for.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("modal").hidden) {
+    $("modal").hidden = true;
+  }
+});
 on("modal", "click", (event) => {
   if (event.target === $("modal")) $("modal").hidden = true;
 });
@@ -1123,6 +1159,13 @@ const COPY_ICON =
   '<path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4a1.5 1.5 0 0 0-1.5 1.5V10"/>' +
   '</svg>';
 
+// accountLabel resolves a persistence key to something a person recognises.
+// The auth index is an opaque hash; the email is what the operator thinks in.
+function accountLabel(authIndex) {
+  const account = accountsState.find((a) => a.authIndex === authIndex);
+  return (account && (account.label || account.email)) || authIndex;
+}
+
 // proxyLabel resolves a probe record's proxy id to the node's address, which is
 // what the operator configured. The id itself is internal.
 function proxyLabel(id) {
@@ -1133,12 +1176,12 @@ function proxyLabel(id) {
 
 function renderProbes(probes) {
   const host = $("probes");
-  if (!changed("probes", probes)) return;
+  if (!changed("probes", [probes, probeTotal, probeOffset, probeAccountFilter])) return;
   clear(host);
 
   const rows = (probes || []).map((p) => el("tr", null, [
     el("td", { class: "mono", text: fmtTime(p.probedAt) }),
-    el("td", { class: "mono", text: p.authIndex }),
+    el("td", { text: accountLabel(p.authIndex), title: p.authIndex }),
     el("td", { class: "mono", text: p.model }),
     el("td", { class: "mono", text: proxyLabel(p.proxyId) }),
     el("td", null, el("span", {
@@ -1152,10 +1195,44 @@ function renderProbes(probes) {
   host.append(table(
     [{ label: "时间" }, { label: "账号" }, { label: "模型" }, { label: "代理" },
      { label: "结果" }, { label: "长度" }, { label: "耗时" }],
-    rows, "暂无探测记录"));
+    rows, "该筛选下暂无探测记录"));
+
+  // Paging, so "最近探测记录" is not limited to whatever fits on one screen.
+  const pageSize = Number($("probe-limit").value) || 50;
+  const shown = (probes || []).length;
+  const from = shown ? probeOffset + 1 : 0;
+  const to = probeOffset + shown;
+  host.append(el("div", { class: "pager" }, [
+    el("span", { class: "muted small", text: `第 ${from}–${to} 条，共 ${probeTotal} 条` }),
+    el("span", { class: "actions" }, [
+      el("button", {
+        class: "btn btn-sm", type: "button", text: "上一页",
+        disabled: probeOffset === 0,
+        onclick: () => { probeOffset = Math.max(0, probeOffset - pageSize); invalidate("probes"); loadProbes(); },
+      }),
+      el("button", {
+        class: "btn btn-sm", type: "button", text: "下一页",
+        disabled: probeOffset + shown >= probeTotal,
+        onclick: () => { probeOffset += pageSize; invalidate("probes"); loadProbes(); },
+      }),
+    ]),
+  ]));
 }
 
-on("refresh-probes", "click", () => loadProbes());
+on("refresh-probes", "click", () => { probeOffset = 0; invalidate("probes"); loadProbes(); });
+
+on("probe-account-filter", "change", () => {
+  probeAccountFilter = $("probe-account-filter").value;
+  probeOffset = 0;
+  invalidate("probes");
+  loadProbes();
+});
+
+on("account-filter", "input", () => {
+  accountFilter = $("account-filter").value;
+  invalidate("accounts");
+  renderAccounts();
+});
 on("probe-limit", "change", () => loadProbes());
 
 /* ----------------------------------------------------------------- load */
@@ -1188,8 +1265,33 @@ async function loadProxies() {
 
 async function loadProbes() {
   const limit = Number($("probe-limit").value) || 50;
-  const payload = await api("GET", `/probe-history?limit=${limit}`);
+  const query = qs({
+    limit,
+    offset: probeOffset,
+    authIndex: probeAccountFilter || undefined,
+  });
+  const payload = await api("GET", `/probe-history?${query}`);
+  probeTotal = payload.total != null ? payload.total : (payload.probes || []).length;
   renderProbes(payload.probes);
+  renderProbeFilter();
+}
+
+// renderProbeFilter offers the accounts that actually appear in the history,
+// rather than every account, so the list stays short on a large pool.
+function renderProbeFilter() {
+  const select = $("probe-account-filter");
+  if (!select) return;
+  const known = accountsState.map((a) => a.authIndex);
+  const wanted = [...new Set([probeAccountFilter, ...known].filter(Boolean))].sort();
+
+  if (!changed("probe-filter", wanted)) return;
+  const current = probeAccountFilter;
+  clear(select);
+  select.append(el("option", { value: "", text: "全部账号" }));
+  for (const authIndex of wanted) {
+    select.append(el("option", { value: authIndex, text: accountLabel(authIndex) }));
+  }
+  select.value = current;
 }
 
 async function loadStatus() {
@@ -1218,6 +1320,7 @@ async function loadStatus() {
 async function loadAll() {
   await loadStatus();
   await loadModelCatalog();
+  await loadAccounts();   // the probe history and its filter name accounts
   await loadSettings();
   // A failing subsystem must not block the panel; each section reports its own
   // error so the operator can still reach the settings that would fix it.
@@ -1229,6 +1332,15 @@ async function refresh() {
   // whatever they were when the panel connected, which is the one moment they
   // are guaranteed to read zero.
   await Promise.allSettled([loadStatus(), loadAccounts(), loadProxies(), loadProbes()]);
+
+  // Expanded model tables were the one thing left out, so a binding that turned
+  // fresh stayed stale on screen until a manual reload.
+  await Promise.allSettled([...expanded].map((authIndex) => {
+    const body = document.querySelector(`[data-account-body="${CSS.escape(authIndex)}"]`);
+    if (!body) return Promise.resolve();
+    const account = accountsState.find((a) => a.authIndex === authIndex);
+    return loadModels(authIndex, body, account && account.blockedReason).catch(() => {});
+  }));
 }
 
 on("sync-accounts", "click", async () => {
