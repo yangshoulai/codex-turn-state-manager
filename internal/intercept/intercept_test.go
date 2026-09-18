@@ -696,3 +696,64 @@ func TestStatsCountPipelineActivity(t *testing.T) {
 		t.Errorf("CapturedReused = %d, want 1", got.CapturedReused)
 	}
 }
+
+// TestObserveResolvesAccountFromCorrelation pins where the account identity
+// comes from on the streaming path.
+//
+// The host's stream-chunk payload does not include selected_auth_index --
+// measured against a live instance, not assumed -- so the correlation record the
+// injector wrote is the only source. Both the capture and the account-state
+// signals depend on resolving it before capture consumes the record.
+func TestObserveResolvesAccountFromCorrelation(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	var gotAuthIndex string
+	var gotSignals headers.Signals
+	h.collector.signals = func(authIndex string, signals headers.Signals) {
+		gotAuthIndex, gotSignals = authIndex, signals
+	}
+
+	// A request whose payload carries no account, only a correlation record.
+	h.corr.Record("req-1", "gpt-5-codex", "auth-id-1", "codex-auth-1")
+
+	chunk := headerInit("gpt-5-codex", "", stateOf(targetLength))
+	chunk.ResponseHeaders.Set(headers.SignalPlanType, "pro")
+	chunk.ResponseHeaders.Set(headers.SignalPrimaryUsedPercent, "42")
+
+	if got := h.collector.Observe(ctx, chunk); got.Action != CaptureBound {
+		t.Fatalf("action = %s, want bound via the resolved account", got.Action)
+	}
+	if gotAuthIndex != "codex-auth-1" {
+		t.Errorf("signals recorded against %q, want codex-auth-1", gotAuthIndex)
+	}
+	if gotSignals.PlanType != "pro" {
+		t.Errorf("PlanType = %q, want pro", gotSignals.PlanType)
+	}
+	if gotSignals.PrimaryUsedPercent == nil || *gotSignals.PrimaryUsedPercent != 42 {
+		t.Errorf("PrimaryUsedPercent = %v, want 42", gotSignals.PrimaryUsedPercent)
+	}
+}
+
+// TestObserveSnapshotRecordsCorrelation pins that the diagnostic snapshot
+// reports whether a correlation record was found. The field existed but was
+// never populated, so it always read false -- a diagnostic that lies is worse
+// than none.
+func TestObserveSnapshotRecordsCorrelation(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	h.corr.Record("req-1", "gpt-5-codex", "auth-id-1", "codex-auth-1")
+	h.collector.Observe(ctx, headerInit("gpt-5-codex", "", ""))
+
+	snap := h.collector.stats.LastHeaderInit()
+	if snap == nil {
+		t.Fatal("no snapshot recorded")
+	}
+	if !snap.Correlated {
+		t.Error("Correlated = false with a record present")
+	}
+	if snap.AuthIndex != "codex-auth-1" {
+		t.Errorf("AuthIndex = %q, want codex-auth-1", snap.AuthIndex)
+	}
+}

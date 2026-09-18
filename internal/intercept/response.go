@@ -95,13 +95,16 @@ func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) Capt
 		return CaptureResult{Action: CaptureNotHeaderInit}
 	}
 	c.stats.streamHeaders.Add(1)
-	// The plan and rate-limit windows ride along on every real response. CPA
-	// exposes neither to plugins, so this is the only place the plugin can
-	// learn them, and it is free.
-	if c.signals != nil && chunk.AuthIndex != "" {
-		if parsed := headers.ParseSignals(chunk.ResponseHeaders); !parsed.Empty() {
-			c.signals(chunk.AuthIndex, parsed)
-		}
+
+	// Resolve the account here rather than leaving it to capture().
+	//
+	// The streaming payload does not carry selected_auth_index -- measured, not
+	// assumed -- so the only reliable source is the correlation record the
+	// injector wrote. capture() consumes that record, so this has to run first.
+	authIndex := chunk.AuthIndex
+	rec, correlated := c.corr.Get(chunk.RequestID)
+	if authIndex == "" && correlated {
+		authIndex = rec.AuthIndex
 	}
 
 	// Snapshot before capture, so the record reflects what arrived rather than
@@ -109,13 +112,24 @@ func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) Capt
 	c.stats.recordHeaderInit(HeaderInitSnapshot{
 		RequestID:   chunk.RequestID,
 		Model:       chunk.Model,
-		AuthIndex:   chunk.AuthIndex,
+		AuthIndex:   authIndex,
+		Correlated:  correlated,
 		HeaderCount: len(chunk.ResponseHeaders),
 		HeaderNames: headerNames(chunk.ResponseHeaders),
 		HasState:    chunk.ResponseHeaders.Get(headers.TurnState) != "",
 		StateLength: len(chunk.ResponseHeaders.Get(headers.TurnState)),
 	})
-	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
+
+	// The plan and rate-limit windows ride along on every real response, and
+	// CPA exposes neither to plugins. It is the only place to learn them, and
+	// it costs nothing.
+	if c.signals != nil && authIndex != "" {
+		if parsed := headers.ParseSignals(chunk.ResponseHeaders); !parsed.Empty() {
+			c.signals(authIndex, parsed)
+		}
+	}
+
+	return c.capture(ctx, chunk.RequestID, chunk.Model, authIndex, chunk.ResponseHeaders)
 }
 
 // ObserveResponse handles the non-streaming response interceptor, which is the
