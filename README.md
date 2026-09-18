@@ -272,7 +272,7 @@ request path.
 | `internal/accounts` | CPA account sync, the `AuthIndex` ⇄ `AuthID` mapping, plan claims, and the probe-health gate. |
 | `internal/models` | The model catalog and each model's reasoning floor. |
 | `internal/states` | Bindings, their lifecycle, and the lock-free hot-path snapshot. |
-| `internal/proxies` | Proxy pool health, cooldown, and least-recently-used selection. |
+| `internal/proxies` | Proxy pool, the per-(account, proxy) cooldown ledger, and least-recently-used selection. |
 | `internal/probe` | Scan scheduling, time windows, backoff, proxy traversal, request shape. |
 | `internal/intercept` | Correlation across interceptor stages, injection, capture, self-healing. |
 | `internal/headers` | The header names this plugin reads and the upstream signal parsing. |
@@ -300,14 +300,20 @@ another proxy could not fix.
 faults. Upstream 400/401/403/429 are not, and never evict a healthy node — the walk stops
 on them instead.
 
-**Proxy cooldown ladder.** A node that deserves a rest steps aside for 1, 2, 4, 8, 16, 32
-then 64 minutes, doubling and holding at the cap; at the cap its counter resets so the
-next failure starts at a minute again, which is what keeps an outage longer than an hour
-from removing a node permanently. Two things earn a cooldown: a proxy fault, and a
-response whose state length is not the target — the request succeeded, but this node is
-not yielding what the pair needs, so the next round prefers another. A node in cooldown
-is not selectable. The panel shows the remaining time and offers a reset that clears both
-the cooldown and the counters.
+**Cooling is per account, not per proxy.** The same node returns the target state length
+for one account and a non-target length for another, because the upstream decides per
+account — so a node-level cooldown lets one account's failures take a working node away
+from everyone else. Availability is therefore recorded per `(account, proxy)` pair: a
+node benched for one account is still selectable by every other, and a round ends for one
+account only when all of *its* nodes are benched. The node list shows how many accounts
+currently have each node benched; the 详情 button opens the per-account rows with a reset
+on each, and the section has a global reset.
+
+**Cooldown ladder.** 1, 2, 4, 8, 16, 32 then 64 minutes, doubling and holding at the cap;
+at the cap the pair's counter resets so the next failure starts at a minute again, which
+is what keeps an outage longer than an hour from removing a pair permanently. Two things
+earn a cooldown: a proxy fault, and a response whose state length is not the target — the
+request succeeded, but this node is not yielding what that account needs.
 
 **Scanning is not probing.** A one-minute scan only enqueues probes that are actually
 due; a non-target-length result backs off for minutes, not seconds.
@@ -378,7 +384,9 @@ GET    /bindings/history?authIndex=…&model=…&expand=1&limit=&offset=
 DELETE /bindings/history?authIndex=…&model=…
 GET    /proxy-nodes
 PUT    /proxy-nodes
-POST   /proxy-nodes/reset?nodeId=…
+POST   /proxy-nodes/reset?nodeId=…&authIndex=…
+POST   /proxy-nodes/reset-all
+GET    /proxy-nodes/cooldowns?nodeId=…
 GET    /probe-history?authIndex=&model=&limit=50&offset=0
 ```
 

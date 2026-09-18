@@ -1072,8 +1072,10 @@ async function deleteBinding(authIndex, model) {
 let modalContext = null;
 
 async function showHistory(authIndex, model) {
-  modalContext = { authIndex, model };
+  modalContext = { kind: "history", authIndex, model };
   $("modal-title").textContent = `${authIndex} / ${model} — 绑定历史`;
+  $("modal-clear").hidden = false;
+  $("modal-reset-all").hidden = true;
   $("modal").hidden = false;
 
   const body = $("modal-body");
@@ -1124,6 +1126,90 @@ document.addEventListener("keydown", (event) => {
 on("modal", "click", (event) => {
   if (event.target === $("modal")) $("modal").hidden = true;
 });
+// showCooldowns is the detail modal for one proxy: every account that has a
+// record against it, with a reset per row.
+//
+// A node no longer has one health value -- the same proxy works for one account
+// and not for another -- so the per-account rows are the whole picture, and the
+// reset has to be available per row rather than only globally.
+async function showCooldowns(proxyId) {
+  modalContext = { kind: "cooldowns", proxyId };
+  $("modal-title").textContent = `${proxyLabel(proxyId)} — 各账号冷却状态`;
+  $("modal-clear").hidden = true;
+  $("modal-reset-all").hidden = false;
+  $("modal").hidden = false;
+
+  const body = $("modal-body");
+  clear(body);
+  body.append(el("div", { class: "empty", text: "加载中…" }));
+
+  try {
+    const payload = await api("GET", `/proxy-nodes/cooldowns?${qs({ nodeId: proxyId })}`);
+    const rows = (payload.cooldowns || []).map((c) => {
+      const until = c.cooldownUntil ? new Date(c.cooldownUntil) : null;
+      const cooling = until && until > new Date();
+      const button = el("button", {
+        class: "btn btn-sm", type: "button", text: "重置",
+        onclick: () => resetCooldown(c.authIndex, proxyId),
+      });
+      return el("tr", null, [
+        el("td", { text: accountLabel(c.authIndex), title: c.authIndex }),
+        el("td", null, el("span", {
+          class: "pill " + (cooling ? "pill-warn" : "pill-ok"),
+          text: cooling ? "冷却中" : "可用",
+        })),
+        el("td", { class: "muted small", text: cooling ? fmtDuration(Math.round((until - Date.now()) / 1000)) : "—" }),
+        el("td", { class: "num", text: c.consecutiveFailures || 0 }),
+        el("td", { class: "num", text: c.failureCount || 0 }),
+        el("td", { class: "muted small", text: fmtAgo(c.lastFailure) }),
+        el("td", null, el("div", { class: "row-actions" }, button)),
+      ]);
+    });
+    clear(body);
+    body.append(table(
+      [{ label: "账号" }, { label: "状态" }, { label: "剩余" },
+       { label: "连败" }, { label: "累计失败" }, { label: "最近失败" }, { label: "" }],
+      rows, "该代理还没有任何失败记录"));
+  } catch (err) {
+    clear(body);
+    body.append(el("div", { class: "empty", text: err.message }));
+  }
+}
+
+async function resetCooldown(authIndex, proxyId) {
+  try {
+    await api("POST", `/proxy-nodes/reset?${qs({ nodeId: proxyId, authIndex })}`);
+    toast("已重置该账号在此代理上的冷却");
+    await showCooldowns(proxyId);
+    await loadProxies();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+on("reset-cooldowns", "click", async () => {
+  if (!confirm("清除所有账号在所有代理上的冷却与失败计数？")) return;
+  try {
+    await api("POST", "/proxy-nodes/reset-all");
+    toast("已重置全部冷却");
+    await loadProxies();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+on("modal-reset-all", "click", async () => {
+  if (!confirm("清除所有账号在所有代理上的冷却与失败计数？")) return;
+  try {
+    await api("POST", "/proxy-nodes/reset-all");
+    toast("已重置全部冷却");
+    $("modal").hidden = true;
+    await loadProxies();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
 on("modal-clear", "click", async () => {
   if (!modalContext) return;
   if (!confirm("清除该组合的全部绑定历史？此操作不可撤销。")) return;
@@ -1172,17 +1258,16 @@ function renderProxies() {
       el("td", null, el("span", { class: "pill " + statusCls, text: node.status })),
       el("td", { class: "num", text: node.lastLatencyMs ? node.lastLatencyMs + "ms" : "—" }),
       el("td", { class: "num", text: `${node.successCount || 0} / ${node.failureCount || 0}` }),
-      el("td", null, [
-        el("div", { class: "muted small", text: cooldownText(node) }),
-        node.consecutiveFailures
-          ? el("div", { class: "muted small", text: `连败 ${node.consecutiveFailures} 次` })
-          : null,
-      ]),
+      // Availability is per account, so this column reports how many accounts
+      // currently have the node benched rather than a single verdict.
+      el("td", null, node.coolingForAccounts
+        ? el("span", { class: "pill pill-warn", text: `${node.coolingForAccounts} 个账号冷却中` })
+        : el("span", { class: "muted small", text: "全部可用" })),
       el("td", { class: "muted small", text: fmtAgo(node.lastUsedAt) }),
       el("td", null, el("div", { class: "row-actions" }, [
-        el("button", { class: "btn btn-sm", type: "button", text: "重置冷却",
-          title: "清除冷却与失败计数，让该节点立即回到池中",
-          onclick: () => resetProxy(node.id) }),
+        el("button", { class: "btn btn-sm", type: "button", text: "详情",
+          title: "查看该代理在每个账号上的冷却状态",
+          onclick: () => showCooldowns(node.id) }),
         el("button", { class: "btn btn-sm btn-danger", type: "button", text: "移除",
           onclick: () => {
             proxiesState.splice(index, 1);
@@ -1212,16 +1297,6 @@ function cooldownText(node) {
   if (Number.isNaN(until.getTime()) || until <= new Date()) return "—";
   const secs = Math.round((until - Date.now()) / 1000);
   return `冷却 ${fmtDuration(secs)}（至 ${fmtTime(node.cooldownUntil)}）`;
-}
-
-async function resetProxy(nodeId) {
-  try {
-    await api("POST", `/proxy-nodes/reset?${qs({ nodeId })}`);
-    toast("已重置该节点的冷却与计数");
-    await loadProxies();
-  } catch (err) {
-    toast(err.message, true);
-  }
 }
 
 on("add-proxy", "click", () => {

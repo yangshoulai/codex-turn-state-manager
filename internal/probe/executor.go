@@ -172,7 +172,9 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 	started := e.now()
 	policy := e.policy()
 
-	available := e.pool.Available(started)
+	// Scoped to the account: a node benched for this account is still available
+	// to every other, which is the point of keeping the ledger per pair.
+	available := e.pool.AvailableFor(authIndex, started)
 	if len(available) == 0 {
 		r := Result{Outcome: OutcomeNoProxyAvailable}
 		e.record(ctx, authIndex, model, r, started)
@@ -230,7 +232,7 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 		switch {
 		case attempt.Outcome == OutcomeSuccessTarget:
 			// Target hit: bind and stop (design doc 3.7.3, rule 1).
-			_ = e.pool.MarkSuccess(runCtx, node.ID, attempt.Latency, e.now())
+			_ = e.pool.MarkSuccess(runCtx, authIndex, node.ID, attempt.Latency, e.now())
 			result.Latency = e.now().Sub(started)
 			return result
 
@@ -246,7 +248,7 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 			// the pair needs, so it steps aside for the rest of the ladder. The
 			// upstream errors that must not evict a node (400/401/403/429) are
 			// Terminal, and returned above.
-			e.coolDown(runCtx, node.ID)
+			e.coolDown(runCtx, authIndex, node.ID)
 		}
 	}
 
@@ -259,10 +261,10 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 // The count is taken before the increment so the first failure gets the base
 // delay, and it is cleared when the ladder reaches its cap so the next failure
 // starts over rather than holding the node out indefinitely.
-func (e *Executor) coolDown(ctx context.Context, id string) {
-	failures := e.consecutiveFailures(id)
+func (e *Executor) coolDown(ctx context.Context, authIndex, id string) {
+	failures := e.consecutiveFailures(authIndex, id)
 	cooldown := ProxyCooldown(failures)
-	if _, err := e.pool.MarkFailure(ctx, id, cooldown, e.now(), ProxyCooldownReachedCap(failures)); err != nil {
+	if _, err := e.pool.MarkFailure(ctx, authIndex, id, cooldown, e.now(), ProxyCooldownReachedCap(failures)); err != nil {
 		e.log(hostapi.LogWarn, "could not cool down proxy", map[string]any{
 			"proxyId": id, "error": err.Error(),
 		})
@@ -418,10 +420,15 @@ func isModelUnsupported(resp *http.Response) bool {
 	return false
 }
 
-func (e *Executor) consecutiveFailures(id string) int {
-	if n, ok := e.pool.Get(id); ok {
-		return n.ConsecutiveFailures
+// consecutiveFailures is how many times this account has failed against this
+// node in a row, which is the ladder position the next cooldown comes from.
+func (e *Executor) consecutiveFailures(authIndex, id string) int {
+	for _, row := range e.pool.CooldownsForProxy(id) {
+		if row.AuthIndex == authIndex {
+			return row.ConsecutiveFailures
+		}
 	}
+	// No record: this is the first failure, and the base delay is what follows.
 	return 1
 }
 

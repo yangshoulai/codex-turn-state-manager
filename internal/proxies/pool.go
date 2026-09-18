@@ -11,17 +11,21 @@ import (
 )
 
 // Node is one proxy in the pool.
+//
+// There is deliberately no cooldown here. Availability depends on which account
+// is asking -- the same node returns the target state length for one account and
+// a non-target length for another -- so it lives in the per-pair ledger in
+// cooldown.go. The counts below are the node's own lifetime totals, kept for the
+// operator's benefit, and they no longer decide anything.
 type Node struct {
 	ID      string `json:"id"`
 	URL     string `json:"url"`
 	Enabled bool   `json:"enabled"`
 
-	SuccessCount        int `json:"successCount"`
-	FailureCount        int `json:"failureCount"`
-	ConsecutiveFailures int `json:"consecutiveFailures"`
+	SuccessCount int `json:"successCount"`
+	FailureCount int `json:"failureCount"`
 
-	CooldownUntil *time.Time `json:"cooldownUntil,omitempty"`
-	LastLatencyMS *int       `json:"lastLatencyMs,omitempty"`
+	LastLatencyMS *int `json:"lastLatencyMs,omitempty"`
 
 	// LastUsedAt is stamped the moment a node is picked, before the request is
 	// sent, so concurrent probe workers never pick the same node (design doc
@@ -31,26 +35,19 @@ type Node struct {
 	LastFailure *time.Time `json:"lastFailure,omitempty"`
 }
 
-// Healthy reports whether the node is enabled and out of cooldown at `now`.
-func (n Node) Healthy(now time.Time) bool {
-	return n.Enabled && !n.CoolingDown(now)
-}
-
-// CoolingDown reports whether the node is inside a cooldown window.
-func (n Node) CoolingDown(now time.Time) bool {
-	return n.CooldownUntil != nil && now.Before(*n.CooldownUntil)
-}
+// Healthy reports whether the node may be used at all.
+//
+// "At all" is the whole of it now: whether it is usable *for a given account*
+// is answered by Pool.AvailableFor, because that is a different question with a
+// different answer per account.
+func (n Node) Healthy() bool { return n.Enabled }
 
 // Status renders the node state for the panel.
-func (n Node) Status(now time.Time) string {
-	switch {
-	case !n.Enabled:
+func (n Node) Status() string {
+	if !n.Enabled {
 		return "disabled"
-	case n.CoolingDown(now):
-		return "cooldown"
-	default:
-		return "healthy"
 	}
+	return "healthy"
 }
 
 // Store persists pool state. Implemented by storage.ProxyStore.
@@ -58,6 +55,11 @@ type Store interface {
 	ListProxies(ctx context.Context) ([]Node, error)
 	UpsertProxy(ctx context.Context, n Node) error
 	DeleteProxy(ctx context.Context, id string) error
+
+	ListCooldowns(ctx context.Context) ([]Cooldown, error)
+	UpsertCooldown(ctx context.Context, c Cooldown) error
+	DeleteCooldown(ctx context.Context, authIndex, proxyID string) error
+	DeleteAllCooldowns(ctx context.Context) error
 }
 
 // Pool is the in-memory view of the proxy pool. It is small (a handful of
@@ -68,11 +70,13 @@ type Pool struct {
 
 	mu    sync.Mutex
 	nodes map[string]Node
+	// coolers is the per-(account, proxy) failure ledger. Guarded by mu.
+	coolers *cooldowns
 }
 
 // NewPool builds an empty pool. Call Load to populate it.
 func NewPool(store Store) *Pool {
-	return &Pool{store: store, nodes: map[string]Node{}}
+	return &Pool{store: store, nodes: map[string]Node{}, coolers: newCooldowns(store)}
 }
 
 // Load rebuilds the pool from the store, restoring health counters and
@@ -87,6 +91,11 @@ func (p *Pool) Load(ctx context.Context) error {
 	p.nodes = make(map[string]Node, len(nodes))
 	for _, n := range nodes {
 		p.nodes[n.ID] = n
+	}
+	// Cooldowns are loaded with the nodes: both are needed before the first
+	// probe, and the panel reads them without a second round trip.
+	if err := p.coolers.load(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -103,20 +112,25 @@ func (p *Pool) All() []Node {
 	return out
 }
 
-// Available returns enabled nodes that are out of cooldown, ordered by the
+// AvailableFor returns the nodes one account may probe through, ordered by the
 // selection policy in design doc 3.7.2:
 //
-//  1. enabled and cooldownUntil <= now
+//  1. enabled, and not in cooldown *for this account*
 //  2. ascending lastUsedAt -- least recently used first
 //  3. never-used nodes (nil lastUsedAt) sort ahead of every used node
 //  4. ties broken by ascending ID for a stable order
-func (p *Pool) Available(now time.Time) []Node {
+//
+// The account is part of the filter rather than an afterthought: a node that
+// keeps failing for one account stays available to every other, which is what
+// the ledger exists for. An empty result means every usable node is benched for
+// this account, and the caller ends the round for it rather than waiting.
+func (p *Pool) AvailableFor(authIndex string, now time.Time) []Node {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	out := make([]Node, 0, len(p.nodes))
 	for _, n := range p.nodes {
-		if !n.Enabled || n.CoolingDown(now) {
+		if !n.Enabled || !p.coolers.available(authIndex, n.ID, now) {
 			continue
 		}
 		out = append(out, n)
@@ -207,64 +221,95 @@ func (p *Pool) MarkUsed(ctx context.Context, id string, now time.Time) error {
 	return p.store.UpsertProxy(ctx, n)
 }
 
-// MarkSuccess records a successful probe.
-func (p *Pool) MarkSuccess(ctx context.Context, id string, latency time.Duration, now time.Time) error {
+// MarkSuccess records a successful probe for one account.
+//
+// The node's own counters still move -- how often a node works overall is worth
+// seeing -- but availability is governed by the pair's ladder, so a success here
+// only clears this account's streak.
+func (p *Pool) MarkSuccess(ctx context.Context, authIndex, id string, latency time.Duration, now time.Time) error {
 	ms := int(latency.Milliseconds())
 	n, err := p.mutate(id, func(n *Node) {
 		n.SuccessCount++
-		n.ConsecutiveFailures = 0
-		n.CooldownUntil = nil
 		n.LastSuccess = &now
 		n.LastLatencyMS = &ms
 	})
 	if err != nil {
 		return err
 	}
-	return p.store.UpsertProxy(ctx, n)
+	if err := p.store.UpsertProxy(ctx, n); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.recordSuccess(ctx, authIndex, id)
 }
 
-// MarkFailure records a failure and applies the cooldown.
+// MarkFailure advances one account's ladder against one node.
 //
 // resetAfterCooldown is set by the caller once the ladder has reached its cap:
-// the counter then drops back to zero so the next failure starts at one minute
-// again. Without it a node that has failed seven times would sit at the cap
-// forever, and a proxy whose outage outlasts an hour would never be retried.
-func (p *Pool) MarkFailure(ctx context.Context, id string, cooldown time.Duration, now time.Time, resetAfterCooldown bool) (Node, error) {
+// the counter then drops back to zero so the next failure starts at the base
+// delay again. Without it a pair that has failed seven times would sit at the
+// cap forever, and an outage outlasting the cap would never be retried.
+func (p *Pool) MarkFailure(ctx context.Context, authIndex, id string, cooldown time.Duration, now time.Time, resetAfterCooldown bool) (Cooldown, error) {
+	// The node's lifetime failure count is a property of the node, so it still
+	// moves; only the cooldown decision moved to the pair.
 	n, err := p.mutate(id, func(n *Node) {
 		n.FailureCount++
-		n.ConsecutiveFailures++
 		n.LastFailure = &now
-		if cooldown > 0 {
-			until := now.Add(cooldown)
-			n.CooldownUntil = &until
-		}
-		if resetAfterCooldown {
-			n.ConsecutiveFailures = 0
-		}
 	})
 	if err != nil {
-		return Node{}, err
+		return Cooldown{}, err
 	}
-	return n, p.store.UpsertProxy(ctx, n)
+	if err := p.store.UpsertProxy(ctx, n); err != nil {
+		return Cooldown{}, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.recordFailure(ctx, authIndex, id, cooldown, now, resetAfterCooldown)
 }
 
-// ResetFailure clears a node's cooldown and both failure counters, returning it
-// to the pool immediately.
+// ResetCooldown clears one account's state against one node, counters included.
 //
-// The counters are cleared too, not just the cooldown: an operator pressing
-// reset after fixing a proxy means "start over", and leaving the ladder where it
-// was would put the node straight back into a long cooldown on its next hiccup.
-func (p *Pool) ResetFailure(ctx context.Context, id string, now time.Time) (Node, error) {
-	n, err := p.mutate(id, func(n *Node) {
-		n.ConsecutiveFailures = 0
-		n.FailureCount = 0
-		n.CooldownUntil = nil
-		n.LastFailure = nil
-	})
-	if err != nil {
-		return Node{}, err
-	}
-	return n, p.store.UpsertProxy(ctx, n)
+// The counters go too, not just the cooldown: an operator pressing reset after
+// fixing something means "start over", and leaving the ladder where it was would
+// put the pair straight back into a long cooldown on its next hiccup.
+func (p *Pool) ResetCooldown(ctx context.Context, authIndex, id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.reset(ctx, authIndex, id)
+}
+
+// ResetAllCooldowns clears every pair. This is the panel's global reset.
+func (p *Pool) ResetAllCooldowns(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.resetAll(ctx)
+}
+
+// Cooldowns returns every recorded pair, sorted for display.
+func (p *Pool) Cooldowns() []Cooldown {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.all()
+}
+
+// CooldownsForProxy returns the pairs recorded against one node.
+func (p *Pool) CooldownsForProxy(proxyID string) []Cooldown {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.forProxy(proxyID)
+}
+
+// CooldownSummary counts, per node, how many accounts have it benched right now.
+//
+// The node list cannot show one health value any more -- that is the point of
+// the change -- so it shows this and leaves the detail to the panel.
+func (p *Pool) CooldownSummary(now time.Time) map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coolers.summary(now)
 }
 
 func (p *Pool) mutate(id string, fn func(*Node)) (Node, error) {

@@ -107,6 +107,8 @@ func Routes() []Route {
 
 		{http.MethodGet, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.listProxies }},
 		{http.MethodPost, "/proxy-nodes/reset", func(a *API) http.HandlerFunc { return a.resetProxy }},
+		{http.MethodPost, "/proxy-nodes/reset-all", func(a *API) http.HandlerFunc { return a.resetAllCooldowns }},
+		{http.MethodGet, "/proxy-nodes/cooldowns", func(a *API) http.HandlerFunc { return a.listCooldowns }},
 		{http.MethodPut, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.replaceProxies }},
 
 		{http.MethodGet, "/probe-history", func(a *API) http.HandlerFunc { return a.probeHistory }},
@@ -136,13 +138,13 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 	proxies := a.svc.Proxies().All()
 
 	healthy := 0
-	now := a.now()
 	for _, p := range proxies {
-		if p.Healthy(now) {
+		if p.Healthy() {
 			healthy++
 		}
 	}
 
+	now := a.now()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":  version.Version,
 		"now":      now.UTC(),
@@ -674,14 +676,23 @@ func (a *API) clearBindingHistory(w http.ResponseWriter, r *http.Request) {
 type proxyView struct {
 	proxies.Node
 	Status string `json:"status"`
+	// CoolingForAccounts counts the accounts that currently have this node
+	// benched, which is the only node-level health statement left.
+	CoolingForAccounts int `json:"coolingForAccounts,omitempty"`
 }
 
 func (a *API) listProxies(w http.ResponseWriter, r *http.Request) {
 	now := a.now()
 	nodes := a.svc.Proxies().All()
+	// Availability is per account now, so a node cannot carry one health value.
+	// The list shows how many accounts currently have it benched and leaves the
+	// detail to the cooldown view.
+	summary := a.svc.Proxies().CooldownSummary(now)
 	out := make([]proxyView, 0, len(nodes))
 	for _, n := range nodes {
-		out = append(out, proxyView{Node: n, Status: n.Status(now)})
+		view := proxyView{Node: n, Status: n.Status()}
+		view.CoolingForAccounts = summary[n.ID]
+		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"proxies": out})
 }
@@ -814,17 +825,52 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// resetProxy clears a node's cooldown and failure counters.
+// resetProxy clears cooldown state for one account against one node, or for
+// every pair when no account is named.
 func (a *API) resetProxy(w http.ResponseWriter, r *http.Request) {
 	nodeID := strings.TrimSpace(r.URL.Query().Get("nodeId"))
+	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
 	if nodeID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("nodeId query parameter is required"))
 		return
 	}
-	node, err := a.svc.Proxies().ResetFailure(r.Context(), nodeID, a.now())
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
+	if authIndex == "" {
+		writeError(w, http.StatusBadRequest,
+			errors.New("authIndex query parameter is required; use /proxy-nodes/reset-all to clear every account"))
 		return
 	}
-	writeJSON(w, http.StatusOK, node)
+	if _, ok := a.svc.Proxies().Get(nodeID); !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("unknown proxy node %q", nodeID))
+		return
+	}
+	if err := a.svc.Proxies().ResetCooldown(r.Context(), authIndex, nodeID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"reset": true})
+}
+
+// resetAllCooldowns clears every account's state against every node.
+func (a *API) resetAllCooldowns(w http.ResponseWriter, r *http.Request) {
+	if err := a.svc.Proxies().ResetAllCooldowns(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"reset": true})
+}
+
+// listCooldowns returns the per-(account, proxy) failure ledger.
+//
+// With a nodeId it answers the panel's detail modal; without one it is the
+// whole ledger, which is what a "why is nothing probing" question needs.
+func (a *API) listCooldowns(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.URL.Query().Get("nodeId"))
+	rows := a.svc.Proxies().Cooldowns()
+	if nodeID != "" {
+		rows = a.svc.Proxies().CooldownsForProxy(nodeID)
+	}
+	if rows == nil {
+		rows = []proxies.Cooldown{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cooldowns": rows})
 }

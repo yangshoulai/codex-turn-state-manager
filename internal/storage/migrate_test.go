@@ -492,11 +492,9 @@ func TestProxyStore_RoundTrip(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Second)
 	latency := 82
-	cooldown := now.Add(5 * time.Minute)
 	node := proxies.Node{
 		ID: "proxy-1", URL: "http://proxy1:8080", Enabled: true,
-		SuccessCount: 3, FailureCount: 1, ConsecutiveFailures: 1,
-		CooldownUntil: &cooldown,
+		SuccessCount: 3, FailureCount: 1,
 		LastLatencyMS: &latency,
 		LastUsedAt:    &now,
 		LastSuccess:   &now,

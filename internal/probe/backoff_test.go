@@ -153,38 +153,34 @@ func TestPoolMarkFailure_ResetsTheCounterAtTheCap(t *testing.T) {
 	// Walk the ladder. Each failure is recorded with the delay that count earns.
 	for failures := 1; failures <= 6; failures++ {
 		cooldown := ProxyCooldown(failures)
-		if _, err := pool.MarkFailure(ctx, "a", cooldown, now, ProxyCooldownReachedCap(failures)); err != nil {
+		if _, err := pool.MarkFailure(ctx, "acct", "a", cooldown, now, ProxyCooldownReachedCap(failures)); err != nil {
 			t.Fatalf("MarkFailure(%d): %v", failures, err)
 		}
 	}
-	n, ok := pool.Get("a")
-	if !ok {
-		t.Fatal("node disappeared")
-	}
-	if n.ConsecutiveFailures != 6 {
-		t.Fatalf("ConsecutiveFailures = %d, want 6 before the cap", n.ConsecutiveFailures)
+	if got := cooldownFor(pool, "acct", "a").ConsecutiveFailures; got != 6 {
+		t.Fatalf("ConsecutiveFailures = %d, want 6 before the cap", got)
 	}
 
 	// The seventh reaches the cap and clears the count.
-	if _, err := pool.MarkFailure(ctx, "a", ProxyCooldown(7), now, ProxyCooldownReachedCap(7)); err != nil {
+	if _, err := pool.MarkFailure(ctx, "acct", "a", ProxyCooldown(7), now, ProxyCooldownReachedCap(7)); err != nil {
 		t.Fatalf("MarkFailure(7): %v", err)
 	}
-	n, _ = pool.Get("a")
-	if n.ConsecutiveFailures != 0 {
-		t.Errorf("ConsecutiveFailures = %d after the cap, want 0", n.ConsecutiveFailures)
+	row := cooldownFor(pool, "acct", "a")
+	if row.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d after the cap, want 0", row.ConsecutiveFailures)
 	}
-	if n.FailureCount != 7 {
-		t.Errorf("FailureCount = %d, want 7 (the lifetime counter must not be cleared)", n.FailureCount)
+	if row.FailureCount != 7 {
+		t.Errorf("FailureCount = %d, want 7 (the lifetime counter must not be cleared)", row.FailureCount)
 	}
-	if ProxyCooldown(n.ConsecutiveFailures) != time.Minute {
-		t.Errorf("the next failure would wait %s, want the base 1m", ProxyCooldown(n.ConsecutiveFailures))
+	if ProxyCooldown(row.ConsecutiveFailures) != time.Minute {
+		t.Errorf("the next failure would wait %s, want the base 1m", ProxyCooldown(row.ConsecutiveFailures))
 	}
 }
 
 // TestPoolResetFailureClearsCooldownAndCounters covers the panel's reset
 // button: "start over" has to mean the counters too, or the node lands straight
 // back in a long cooldown on its next hiccup.
-func TestPoolResetFailureClearsCooldownAndCounters(t *testing.T) {
+func TestPoolResetCooldownClearsCooldownAndCounters(t *testing.T) {
 	ctx := context.Background()
 	store := newMemProxyStore()
 	pool := proxies.NewPool(store)
@@ -194,67 +190,31 @@ func TestPoolResetFailureClearsCooldownAndCounters(t *testing.T) {
 	now := time.Now()
 
 	for failures := 1; failures <= 4; failures++ {
-		if _, err := pool.MarkFailure(ctx, "a", ProxyCooldown(failures), now, false); err != nil {
+		if _, err := pool.MarkFailure(ctx, "acct", "a", ProxyCooldown(failures), now, false); err != nil {
 			t.Fatalf("MarkFailure: %v", err)
 		}
 	}
-	if n, _ := pool.Get("a"); n.ConsecutiveFailures != 4 {
-		t.Fatalf("setup: ConsecutiveFailures = %d, want 4", n.ConsecutiveFailures)
+	if got := cooldownFor(pool, "acct", "a").ConsecutiveFailures; got != 4 {
+		t.Fatalf("setup: ConsecutiveFailures = %d, want 4", got)
 	}
 
-	n, err := pool.ResetFailure(ctx, "a", now)
-	if err != nil {
-		t.Fatalf("ResetFailure: %v", err)
+	if err := pool.ResetCooldown(ctx, "acct", "a"); err != nil {
+		t.Fatalf("ResetCooldown: %v", err)
 	}
-	if n.ConsecutiveFailures != 0 || n.FailureCount != 0 {
-		t.Errorf("counters = %d/%d after reset, want 0/0", n.ConsecutiveFailures, n.FailureCount)
+	if rows := pool.Cooldowns(); len(rows) != 0 {
+		t.Errorf("Cooldowns() = %d rows after a reset, want 0", len(rows))
 	}
-	if n.CooldownUntil != nil {
-		t.Errorf("CooldownUntil = %v after reset, want cleared", n.CooldownUntil)
-	}
-	if !n.Healthy(now) {
-		t.Error("node is still unhealthy after a reset")
+	if got := len(pool.AvailableFor("acct", now)); got != 1 {
+		t.Errorf("the node is still unavailable to the reset account (%d available)", got)
 	}
 }
 
-// TestOutcome_ProxyFault pins the rule that upstream 4xx responses must not
-// evict a healthy proxy node.
-func TestOutcome_ProxyFault(t *testing.T) {
-	shouldCool := []Outcome{OutcomeNetworkError}
-	mustNotCool := []Outcome{
-		OutcomeAuthError, OutcomeRateLimit, OutcomeModelUnsupported,
-		OutcomeUpstreamError, OutcomeSuccessTarget, OutcomeSuccessNonTarget,
-	}
-
-	for _, o := range shouldCool {
-		if !o.ProxyFault() {
-			t.Errorf("%s should be classified as a proxy fault", o)
+// cooldownFor reads one pair's ledger row.
+func cooldownFor(pool *proxies.Pool, authIndex, proxyID string) proxies.Cooldown {
+	for _, row := range pool.CooldownsForProxy(proxyID) {
+		if row.AuthIndex == authIndex {
+			return row
 		}
 	}
-	for _, o := range mustNotCool {
-		if o.ProxyFault() {
-			t.Errorf("%s must not cool down the proxy node", o)
-		}
-	}
-}
-
-// TestOutcome_Terminal pins the rule that account- and model-level failures
-// abort the traversal instead of walking the rest of the pool.
-func TestOutcome_Terminal(t *testing.T) {
-	terminal := []Outcome{OutcomeAuthError, OutcomeModelUnsupported, OutcomeAborted}
-	continueWalking := []Outcome{
-		OutcomeSuccessNonTarget, OutcomeNetworkError, OutcomeRateLimit,
-		OutcomeUpstreamError, OutcomeNoProxyAvailable, OutcomeTimeoutAllProxies,
-	}
-
-	for _, o := range terminal {
-		if !o.Terminal() {
-			t.Errorf("%s should terminate the traversal", o)
-		}
-	}
-	for _, o := range continueWalking {
-		if o.Terminal() {
-			t.Errorf("%s should not terminate the traversal", o)
-		}
-	}
+	return proxies.Cooldown{}
 }

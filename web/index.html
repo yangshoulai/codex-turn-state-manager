@@ -169,9 +169,13 @@
 
       <div class="sub-head">
         <h3>代理池</h3>
-        <button id="add-proxy" class="btn" type="button">添加节点</button>
+        <span class="actions">
+          <button id="reset-cooldowns" class="btn" type="button">全部重置冷却</button>
+          <button id="add-proxy" class="btn" type="button">添加节点</button>
+        </span>
       </div>
-      <p class="muted small">探测按「最久未使用优先」遍历，直到命中目标长度或遍历完毕。HTTP / HTTPS / SOCKS5 均可。地址与开关改动即时保存。</p>
+      <p class="muted small">探测按「最久未使用优先」遍历，直到命中目标长度或达成单轮上限。HTTP / HTTPS / SOCKS5 均可。地址与开关改动即时保存。</p>
+      <p class="muted small">冷却按「账号 × 代理」分别记账：同一个代理对一个账号失败，不会影响其他账号使用它。点列表里的「详情」看某个代理在每个账号上的状态。</p>
       <div id="proxies"></div>
     </div>
   </section>
@@ -217,6 +221,7 @@
     <div class="modal-body" id="modal-body"></div>
     <div class="modal-foot">
       <button id="modal-clear" class="btn btn-danger" type="button">清除历史</button>
+      <button id="modal-reset-all" class="btn btn-danger" type="button" hidden>重置全部冷却</button>
     </div>
   </div>
 </div>

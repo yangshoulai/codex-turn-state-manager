@@ -65,11 +65,11 @@ func TestProxyLastUsed_ConcurrentUpdates(t *testing.T) {
 					errs <- fmt.Errorf("worker %d MarkUsed: %w", worker, err)
 					return
 				}
-				if _, err := pool.MarkFailure(ctx, "p1", 0, now, false); err != nil {
+				if _, err := pool.MarkFailure(ctx, "acct", "p1", 0, now, false); err != nil {
 					errs <- fmt.Errorf("worker %d MarkFailure: %w", worker, err)
 					return
 				}
-				if err := pool.MarkSuccess(ctx, "p1", 5*time.Millisecond, now); err != nil {
+				if err := pool.MarkSuccess(ctx, "acct", "p1", 5*time.Millisecond, now); err != nil {
 					errs <- fmt.Errorf("worker %d MarkSuccess: %w", worker, err)
 					return
 				}

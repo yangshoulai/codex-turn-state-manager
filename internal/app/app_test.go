@@ -814,7 +814,7 @@ func TestApp_ReplaceProxiesEndpoint(t *testing.T) {
 	}
 
 	// A disabled node is stored but never selected.
-	if got := len(a.Proxies().Available(time.Now())); got != 1 {
+	if got := len(a.Proxies().AvailableFor("codex-auth-1", time.Now())); got != 1 {
 		t.Errorf("available nodes = %d, want 1", got)
 	}
 

@@ -113,12 +113,13 @@ func respondWith(status int, state string, body string) RespondFunc {
 // harness
 
 type memProxyStore struct {
-	mu    sync.Mutex
-	nodes map[string]proxies.Node
+	mu        sync.Mutex
+	nodes     map[string]proxies.Node
+	cooldowns map[string]proxies.Cooldown
 }
 
 func newMemProxyStore() *memProxyStore {
-	return &memProxyStore{nodes: map[string]proxies.Node{}}
+	return &memProxyStore{nodes: map[string]proxies.Node{}, cooldowns: map[string]proxies.Cooldown{}}
 }
 
 func (s *memProxyStore) ListProxies(context.Context) ([]proxies.Node, error) {
@@ -142,6 +143,40 @@ func (s *memProxyStore) DeleteProxy(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.nodes, id)
+	return nil
+}
+
+// The cooldown ledger, in memory. It is a separate map keyed by the pair so a
+// test can assert that one account's failures leave another account's view of
+// the same node alone -- which is the behaviour the ledger exists for.
+func (s *memProxyStore) ListCooldowns(context.Context) ([]proxies.Cooldown, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]proxies.Cooldown, 0, len(s.cooldowns))
+	for _, c := range s.cooldowns {
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+func (s *memProxyStore) UpsertCooldown(_ context.Context, c proxies.Cooldown) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cooldowns[memCooldownKey(c.AuthIndex, c.ProxyID)] = c
+	return nil
+}
+
+func (s *memProxyStore) DeleteCooldown(_ context.Context, authIndex, proxyID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.cooldowns, memCooldownKey(authIndex, proxyID))
+	return nil
+}
+
+func (s *memProxyStore) DeleteAllCooldowns(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cooldowns = map[string]proxies.Cooldown{}
 	return nil
 }
 
@@ -612,11 +647,10 @@ func TestExecutor_ServerErrorDoesNotCoolDownProxy(t *testing.T) {
 		t.Fatalf("outcome = %s, want the walk to continue past a 5xx", got.Outcome)
 	}
 
-	node, _ := h.pool.Get("p1")
-	if node.CooldownUntil != nil {
-		t.Errorf("an upstream 5xx cooled the node down until %v; it must not", node.CooldownUntil)
+	if rows := h.pool.CooldownsForProxy("p1"); len(rows) != 0 {
+		t.Errorf("an upstream 5xx benched the node for account %s; it must not", rows[0].AuthIndex)
 	}
-	if node.FailureCount != 0 {
+	if node, _ := h.pool.Get("p1"); node.FailureCount != 0 {
 		t.Errorf("FailureCount = %d, want 0 for an upstream fault", node.FailureCount)
 	}
 }
@@ -631,15 +665,19 @@ func TestExecutor_NetworkErrorCoolsDownProxy(t *testing.T) {
 		t.Fatalf("outcome = %s, want the walk to continue past a dead node", got.Outcome)
 	}
 
-	node, _ := h.pool.Get("dead")
-	if node.CooldownUntil == nil {
+	rows := h.pool.CooldownsForProxy("dead")
+	if len(rows) != 1 {
+		t.Fatalf("a connect failure left %d ledger rows for the node, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.CooldownUntil == nil {
 		t.Fatal("a connect failure must cool the node down")
 	}
-	if node.ConsecutiveFailures != 1 {
-		t.Errorf("ConsecutiveFailures = %d, want 1", node.ConsecutiveFailures)
+	if row.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", row.ConsecutiveFailures)
 	}
-	if want := time.Now().Add(ProxyCooldown(1)); node.CooldownUntil.After(want.Add(time.Second)) {
-		t.Errorf("cooldown until %v, want about %v", node.CooldownUntil, want)
+	if want := time.Now().Add(ProxyCooldown(1)); row.CooldownUntil.After(want.Add(time.Second)) {
+		t.Errorf("cooldown until %v, want about %v", row.CooldownUntil, want)
 	}
 }
 
@@ -919,20 +957,24 @@ func TestExecutor_NonTargetCoolsTheProxy(t *testing.T) {
 		t.Fatalf("outcome = %s, want a non-target success", got.Outcome)
 	}
 
-	node, ok := h.pool.Get("only")
-	if !ok {
-		t.Fatal("node disappeared")
+	rows := h.pool.CooldownsForProxy("only")
+	if len(rows) != 1 {
+		t.Fatalf("a non-target result left %d ledger rows, want 1", len(rows))
 	}
-	if node.CooldownUntil == nil {
+	row := rows[0]
+	if row.CooldownUntil == nil {
 		t.Fatal("a non-target result did not cool the node down")
 	}
-	if node.ConsecutiveFailures != 1 {
-		t.Errorf("ConsecutiveFailures = %d, want 1", node.ConsecutiveFailures)
+	if row.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", row.ConsecutiveFailures)
 	}
-	if node.FailureCount != 1 {
+	if node, _ := h.pool.Get("only"); node.FailureCount != 1 {
 		t.Errorf("FailureCount = %d, want 1", node.FailureCount)
 	}
-	if node.Healthy(time.Now()) {
-		t.Error("the node is still healthy immediately after a non-target result")
+	if got := len(h.pool.AvailableFor("codex-auth-1", time.Now())); got != 0 {
+		t.Error("the node is still selectable immediately after a non-target result")
 	}
 }
+
+// memCooldownKey stands in for the ledger's own key type, which is unexported.
+func memCooldownKey(authIndex, proxyID string) string { return authIndex + "\x00" + proxyID }

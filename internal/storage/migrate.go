@@ -12,7 +12,7 @@ import (
 
 // CurrentSchemaVersion is the schema version this build expects. Bump it in
 // the same commit that appends a migration -- never edit a released migration.
-const CurrentSchemaVersion = 3
+const CurrentSchemaVersion = 4
 
 // Migration is one forward-only schema step.
 //
@@ -128,6 +128,33 @@ var migrations = []Migration{
 		Stmts: []string{
 			`CREATE INDEX IF NOT EXISTS idx_probe_history_auth_model
 				ON probe_history(auth_index, model, probed_at DESC)`,
+		},
+	},
+	{
+		Version: 4,
+		Name:    "proxy_cooldown_per_account",
+		Stmts: []string{
+			// A proxy's health is a property of the (account, proxy) pair, not
+			// of the proxy. The same node returns the target state length for
+			// one account and a non-target length for another, so cooling the
+			// node globally lets one account's failures take it away from every
+			// other account.
+			//
+			// proxy_node.consecutive_failures and proxy_node.cooldown_until are
+			// left in place but no longer read: shipped migrations are not
+			// edited, and dropping columns means the create-new/copy/drop/rename
+			// dance for data that is now meaningless.
+			`CREATE TABLE IF NOT EXISTS proxy_cooldown (
+				auth_index           TEXT NOT NULL,
+				proxy_id             TEXT NOT NULL,
+				consecutive_failures INTEGER NOT NULL DEFAULT 0,
+				failure_count        INTEGER NOT NULL DEFAULT 0,
+				cooldown_until       TEXT,
+				last_failure         TEXT,
+				PRIMARY KEY (auth_index, proxy_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_proxy_cooldown_proxy
+				ON proxy_cooldown(proxy_id)`,
 		},
 	},
 }
