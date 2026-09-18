@@ -308,6 +308,23 @@ func TestStylesheetHidesHiddenElements(t *testing.T) {
 // <div> in that container is the management-key row, so no switch row was ever
 // "first". The group rendered with two hairlines above it, which is only
 // visible by looking at the page. The fix states the relationship instead.
+// stripCSSComments removes /* ... */ blocks so rule assertions do not match the
+// comments that explain them.
+func stripCSSComments(css string) string {
+	out := css
+	for {
+		start := strings.Index(out, "/*")
+		if start < 0 {
+			return out
+		}
+		end := strings.Index(out[start:], "*/")
+		if end < 0 {
+			return out[:start]
+		}
+		out = out[:start] + out[start+end+2:]
+	}
+}
+
 func TestStylesheetSeparatesGroupsOnce(t *testing.T) {
 	css, err := ReadAsset("style.css")
 	if err != nil {
@@ -318,9 +335,11 @@ func TestStylesheetSeparatesGroupsOnce(t *testing.T) {
 	if !strings.Contains(sheet, ".divider + .switch-row { border-top: none; }") {
 		t.Error("no rule stops a switch row from doubling the divider above it")
 	}
-	// Type-based positional selectors are the trap this fell into; the stylesheet
-	// should not depend on them.
-	if strings.Contains(sheet, ":first-of-type") || strings.Contains(sheet, ":nth-of-type") {
+	// Type-based positional selectors are the trap this fell into. Check the
+	// rules, not the prose: the file explains the trap in a comment, and a
+	// naive substring match flags its own documentation.
+	if strings.Contains(stripCSSComments(sheet), ":first-of-type") ||
+		strings.Contains(stripCSSComments(sheet), ":nth-of-type") {
 		t.Error("positional type selectors are in use; they match by element type, not by class")
 	}
 	// The remaining switches still need their own separators.
