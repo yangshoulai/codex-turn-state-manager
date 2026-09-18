@@ -354,3 +354,9 @@ A change is complete when:
 5. The design document was updated if behaviour changed.
 6. Nothing in the change caches a credential, puts SQLite on the hot path,
    bypasses the master switch, or exposes a secret on a resource route.
+7. **The status table in `README.md` was updated** if the change moved a
+   development-plan item. That table is the single record of progress and is used
+   to drive the work, so it must not drift from reality. Only mark an item ✅
+   when it meets the bar stated under 状态判定口径 there — in particular, work
+   that depends on real CPA callback behaviour or on browser rendering stays 🔄
+   until it has actually been exercised in that environment.

@@ -19,15 +19,50 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 ---
 
-## Status
+## 开发计划
 
-The plugin's internals are complete and covered by tests. The **CPA ABI adapter is not
-written**, because the plugin SDK surface has not been confirmed against a real CPA
-instance or its source — see section 9.2 of the design document and section 7 of
-`AGENTS.md`. `cmd/plugin/cshared.go` exports only an ABI version probe so the toolchain
-can be validated.
+对应设计文档 [§6.1 阶段划分](./插件开发文档.md)。**本表是开发进度的唯一记录，完成一项就更新一次状态。**
 
-Everything else runs today against the bundled development harness.
+| 图例 | 含义 |
+|:---:|---|
+| ✅ | 已完成 |
+| 🔄 | 进行中 |
+| ⬜ | 未开始 |
+
+| # | 阶段 | 内容 | 产出（验收标准） | 状态 |
+|:--:|---|---|---|:--:|
+| 0 | **P0 — CPA ABI 适配层** | `internal/pluginabi`：把 CPA 宿主 ABI 适配到 `hostapi.Host`，导出注册入口，打通 BeforeAuth → Scheduler → AfterAuth → 响应头的回调链路 | 插件可被真实 CPA 实例加载，端到端闭环跑通 | ⬜ |
+| 1 | **P0 — 基础框架** | 插件项目骨架、CGO 构建、SQLite 初始化、PersistenceManager + Schema 迁移框架、Management API 基础路由 | 可编译加载的插件，启动后可恢复配置 | 🔄 |
+| 2 | **P0 — 账号同步** | AccountRegistry：定时同步 CPA Codex 账号 | 面板可展示账号列表 | ✅ |
+| 3 | **P0 — 代理池** | ProxyPool：节点增删改、健康状态、冷却排序、`last_used_at` 持久化 | 代理池可管理，选择顺序按冷却时间 | ✅ |
+| 4 | **P0 — 探测引擎** | ProbeScheduler + TimeWindowManager + ProbeExecutor（含遍历所有代理直到命中目标），探测并发数默认 2 且可配置 | 可对指定 `(账号, 模型)` 发起定时探测 | ✅ |
+| 5 | **P0 — 请求拦截** | CorrelationManager + RequestStateInjector + ResponseStateCollector | 请求头替换与响应头反向绑定全链路打通 | 🔄 |
+| 6 | **P0 — 全局开关** | 定时探测开关 + 反向绑定开关，独立控制，状态持久化 | 两个开关可独立启停 | ✅ |
+| 7 | **P0 — 绑定管理** | 绑定删除 + 历史记录 + Management API | 面板可删除绑定并查看历史 | ✅ |
+| 8 | **P1 — 调度干预** | CredentialScheduler | CPA 调度结果可被插件干预 | 🔄 |
+| 9 | **P1 — 管理面板** | ResourceUI：简洁前端 + 时间窗口配置 + 历史弹窗 + 代理池展示 + 探测并发配置 | 可视化操作全部功能 | 🔄 |
+| 10 | **P1 — 自愈与退避** | State 失败自动失效、探测退避策略、被动续期 | 系统具备自愈能力 | ✅ |
+| 11 | **P2 — 可观测性** | 探测历史查询、代理健康统计、State 状态可视化 | 运维面板完善 | 🔄 |
+
+### 状态判定口径
+
+✅ 的含义是：代码完成、有单元测试覆盖、`make test-race` 通过，并在开发 harness 中实跑验证过。凡是依赖 CPA 真实回调行为（#5、#8）或依赖浏览器渲染（#9、#11）的部分，一律不计入 ✅。
+
+### 进行中项的具体缺口
+
+| # | 缺口 |
+|:--:|---|
+| 1 | 仅差「可被 CPA 加载」这一条：`c-shared` 产物已能构建通过（`nm` 可见导出符号），但 `internal/pluginabi` 尚不存在，见 #0。 |
+| 5 | 代码与单测完整，但 correlation 链路依赖设计文档 §9.2 第 1 条未决问题：BeforeAuth 阶段写入的自定义 header 能否被 Scheduler 与 AfterAuth 读到。未经真实环境验证。 |
+| 8 | 依赖 §9.2 第 2 条未决问题：`SchedulerPickResponse` 是否确实支持返回指定 `AuthID`，以及候选列表标识与 `host.auth.list` 的对应关系。 |
+| 9 | 功能齐全、静态资源可正常返回、JS 通过语法检查，但**未在浏览器中实际点击验证过**。 |
+| 11 | API 侧（探测历史查询、代理健康统计）已完成并有测试；可视化部分随 #9 一并验证。 |
+
+### 关于第 0 项
+
+#0 不在设计文档 §6.1 的计划表内，是框架落地后暴露出来的前置项，也是当前唯一的阻塞点：它直接卡住 #1、#5、#8 的最终验收。设计文档 §8「关键技术验证清单」的 12 项验证应当在这一步内完成。
+
+**下一步：开始 #0。**
 
 ---
 
