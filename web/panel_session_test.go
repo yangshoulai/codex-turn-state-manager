@@ -299,3 +299,32 @@ func TestStylesheetHidesHiddenElements(t *testing.T) {
 		}
 	}
 }
+
+// TestStylesheetSeparatesGroupsOnce pins that a section divider and the first
+// row under it do not each draw a line.
+//
+// The original rule was `.switch-row:first-of-type { border-top: none }`, which
+// silently did nothing: `:first-of-type` matches by element type, and the first
+// <div> in that container is the management-key row, so no switch row was ever
+// "first". The group rendered with two hairlines above it, which is only
+// visible by looking at the page. The fix states the relationship instead.
+func TestStylesheetSeparatesGroupsOnce(t *testing.T) {
+	css, err := ReadAsset("style.css")
+	if err != nil {
+		t.Fatalf("read style.css: %v", err)
+	}
+	sheet := string(css)
+
+	if !strings.Contains(sheet, ".divider + .switch-row { border-top: none; }") {
+		t.Error("no rule stops a switch row from doubling the divider above it")
+	}
+	// Type-based positional selectors are the trap this fell into; the stylesheet
+	// should not depend on them.
+	if strings.Contains(sheet, ":first-of-type") || strings.Contains(sheet, ":nth-of-type") {
+		t.Error("positional type selectors are in use; they match by element type, not by class")
+	}
+	// The remaining switches still need their own separators.
+	if !strings.Contains(sheet, ".switch-row {") {
+		t.Error("switch rows lost their separator entirely")
+	}
+}

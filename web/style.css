@@ -259,7 +259,15 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
   padding: 10px 0;
   border-top: 1px solid var(--line);
 }
-.switch-row:first-of-type { border-top: none; }
+/*
+ * A switch row sitting directly under a section divider must not draw a second
+ * line.
+ *
+ * `:first-of-type` cannot express this: it matches by element type, and the
+ * first <div> in this container is the management-key row, so the rule never
+ * applied and the group rendered with two hairlines above it.
+ */
+.divider + .switch-row { border-top: none; }
 
 .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; margin-top: 2px; }
 .switch input { opacity: 0; width: 0; height: 0; }
