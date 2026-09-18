@@ -20,6 +20,19 @@
 
 * { box-sizing: border-box; }
 
+/*
+ * The single authority for the hidden attribute.
+ *
+ * An author `display` declaration outranks the user agent's [hidden] rule, so
+ * an element styled `display: flex` stays visible while hidden unless this is
+ * stated. That is not hypothetical: it made the login gate render on top of a
+ * working panel, and the DOM property still read hidden=true, so every
+ * programmatic check said the panel was fine.
+ *
+ * Do not add per-selector [hidden] rules; they would be a second source of truth.
+ */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -75,7 +88,6 @@ h3 { font-size: 13px; color: var(--ink-soft); }
   border-radius: 999px;
   background: #fbfcfd;
 }
-.session[hidden] { display: none; }
 .session code {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -100,7 +112,6 @@ h3 { font-size: 13px; color: var(--ink-soft); }
   font-size: 13px;
   white-space: pre-wrap;
 }
-.fatal[hidden] { display: none; }
 
 /* ---------- layout ---------- */
 
@@ -268,7 +279,6 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .account-head .who strong { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-head .meta { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-soft); }
 .account-body { padding: 2px 12px 12px; }
-.account-body[hidden] { display: none; }
 
 /* ---------- pills ---------- */
 
@@ -326,7 +336,6 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
   padding: 24px;
   z-index: 40;
 }
-.modal[hidden] { display: none; }
 .modal-card {
   background: var(--surface);
   border-radius: 12px;
@@ -357,7 +366,6 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
   z-index: 60;
   max-width: 80vw;
 }
-.toast[hidden] { display: none; }
 .toast.bad { background: var(--bad); }
 
 /* ---------- misc ---------- */

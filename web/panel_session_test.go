@@ -174,3 +174,35 @@ func TestPanelBindsListenersDefensively(t *testing.T) {
 		t.Error("the login gate is visible by default")
 	}
 }
+
+// TestStylesheetHidesHiddenElements pins the CSS rule that made the login gate
+// render on top of a working panel.
+//
+// An author `display` declaration outranks the user agent's [hidden] rule, so
+// `.gate { display: flex }` kept the form on screen while the DOM property read
+// hidden=true -- every programmatic check reported success and the user still
+// saw a login box. One global rule fixes it; a per-selector rule for each
+// element would be a second source of truth for the same behaviour.
+func TestStylesheetHidesHiddenElements(t *testing.T) {
+	css, err := ReadAsset("style.css")
+	if err != nil {
+		t.Fatalf("read style.css: %v", err)
+	}
+	sheet := string(css)
+
+	if !strings.Contains(sheet, "[hidden] { display: none !important; }") {
+		t.Error("no global [hidden] rule; any element with an author display value will stay visible")
+	}
+
+	// A layout rule on an element that is toggled via the hidden attribute is
+	// the exact combination that caused the bug, so make sure both remain
+	// present and the global rule is what covers it.
+	if !strings.Contains(sheet, ".gate { display: flex") {
+		t.Error("expected .gate to still be laid out with flex")
+	}
+	for _, redundant := range []string{".gate[hidden]", "main[hidden]"} {
+		if strings.Contains(sheet, redundant) {
+			t.Errorf("%s is redundant; the global [hidden] rule is the single authority", redundant)
+		}
+	}
+}
