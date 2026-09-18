@@ -282,6 +282,35 @@ func TestRegistrationSatisfiesHostValidity(t *testing.T) {
 	}
 }
 
+// TestRequestInterceptBeforeIsAnswered covers a defect that only a real instance
+// revealed: RequestInterceptor declares both stages, so the host calls both, and
+// leaving the pre-credential stage unimplemented made it log
+//
+//	pluginhost: request interceptor ... failed: unsupported method: request.intercept_before
+//
+// on every single request. The stage does nothing by design -- no account has
+// been chosen yet -- but it has to say so.
+func TestRequestInterceptBeforeIsAnswered(t *testing.T) {
+	p := newTestPlugin(t, authListCaller())
+
+	raw, err := p.Handle(pluginabi.MethodRequestInterceptBefore, []byte(`{"RequestID":"req-1"}`))
+	if err != nil {
+		t.Fatalf("request.intercept_before: %v", err)
+	}
+	if !envelopeOK(t, raw) {
+		t.Fatal("the pre-credential stage must be answered, not rejected")
+	}
+
+	// And it must not modify anything: there is no binding to apply yet.
+	var resp pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(resultOf(t, raw), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Headers) != 0 || len(resp.ClearHeaders) != 0 || resp.Terminate {
+		t.Errorf("the pre-credential stage should be a pass-through, got %+v", resp)
+	}
+}
+
 func TestShutdown_IsIdempotent(t *testing.T) {
 	p := newTestPlugin(t, authListCaller())
 	if _, err := p.Handle(pluginabi.MethodPluginShutdown, nil); err != nil {

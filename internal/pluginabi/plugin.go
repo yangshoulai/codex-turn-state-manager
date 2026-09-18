@@ -82,6 +82,9 @@ func (p *Plugin) Handle(method string, request []byte) ([]byte, error) {
 		p.Stop()
 		return okEnvelope(struct{}{})
 
+	case pluginabi.MethodRequestInterceptBefore:
+		return p.handleRequestInterceptBefore(request)
+
 	case pluginabi.MethodRequestInterceptAfter:
 		return p.handleRequestIntercept(request)
 
@@ -285,6 +288,19 @@ func unavailable() ([]byte, error) {
 
 // ---------------------------------------------------------------------------
 // request / response interception
+
+// handleRequestInterceptBefore answers the pre-credential stage.
+//
+// It does nothing on purpose: no account has been chosen yet, so there is no
+// binding to look up and no state to inject. The stage still has to be answered
+// because the host calls it whenever RequestInterceptor is declared, and
+// leaving it unimplemented made the host log a failure on every request.
+func (p *Plugin) handleRequestInterceptBefore(request []byte) ([]byte, error) {
+	if p.current() == nil {
+		return unavailable()
+	}
+	return okEnvelope(pluginapi.RequestInterceptResponse{})
+}
 
 func (p *Plugin) handleRequestIntercept(request []byte) ([]byte, error) {
 	a := p.current()

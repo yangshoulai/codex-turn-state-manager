@@ -17,6 +17,13 @@ type Stats struct {
 	captured       atomic.Int64
 	capturedReused atomic.Int64
 	invalidated    atomic.Int64
+
+	// Which response callback the host actually invokes. "Nothing was
+	// captured" has two very different causes -- the callback never ran, or it
+	// ran and the response carried no state -- and only these distinguish them.
+	streamChunks  atomic.Int64
+	streamHeaders atomic.Int64
+	nonStream     atomic.Int64
 }
 
 // StatsSnapshot is a point-in-time copy for the panel.
@@ -37,6 +44,14 @@ type StatsSnapshot struct {
 	CapturedReused int64 `json:"capturedReused"`
 	// Invalidated counts bindings dropped by the self-healing rules.
 	Invalidated int64 `json:"invalidated"`
+
+	// StreamChunks counts streaming-response callbacks received.
+	StreamChunks int64 `json:"streamChunks"`
+	// StreamHeaders counts those that were the header-only initialisation call,
+	// which is the only one carrying the upstream response headers.
+	StreamHeaders int64 `json:"streamHeaders"`
+	// NonStream counts non-streaming response callbacks received.
+	NonStream int64 `json:"nonStream"`
 }
 
 // Snapshot returns the current counters.
@@ -49,5 +64,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		Captured:       s.captured.Load(),
 		CapturedReused: s.capturedReused.Load(),
 		Invalidated:    s.invalidated.Load(),
+		StreamChunks:   s.streamChunks.Load(),
+		StreamHeaders:  s.streamHeaders.Load(),
+		NonStream:      s.nonStream.Load(),
 	}
 }

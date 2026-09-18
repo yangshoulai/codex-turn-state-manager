@@ -83,16 +83,19 @@ const (
 // With the master switch off the response is ignored outright -- no capture, no
 // TTL refresh, no rebind.
 func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) CaptureResult {
+	c.stats.streamChunks.Add(1)
 	if !chunk.IsHeaderInit() {
 		// Only the header-only call carries the initial upstream headers.
 		return CaptureResult{Action: CaptureNotHeaderInit}
 	}
+	c.stats.streamHeaders.Add(1)
 	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
 }
 
 // ObserveResponse handles the non-streaming response interceptor, which is the
 // simpler of the two paths for observing a state value.
 func (c *Collector) ObserveResponse(ctx context.Context, chunk hostapi.StreamChunk) CaptureResult {
+	c.stats.nonStream.Add(1)
 	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
 }
 
