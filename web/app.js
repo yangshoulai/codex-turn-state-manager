@@ -129,7 +129,12 @@ let proxiesState = [];
 let windowsState = [];
 let accountsState = [];
 let expanded = new Set();
+// modelCache holds every account's models, filled by one bulk request per
+// refresh. modelsLoaded distinguishes "not fetched yet" from "this account has
+// no models", which read the same on screen otherwise.
 const modelCache = new Map();
+let modelsLoaded = false;
+let modelsError = "";
 // Seed model names for the add control. Suggestions only: the plugin cannot
 // read an account's real model list from CPA, so nothing here is probed until
 // an operator adds it.
@@ -279,6 +284,17 @@ function fmtDuration(seconds) {
   return `${s}s`;
 }
 
+// fmtClock drops the date. The probe table keeps 24 hours of history, so the
+// date is almost always today and the column is the widest thing in the row;
+// the full timestamp stays in the cell's title.
+function fmtClock(value) {
+  if (!value) return "—";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function fmtTime(value) {
   if (!value) return "—";
   const d = new Date(value);
@@ -308,7 +324,13 @@ function planBadge(plan) {
   const title = plan.activeUntil
     ? `套餐 ${label}，有效期至 ${fmtTime(plan.activeUntil)}`
     : `套餐 ${label}`;
-  return el("span", { class: "pill pill-plan", text: label, title });
+  // Tint by tier. The claim value is whatever upstream sent, so an unrecognised
+  // tier falls through to the neutral badge rather than being forced into a
+  // colour that would imply a position in a ranking we have not verified.
+  const tier = String(plan.type).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const known = ["free", "plus", "pro", "team", "enterprise"];
+  const modifier = known.includes(tier) ? " pill-plan-" + tier : "";
+  return el("span", { class: "pill pill-plan" + modifier, text: label, title });
 }
 
 // quotaBadge renders the rate-limit windows the upstream reported, which is the
@@ -638,16 +660,27 @@ function renderWindows() {
     return;
   }
   for (const win of windowsState) {
-    const days = (!win.daysOfWeek || !win.daysOfWeek.length)
-      ? "每天"
-      : win.daysOfWeek.map((d) => DAY_NAMES[d]).join("");
-
+    // Checkboxes rather than a text field. The text field displayed the days as
+    // CJK characters but parsed only digits, so saving a window without editing
+    // it failed with "无效的星期值" on the panel's own output. A control that
+    // cannot express a value it just rendered is the bug; seven boxes cannot
+    // get out of step with what they show.
     tbody.append(el("tr", null, [
       el("td", null, el("input", { type: "text", value: win.label || "", "data-k": "label" })),
-      el("td", null, el("input", {
-        type: "text", value: days, placeholder: "每天", "data-k": "days",
-        title: "用 0-6 表示周日到周六，逗号分隔；留空表示每天",
-      })),
+      el("td", null, el("div", {
+        class: "days", "data-k": "days",
+        title: "勾选生效的星期；一个都不勾表示每天",
+      },
+        DAY_NAMES.map((name, index) => el("label", {
+          class: "day",
+          title: index === 0 ? "周日" : "周" + name,
+        }, [
+          el("input", {
+            type: "checkbox",
+            checked: (win.daysOfWeek || []).includes(index),
+          }),
+          el("span", { text: name }),
+        ])))),
       el("td", null, el("input", { type: "text", value: win.startTime, "data-k": "start" })),
       el("td", null, el("input", { type: "text", value: win.endTime, "data-k": "end" })),
       el("td", null, el("input", { type: "checkbox", checked: win.enabled, "data-k": "enabled" })),
@@ -661,25 +694,17 @@ function renderWindows() {
   }
 }
 
-function parseDays(text) {
-  const trimmed = text.trim();
-  if (!trimmed || trimmed === "每天") return [];
-  return trimmed.split(/[,\s，]+/).filter(Boolean).map((part) => {
-    const n = Number(part);
-    if (!Number.isInteger(n) || n < 0 || n > 6) throw new Error(`无效星期值: ${part}`);
-    return n;
-  });
+// readDays returns the checked weekdays. No boxes checked means every day,
+// which is how the backend reads an empty list.
+function readDays(cell) {
+  const boxes = [...cell.querySelectorAll("input[type=\"checkbox\"]")];
+  const days = boxes.flatMap((box, index) => (box.checked ? [index] : []));
+  return days.length === boxes.length ? [] : days;
 }
 
 async function saveWindow(id, row) {
   const read = (k) => row.querySelector(`[data-k="${k}"]`);
-  let days;
-  try {
-    days = parseDays(read("days").value);
-  } catch (err) {
-    toast(err.message, true);
-    return;
-  }
+  const days = readDays(read("days"));
   try {
     await api("PUT", `/time-windows?${qs({ id })}`, {
       label: read("label").value || id,
@@ -777,7 +802,7 @@ function renderAccounts() {
     ]);
 
     const block = el("div", { class: "account" }, [head, body]);
-    if (open) loadModels(account.authIndex, body, account.blockedReason);
+    if (open) renderModels(account.authIndex, body, account.blockedReason);
     host.append(block);
   }
 }
@@ -809,38 +834,68 @@ async function addModel(authIndex, container, model) {
   try {
     await api("PUT", `/accounts/models/probe?${qs({ authIndex, model: name })}`, { enabled: true });
     toast(`已添加 ${name} 并开启探测`);
-    await loadModels(authIndex, container);
+    await loadAllModels();
+    invalidate(`models:${authIndex}`);
+    const account = accountsState.find((a) => a.authIndex === authIndex);
+    renderModels(authIndex, container, account && account.blockedReason);
     await loadAccounts();
   } catch (err) {
     toast(err.message, true);
   }
 }
 
-async function loadModels(authIndex, container, blockedReason) {
-  // Only show the loading state on a first load. Re-showing it on every poll
-  // is what made the panel flash: the table vanished and came back every 15
-  // seconds.
+// loadAllModels fetches every account's models in one request.
+//
+// Per-account fetching meant the refresh cost grew with the number of accounts
+// the operator had open, and expanding one waited on a round trip for data the
+// account list already implied. One request on the same 15s cycle replaces
+// both, and the tables then render from the cache.
+async function loadAllModels() {
+  try {
+    const payload = await api("GET", "/accounts/models");
+    const byAccount = payload.accounts || {};
+    modelCache.clear();
+    for (const [authIndex, models] of Object.entries(byAccount)) {
+      modelCache.set(authIndex, models || []);
+    }
+    modelsLoaded = true;
+  } catch (err) {
+    modelsError = err.message;
+  }
+}
+
+// renderModels draws one account's table from the cache. It never fetches, so
+// expanding an account is instant.
+function renderModels(authIndex, container, blockedReason) {
   if (!container.hasChildNodes()) {
     container.append(el("div", { class: "empty", text: "加载中…" }));
   }
-
-  let payload;
-  try {
-    payload = await api("GET", `/accounts/models?${qs({ authIndex })}`);
-  } catch (err) {
-    clear(container);
-    container.append(el("div", { class: "empty", text: err.message }));
+  if (!modelCache.has(authIndex)) {
+    // Bulk load has not landed yet, or this account is unknown to the registry.
+    if (modelsError && !container.querySelector(".empty")) {
+      clear(container);
+      container.append(el("div", { class: "empty", text: modelsError }));
+    }
     return;
   }
-  modelCache.set(authIndex, payload.models || []);
-  if (!expanded.has(authIndex)) return; // collapsed while loading
 
-  // Redraw only when something moved. A binding turning fresh, or a probe
-  // countdown changing, is exactly what the operator is watching for -- and
-  // rebuilding identical rows is what makes it flicker.
-  if (!changed(`models:${authIndex}`, [payload.models, blockedReason])) return;
+  const models = modelCache.get(authIndex) || [];
+  // Redraw when something moved, or when there is nothing here to keep.
+  //
+  // The second half is not redundant: renderAccounts rebuilds every account
+  // block from scratch on each poll that changes the list, which hands this
+  // function a brand-new empty body while the memo below still holds the
+  // previous signature. Trusting the memo alone left the fresh body showing
+  // "加载中…" forever, because the content had not changed and nothing ever
+  // drew into it.
+  //
+  // changed() is called unconditionally so the memo tracks reality either way;
+  // rebuilding identical rows on every poll is what makes the table flicker.
+  const drawn = container.querySelector("table") !== null;
+  const moved = changed(`models:${authIndex}`, [models, blockedReason]);
+  if (drawn && !moved) return;
   clear(container);
-  const rows = (payload.models || []).map((m) => {
+  const rows = models.map((m) => {
     const probeToggle = el("input", { type: "checkbox", checked: m.probeEnabled });
     probeToggle.addEventListener("change", async () => {
       try {
@@ -1180,10 +1235,10 @@ function renderProbes(probes) {
   clear(host);
 
   const rows = (probes || []).map((p) => el("tr", null, [
-    el("td", { class: "mono", text: fmtTime(p.probedAt) }),
-    el("td", { text: accountLabel(p.authIndex), title: p.authIndex }),
-    el("td", { class: "mono", text: p.model }),
-    el("td", { class: "mono", text: proxyLabel(p.proxyId) }),
+    el("td", { class: "mono", text: fmtClock(p.probedAt), title: fmtTime(p.probedAt) }),
+    el("td", { text: accountLabel(p.authIndex), title: accountLabel(p.authIndex) }),
+    el("td", { class: "mono", text: p.model, title: p.model }),
+    el("td", { class: "mono", text: proxyLabel(p.proxyId), title: proxyLabel(p.proxyId) }),
     el("td", null, el("span", {
       class: "pill " + (OUTCOME_PILL[p.result] || "pill-idle"),
       text: p.result,
@@ -1331,16 +1386,22 @@ async function refresh() {
   // loadStatus belongs here: without it the pipeline counters freeze at
   // whatever they were when the panel connected, which is the one moment they
   // are guaranteed to read zero.
-  await Promise.allSettled([loadStatus(), loadAccounts(), loadProxies(), loadProbes()]);
+  await Promise.allSettled([
+    loadStatus(), loadAccounts(), loadProxies(), loadProbes(),
+    // Every account's models arrive in this one request, so the cost of the
+    // cycle no longer grows with how many accounts are expanded.
+    loadAllModels(),
+  ]);
 
-  // Expanded model tables were the one thing left out, so a binding that turned
-  // fresh stayed stale on screen until a manual reload.
-  await Promise.allSettled([...expanded].map((authIndex) => {
+  // Redraw from the cache that just landed. Expanded model tables were once the
+  // one thing left out, so a binding that turned fresh stayed stale on screen
+  // until a manual reload.
+  for (const authIndex of expanded) {
     const body = document.querySelector(`[data-account-body="${CSS.escape(authIndex)}"]`);
-    if (!body) return Promise.resolve();
+    if (!body) continue;
     const account = accountsState.find((a) => a.authIndex === authIndex);
-    return loadModels(authIndex, body, account && account.blockedReason).catch(() => {});
-  }));
+    renderModels(authIndex, body, account && account.blockedReason);
+  }
 }
 
 on("sync-accounts", "click", async () => {

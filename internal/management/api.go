@@ -390,34 +390,50 @@ func (a *API) syncAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int{"accounts": n})
 }
 
+// listAccountModels returns each account's models with their binding state.
+//
+// Called with authIndex it returns that account; called without, every account
+// at once. The panel uses the bulk form: it renders one table per expanded
+// account and polls, so per-account requests made the refresh cost grow with
+// how many accounts were open, and made expanding an account wait on a round
+// trip for data the list already implied.
 func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
 	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
 	if authIndex == "" {
-		writeError(w, http.StatusBadRequest, errors.New("authIndex query parameter is required"))
+		byAccount := map[string][]modelView{}
+		for _, acc := range a.svc.Accounts().All() {
+			byAccount[acc.AuthIndex] = a.accountModelViews(acc.AuthIndex)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": byAccount})
 		return
 	}
-	modelStates, ok := a.svc.Accounts().Models(authIndex)
-	if !ok {
+	if _, ok := a.svc.Accounts().Models(authIndex); !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown account %q", authIndex))
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": a.accountModelViews(authIndex)})
+}
 
-	type modelView struct {
-		accounts.ModelState
-		Status       string     `json:"status"`
-		StateLength  int        `json:"stateLength,omitempty"`
-		Source       string     `json:"source,omitempty"`
-		ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
-		BoundAt      *time.Time `json:"boundAt,omitempty"`
-		NextProbeAt  *time.Time `json:"nextProbeAt,omitempty"`
-		InFlight     bool       `json:"inFlight"`
-		MinReasoning string     `json:"minReasoning"`
-		// NonTargetStreak counts consecutive probes that returned a state of the
-		// wrong length. Such a pair is re-probed every few minutes by design, so
-		// a long run is the only signal that a model will never yield a usable
-		// token -- visible here rather than polled at quota forever.
-		NonTargetStreak int `json:"nonTargetStreak,omitempty"`
-	}
+type modelView struct {
+	accounts.ModelState
+	Status       string     `json:"status"`
+	StateLength  int        `json:"stateLength,omitempty"`
+	Source       string     `json:"source,omitempty"`
+	ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
+	BoundAt      *time.Time `json:"boundAt,omitempty"`
+	NextProbeAt  *time.Time `json:"nextProbeAt,omitempty"`
+	InFlight     bool       `json:"inFlight"`
+	MinReasoning string     `json:"minReasoning"`
+	// NonTargetStreak counts consecutive probes that returned a state of the
+	// wrong length. Such a pair is re-probed every few minutes by design, so
+	// a long run is the only signal that a model will never yield a usable
+	// token -- visible here rather than polled at quota forever.
+	NonTargetStreak int `json:"nonTargetStreak,omitempty"`
+}
+
+// accountModelViews builds the per-model view for one account.
+func (a *API) accountModelViews(authIndex string) []modelView {
+	modelStates, _ := a.svc.Accounts().Models(authIndex)
 	out := make([]modelView, 0, len(modelStates))
 	for _, ms := range modelStates {
 		view := modelView{
@@ -440,7 +456,7 @@ func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
 		view.NonTargetStreak = a.svc.ProbeScheduler().NonTargetStreak(pair)
 		out = append(out, view)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": out})
+	return out
 }
 
 func (a *API) setProbeEnabled(w http.ResponseWriter, r *http.Request) {

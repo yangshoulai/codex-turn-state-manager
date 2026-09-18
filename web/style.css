@@ -362,6 +362,29 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 /* The probe history is dense reference data; keep it lighter than the matrix. */
 #probes .table td { padding: 6px 8px; }
 
+/* On a narrow window the account and proxy columns wrapped onto several lines,
+   which turned one row into a ragged block and made the table hard to scan. The
+   identifying columns are the long ones and the only ones that can be
+   truncated without losing meaning: an email or a host name stays recognisable
+   from its head, while the columns that carry the actual reading -- time,
+   result, length, latency -- must never be cut. */
+#probes .table { table-layout: fixed; }
+#probes .table th, #probes .table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Widths are measured, not guessed. The columns nobody can afford to lose --
+   the outcome, and the three readings beside it -- are pinned to the widest
+   value they can actually hold ("PROBE_TIMEOUT_ALL_PROXIES" needs 214px);
+   account and proxy are left unset so they absorb whatever is left and are the
+   only ones that truncate. */
+#probes .table th:nth-child(1), #probes .table td:nth-child(1) { width: 74px; }
+#probes .table th:nth-child(3), #probes .table td:nth-child(3) { width: 140px; }
+#probes .table th:nth-child(5), #probes .table td:nth-child(5) { width: 214px; }
+#probes .table th:nth-child(6), #probes .table td:nth-child(6) { width: 52px; }
+#probes .table th:nth-child(7), #probes .table td:nth-child(7) { width: 80px; }
+
 /* ---------- accounts ---------- */
 
 .add-model {
@@ -510,6 +533,23 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .num { font-variant-numeric: tabular-nums; }
 
+/* Weekday picker: seven small boxes that fit one row without widening the
+   column, so a window does not become the widest thing in the table. */
+.days { display: flex; gap: 2px; align-items: center; }
+.days .day {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 3px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.days .day:hover { background: var(--accent-soft); }
+.days .day input { margin: 0; }
+.days .day:has(input:checked) { background: var(--accent-soft); color: var(--ink); }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
@@ -529,14 +569,23 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 .btn-icon:hover { color: var(--ink); background: var(--accent-soft); border-color: transparent; }
 .btn-icon svg { display: block; }
 
-/* Plan badge: informational, so deliberately quieter than the status pills --
-   colour on this page means binding health. */
+/* Plan badge. Colour is keyed to the tier because the tier is what the operator
+   scans the column for: a free account and a pro account behave very
+   differently under load, and reading that off a word is slower than off a hue.
+   Every value is muted on purpose -- these sit next to binding-status pills,
+   and a saturated badge would compete with the one signal that means something
+   is wrong. Unknown tiers keep the neutral style rather than guessing. */
 .pill-plan {
   background: #eef0ec;
   color: var(--ink-soft);
   border-color: var(--line);
   font-variant-numeric: tabular-nums;
 }
+.pill-plan-free { background: #eceeeb; color: #6b6f68; border-color: #dcded9; }
+.pill-plan-plus { background: #e7eff6; color: #2f5d80; border-color: #d3e0ec; }
+.pill-plan-pro { background: #f6ecd2; color: #8a6100; border-color: #e8dcbb; }
+.pill-plan-team { background: #e2f0e6; color: #2f6b41; border-color: #cde3d4; }
+.pill-plan-enterprise { background: #e8e6f3; color: #4a4275; border-color: #d9d5ea; }
 
 /* Explains why an account is idle; reads as an aside, not an error, because a
    paused account is a normal state rather than a fault. */

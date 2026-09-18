@@ -1231,3 +1231,70 @@ func TestApp_PanelMountServesTheEntryPoint(t *testing.T) {
 		t.Errorf("index.html did not serve the panel document (%d bytes)", len(body))
 	}
 }
+
+// TestApp_AccountModelsBulkEndpoint covers the shape the panel actually polls.
+//
+// The panel used to request one account's models per expanded account on every
+// refresh, so the cycle cost grew with how many accounts were open. The bulk
+// form answers every account at once, and the per-account form has to keep
+// working because it is what the probe toggle and the delete endpoints use.
+func TestApp_AccountModelsBulkEndpoint(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(2))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	// Every account is seeded with the whole catalog, so the two accounts differ
+	// only in which models have probing switched on. That is the difference the
+	// bulk response has to preserve: if it collapsed the accounts onto one
+	// shared list, the toggle below would show up under both.
+	if err := a.Accounts().SetProbeEnabled(ctx, "codex-auth-1", "gpt-5.6-luna", true); err != nil {
+		t.Fatalf("SetProbeEnabled: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	code, body := api.do(http.MethodGet, "/accounts/models", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /accounts/models = %d (%s)", code, body)
+	}
+	var payload struct {
+		Accounts map[string][]struct {
+			Model        string `json:"model"`
+			ProbeEnabled bool   `json:"probeEnabled"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+
+	// Both synced accounts must be present, keyed by authIndex, so the panel can
+	// look each expanded account's table up without a request of its own.
+	for _, authIndex := range []string{"codex-auth-1", "codex-auth-2"} {
+		if _, ok := payload.Accounts[authIndex]; !ok {
+			t.Errorf("account %s is missing from the bulk response", authIndex)
+		}
+	}
+
+	probeOn := func(authIndex, model string) (bool, bool) {
+		for _, m := range payload.Accounts[authIndex] {
+			if m.Model == model {
+				return m.ProbeEnabled, true
+			}
+		}
+		return false, false
+	}
+
+	if on, found := probeOn("codex-auth-1", "gpt-5.6-luna"); !found || !on {
+		t.Errorf("codex-auth-1/gpt-5.6-luna probeEnabled = %v (found %v), want true", on, found)
+	}
+	if on, found := probeOn("codex-auth-2", "gpt-5.6-luna"); !found || on {
+		t.Errorf("codex-auth-2/gpt-5.6-luna probeEnabled = %v (found %v), want false", on, found)
+	}
+	if n := len(payload.Accounts["codex-auth-1"]); n == 0 {
+		t.Error("codex-auth-1 came back with no models")
+	}
+}

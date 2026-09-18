@@ -99,8 +99,8 @@
           <span class="slider"></span>
         </label>
         <div class="switch-text">
-          <strong>状态优先调度</strong>
-          <span class="muted">开启后插件才会干预 CPA 的账号选择；关闭时仍正常注入已持有的 State</span>
+          <strong>账号调度干预</strong>
+          <span class="muted">干预的总开关：关闭后插件完全不碰 CPA 的账号选择。开启时按下方「干预方式」执行；两种状态下 State 注入都不受影响</span>
         </div>
       </div>
 
@@ -136,10 +136,10 @@
       </div>
 
       <div class="strategy">
-        <span class="label">账号路由策略</span>
-        <label class="radio"><input type="radio" name="strategy" value="respect_cpa_priority"> 优先遵循 CPA priority</label>
-        <label class="radio"><input type="radio" name="strategy" value="state_first"> State 优先</label>
-        <span class="muted small">State 优先会跨优先级档选择持有 State 的账号</span>
+        <span class="label">干预方式</span>
+        <label class="radio"><input type="radio" name="strategy" value="respect_cpa_priority"> 在 CPA 的最高优先级档内挑选</label>
+        <label class="radio"><input type="radio" name="strategy" value="state_first"> 在持有 State 的账号内挑选</label>
+        <span class="muted small">前者不越过 CPA 的优先级档，档内没有持 State 的账号时就不干预；后者会在持有 State 的账号里取最高档，因此可能选到优先级较低但持有 State 的账号</span>
       </div>
 
       <div class="card-actions right">
