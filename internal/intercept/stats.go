@@ -1,6 +1,14 @@
 package intercept
 
-import "sync/atomic"
+import (
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"net/http"
+)
 
 // Stats counts what the request pipeline has actually done.
 //
@@ -31,6 +39,64 @@ type Stats struct {
 	skipNoAuth    atomic.Int64
 	skipNoState   atomic.Int64
 	skipNonTarget atomic.Int64
+
+	// lastHeaderInit records what the most recent header-init call actually
+	// carried.
+	//
+	// This exists because the question "did the response contain the state
+	// header" was unanswerable from the counters alone, and routing it through
+	// the host log proved unreliable: fields of every type were dropped before
+	// reaching the log, for reasons outside this plugin. Reading it back over
+	// the Management API avoids that path entirely.
+	lastMu         sync.Mutex
+	lastHeaderInit *HeaderInitSnapshot
+}
+
+// HeaderInitSnapshot is what one header-init call carried. Header names are
+// protocol metadata; no header values are recorded except the state length,
+// which is a number.
+type HeaderInitSnapshot struct {
+	At          time.Time `json:"at"`
+	RequestID   string    `json:"requestId,omitempty"`
+	Model       string    `json:"model,omitempty"`
+	AuthIndex   string    `json:"authIndex,omitempty"`
+	Correlated  bool      `json:"correlated"`
+	HeaderCount int       `json:"headerCount"`
+	HeaderNames string    `json:"headerNames,omitempty"`
+	HasState    bool      `json:"hasState"`
+	StateLength int       `json:"stateLength,omitempty"`
+}
+
+// recordHeaderInit stores what a header-init call carried.
+func (s *Stats) recordHeaderInit(snap HeaderInitSnapshot) {
+	snap.At = time.Now().UTC()
+	s.lastMu.Lock()
+	s.lastHeaderInit = &snap
+	s.lastMu.Unlock()
+}
+
+// LastHeaderInit returns the most recent header-init snapshot, if any.
+func (s *Stats) LastHeaderInit() *HeaderInitSnapshot {
+	s.lastMu.Lock()
+	defer s.lastMu.Unlock()
+	if s.lastHeaderInit == nil {
+		return nil
+	}
+	out := *s.lastHeaderInit
+	return &out
+}
+
+// headerNames lists a response's header names, sorted. Names only.
+func headerNames(header http.Header) string {
+	if len(header) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(header))
+	for name := range header {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 // StatsSnapshot is a point-in-time copy for the panel.
@@ -66,6 +132,9 @@ type StatsSnapshot struct {
 	SkipNoAuth    int64 `json:"skipNoAuth"`
 	SkipNoState   int64 `json:"skipNoState"`
 	SkipNonTarget int64 `json:"skipNonTarget"`
+
+	// LastHeaderInit is what the most recent header-init call carried.
+	LastHeaderInit *HeaderInitSnapshot `json:"lastHeaderInit,omitempty"`
 }
 
 // Snapshot returns the current counters.
@@ -85,5 +154,6 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		SkipNoAuth:     s.skipNoAuth.Load(),
 		SkipNoState:    s.skipNoState.Load(),
 		SkipNonTarget:  s.skipNonTarget.Load(),
+		LastHeaderInit: s.LastHeaderInit(),
 	}
 }

@@ -3,7 +3,6 @@ package intercept
 import (
 	"context"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 
@@ -90,6 +89,17 @@ func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) Capt
 		return CaptureResult{Action: CaptureNotHeaderInit}
 	}
 	c.stats.streamHeaders.Add(1)
+	// Snapshot before capture, so the record reflects what arrived rather than
+	// what happened to it.
+	c.stats.recordHeaderInit(HeaderInitSnapshot{
+		RequestID:   chunk.RequestID,
+		Model:       chunk.Model,
+		AuthIndex:   chunk.AuthIndex,
+		HeaderCount: len(chunk.ResponseHeaders),
+		HeaderNames: headerNames(chunk.ResponseHeaders),
+		HasState:    chunk.ResponseHeaders.Get(headers.TurnState) != "",
+		StateLength: len(chunk.ResponseHeaders.Get(headers.TurnState)),
+	})
 	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
 }
 
@@ -135,14 +145,8 @@ func (c *Collector) capture(
 	value := headers.Get(header, headers.TurnState)
 	if value == "" {
 		c.stats.skipNoState.Add(1)
-		// The header names present are protocol metadata, not values, and
-		// without them "the response carried no state" is indistinguishable
-		// from "we looked in the wrong place".
-		c.log(hostapi.LogDebug, "header-init carried no turn state", map[string]any{
-			"requestId": requestID,
-			"model":     model,
-			"headers":   headerNames(header),
-		})
+		// What arrived is recorded in the last-header-init snapshot rather than
+		// logged: the log path dropped these fields regardless of their type.
 		return CaptureResult{Action: CaptureIgnored, AuthIndex: authIndex}
 	}
 
@@ -261,20 +265,6 @@ func (c *Collector) ObserveCompletion(ctx context.Context, comp hostapi.Completi
 		"status": comp.StatusCode, "reason": reason,
 	})
 	return FailureSignal{Invalidated: true, AuthIndex: rec.AuthIndex, Reason: reason}
-}
-
-// headerNames lists the header names on a response, sorted, for diagnostics.
-// Names only: values are never read here.
-func headerNames(header http.Header) []string {
-	if header == nil {
-		return nil
-	}
-	out := make([]string, 0, len(header))
-	for name := range header {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func bodyMentions(body []byte, marker string) bool {
