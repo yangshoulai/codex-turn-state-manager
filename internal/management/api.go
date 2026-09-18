@@ -174,9 +174,19 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 					"daysOfWeek": w.DaysOfWeek,
 				})
 			}
+			// The clock the decision was made on. Time windows are evaluated
+			// in the host process's local timezone, while `now` above is UTC
+			// and the panel renders timestamps in the browser's timezone; when
+			// those three differ, a window that looks correct in the panel can
+			// be evaluating against a completely different hour.
+			zoneName, offset := now.Zone()
 			return map[string]any{
-				"allowsProbe": a.svc.Windows().ShouldProbeNow(now),
-				"enabled":     enabled,
+				"allowsProbe":   a.svc.Windows().ShouldProbeNow(now),
+				"enabled":       enabled,
+				"serverTime":    now.Format(time.RFC3339),
+				"timezone":      now.Location().String(),
+				"zone":          zoneName,
+				"offsetMinutes": offset / 60,
 			}
 		}(),
 		// Whether the scan loop is running at all. Without it a stalled loop

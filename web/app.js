@@ -471,9 +471,16 @@ function refreshConfigSummary() {
       .map((w) => `${w.startTime}–${w.endTime}`)
       .join("、");
     const allowed = windowState ? windowState.allowsProbe : null;
+    // The server clock is part of the statement, not decoration: the window is
+    // evaluated in the host's timezone while these timestamps render in the
+    // browser's, and an eight-hour gap makes "why did it probe at 02:44" a
+    // question about clocks rather than about configuration.
+    const clock = windowState && windowState.serverTime
+      ? ` · 服务器 ${fmtClock(windowState.serverTime)} ${windowState.zone || ""}`.trimEnd()
+      : "";
     parts.push(allowed === false
-      ? `窗口 ${ranges}（当前禁止探测）`
-      : `窗口 ${ranges}`);
+      ? `窗口 ${ranges}（当前禁止探测${clock}）`
+      : `窗口 ${ranges}${clock}`);
   }
   const proxies = proxiesState.length;
   parts.push(proxies ? `${proxies} 个代理节点` : "无代理节点");

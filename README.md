@@ -355,6 +355,13 @@ The manual probe button on a model row **ignores the window deliberately**: it i
 explicit request for one probe now, and a pair whose scheduled probing is off is exactly
 the one someone would want to test by hand. Its tooltip says so.
 
+**Windows are evaluated in the CPA process's local timezone.** The panel renders
+timestamps in your browser's timezone and `/status` reports `now` in UTC, so all three can
+disagree — and a container left on UTC makes an `08:00–02:00` window mean something eight
+hours off from what the operator intended. The config line therefore states the clock the
+decision was made on: `窗口 08:00–02:00（当前禁止探测 · 服务器 02:57 CST）`. Set `TZ` on the
+container if you want the window to follow your own hours.
+
 Proxy nodes are ordinary HTTP/HTTPS/SOCKS5 URLs.
 
 ## Management API
