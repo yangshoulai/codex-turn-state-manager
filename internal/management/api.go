@@ -53,30 +53,70 @@ func New(svc Service) *API { return &API{svc: svc, now: time.Now} }
 func (a *API) Register(mux *http.ServeMux) {
 	base := version.ManagementBasePath
 
-	mux.HandleFunc("GET "+base+"/status", a.status)
+	for _, route := range Routes() {
+		mux.HandleFunc(route.Method+" "+base+route.Path, route.bind(a))
+	}
+}
 
-	mux.HandleFunc("GET "+base+"/settings", a.getSettings)
-	mux.HandleFunc("PUT "+base+"/settings", a.putSettings)
+// Route is one Management API route.
+//
+// CPA dispatches management calls by exact path -- routes are a map keyed by
+// "METHOD /path" and paths containing ":" or "*" are rejected at registration.
+// There is no wildcard option, so anything variable travels as a query
+// parameter and every path here must be a literal.
+//
+// This table is also what gets declared to the host, so it is the single source
+// of truth for what exists.
+type Route struct {
+	Method  string
+	Path    string
+	Handler func(*API) http.HandlerFunc
+}
 
-	mux.HandleFunc("GET "+base+"/time-windows", a.listWindows)
-	mux.HandleFunc("POST "+base+"/time-windows", a.createWindow)
-	mux.HandleFunc("PUT "+base+"/time-windows/{id}", a.updateWindow)
-	mux.HandleFunc("DELETE "+base+"/time-windows/{id}", a.deleteWindow)
+func (r Route) bind(a *API) http.HandlerFunc { return r.Handler(a) }
 
-	mux.HandleFunc("GET "+base+"/accounts", a.listAccounts)
-	mux.HandleFunc("POST "+base+"/accounts/sync", a.syncAccounts)
-	mux.HandleFunc("GET "+base+"/accounts/{authIndex}/models", a.listAccountModels)
-	mux.HandleFunc("PUT "+base+"/accounts/{authIndex}/models/{model}/probe", a.setProbeEnabled)
+// Routes returns every Management API route, in registration order.
+func Routes() []Route {
+	return []Route{
+		{http.MethodGet, "/status", func(a *API) http.HandlerFunc { return a.status }},
 
-	mux.HandleFunc("GET "+base+"/bindings", a.listBindings)
-	mux.HandleFunc("DELETE "+base+"/bindings/{authIndex}/{model}", a.deleteBinding)
-	mux.HandleFunc("GET "+base+"/bindings/{authIndex}/{model}/history", a.bindingHistory)
-	mux.HandleFunc("DELETE "+base+"/bindings/{authIndex}/{model}/history", a.clearBindingHistory)
+		{http.MethodGet, "/settings", func(a *API) http.HandlerFunc { return a.getSettings }},
+		{http.MethodPut, "/settings", func(a *API) http.HandlerFunc { return a.putSettings }},
 
-	mux.HandleFunc("GET "+base+"/proxy-nodes", a.listProxies)
-	mux.HandleFunc("PUT "+base+"/proxy-nodes", a.replaceProxies)
+		{http.MethodGet, "/time-windows", func(a *API) http.HandlerFunc { return a.listWindows }},
+		{http.MethodPost, "/time-windows", func(a *API) http.HandlerFunc { return a.createWindow }},
+		{http.MethodPut, "/time-windows", func(a *API) http.HandlerFunc { return a.updateWindow }},
+		{http.MethodDelete, "/time-windows", func(a *API) http.HandlerFunc { return a.deleteWindow }},
 
-	mux.HandleFunc("GET "+base+"/probe-history", a.probeHistory)
+		{http.MethodGet, "/accounts", func(a *API) http.HandlerFunc { return a.listAccounts }},
+		{http.MethodPost, "/accounts/sync", func(a *API) http.HandlerFunc { return a.syncAccounts }},
+		{http.MethodGet, "/accounts/models", func(a *API) http.HandlerFunc { return a.listAccountModels }},
+		{http.MethodPut, "/accounts/models/probe", func(a *API) http.HandlerFunc { return a.setProbeEnabled }},
+
+		{http.MethodGet, "/bindings", func(a *API) http.HandlerFunc { return a.listBindings }},
+		{http.MethodDelete, "/bindings", func(a *API) http.HandlerFunc { return a.deleteBinding }},
+		{http.MethodGet, "/bindings/history", func(a *API) http.HandlerFunc { return a.bindingHistory }},
+		{http.MethodDelete, "/bindings/history", func(a *API) http.HandlerFunc { return a.clearBindingHistory }},
+
+		{http.MethodGet, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.listProxies }},
+		{http.MethodPut, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.replaceProxies }},
+
+		{http.MethodGet, "/probe-history", func(a *API) http.HandlerFunc { return a.probeHistory }},
+	}
+}
+
+// pairQuery reads the (authIndex, model) pair a binding endpoint operates on.
+func pairQuery(w http.ResponseWriter, r *http.Request) (states.Pair, bool) {
+	pair := states.Pair{
+		AuthIndex: strings.TrimSpace(r.URL.Query().Get("authIndex")),
+		Model:     strings.TrimSpace(r.URL.Query().Get("model")),
+	}
+	if pair.AuthIndex == "" || pair.Model == "" {
+		writeError(w, http.StatusBadRequest,
+			errors.New("authIndex and model query parameters are required"))
+		return states.Pair{}, false
+	}
+	return pair, true
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +280,11 @@ func (a *API) updateWindow(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &win) {
 		return
 	}
-	win.ID = r.PathValue("id")
+	win.ID = strings.TrimSpace(r.URL.Query().Get("id"))
+	if win.ID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id query parameter is required"))
+		return
+	}
 	if err := a.svc.Windows().Upsert(r.Context(), win); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -249,7 +293,12 @@ func (a *API) updateWindow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteWindow(w http.ResponseWriter, r *http.Request) {
-	if err := a.svc.Windows().Delete(r.Context(), r.PathValue("id")); err != nil {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id query parameter is required"))
+		return
+	}
+	if err := a.svc.Windows().Delete(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -292,7 +341,11 @@ func (a *API) syncAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
-	authIndex := r.PathValue("authIndex")
+	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
+	if authIndex == "" {
+		writeError(w, http.StatusBadRequest, errors.New("authIndex query parameter is required"))
+		return
+	}
 	modelStates, ok := a.svc.Accounts().Models(authIndex)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown account %q", authIndex))
@@ -341,8 +394,13 @@ func (a *API) setProbeEnabled(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	authIndex := r.PathValue("authIndex")
-	model := r.PathValue("model")
+	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if authIndex == "" || model == "" {
+		writeError(w, http.StatusBadRequest,
+			errors.New("authIndex and model query parameters are required"))
+		return
+	}
 	if err := a.svc.Accounts().SetProbeEnabled(r.Context(), authIndex, model, body.Enabled); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -402,9 +460,9 @@ func (a *API) toBindingView(b states.Binding, now time.Time) bindingView {
 }
 
 func (a *API) deleteBinding(w http.ResponseWriter, r *http.Request) {
-	pair := states.Pair{
-		AuthIndex: r.PathValue("authIndex"),
-		Model:     r.PathValue("model"),
+	pair, ok := pairQuery(w, r)
+	if !ok {
+		return
 	}
 	if err := a.svc.States().Delete(r.Context(), pair, states.SourceManual); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -424,9 +482,9 @@ func (a *API) bindingHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, errors.New("history store unavailable"))
 		return
 	}
-	pair := states.Pair{
-		AuthIndex: r.PathValue("authIndex"),
-		Model:     r.PathValue("model"),
+	pair, ok := pairQuery(w, r)
+	if !ok {
+		return
 	}
 	limit := intQuery(r, "limit", 50)
 	offset := intQuery(r, "offset", 0)
@@ -477,9 +535,9 @@ func (a *API) clearBindingHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, errors.New("history store unavailable"))
 		return
 	}
-	pair := states.Pair{
-		AuthIndex: r.PathValue("authIndex"),
-		Model:     r.PathValue("model"),
+	pair, ok := pairQuery(w, r)
+	if !ok {
+		return
 	}
 	n, err := store.ClearHistory(r.Context(), pair)
 	if err != nil {

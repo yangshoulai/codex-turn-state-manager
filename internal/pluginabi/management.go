@@ -11,7 +11,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/management"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
+	"github.com/yangshoulai/codex-turn-state-manager/web"
 )
 
 // parseConfig decodes the plugin's configuration section.
@@ -39,33 +41,10 @@ func parseConfig(raw []byte) (Config, error) {
 // ---------------------------------------------------------------------------
 // management API
 //
-// CPA dispatches management calls by exact path: routes are a map keyed by
-// "METHOD /path", and paths containing ":" or "*" are rejected at registration.
-// So the plugin registers a fixed set of paths and does its own sub-path work
-// inside the handler -- there is no wildcard option to lean on.
-
-// managementRoutes is the exact set of Management API routes registered with
-// the host. Every entry must be a path the plugin's own mux can serve verbatim.
-var managementRoutes = []struct {
-	Method string
-	Path   string
-}{
-	{http.MethodGet, "/status"},
-	{http.MethodGet, "/settings"},
-	{http.MethodPut, "/settings"},
-	{http.MethodGet, "/time-windows"},
-	{http.MethodPost, "/time-windows"},
-	{http.MethodGet, "/accounts"},
-	{http.MethodPost, "/accounts/sync"},
-	{http.MethodGet, "/bindings"},
-	{http.MethodGet, "/proxy-nodes"},
-	{http.MethodPut, "/proxy-nodes"},
-	{http.MethodGet, "/probe-history"},
-}
-
-// resourceRoutes are the panel's static assets. Each file needs its own route:
-// the host has no static-directory or wildcard resource support.
-var resourceRoutes = []string{"/index.html", "/app.js", "/style.css"}
+// CPA dispatches management calls by exact path, so the route table lives with
+// the handlers in internal/management and is declared verbatim here. Deriving
+// both from one table means a new endpoint cannot be added without also being
+// reachable.
 
 func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 	var req pluginapi.ManagementRegistrationRequest
@@ -77,16 +56,20 @@ func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 
 	// Paths are relative; the host resolves them under the base paths it
 	// supplied, which match version.ManagementBasePath / ResourceBasePath.
-	routes := make([]pluginapi.ManagementRoute, 0, len(managementRoutes))
-	for _, r := range managementRoutes {
+	declared := management.Routes()
+	routes := make([]pluginapi.ManagementRoute, 0, len(declared))
+	for _, r := range declared {
 		routes = append(routes, pluginapi.ManagementRoute{
 			Method: r.Method,
 			Path:   r.Path,
 		})
 	}
 
-	resources := make([]pluginapi.ResourceRoute, 0, len(resourceRoutes))
-	for _, path := range resourceRoutes {
+	// One route per file: the host has no static-directory or wildcard resource
+	// support, and resource requests are forced to GET.
+	assets := web.Assets
+	resources := make([]pluginapi.ResourceRoute, 0, len(assets))
+	for _, path := range assets {
 		resources = append(resources, pluginapi.ResourceRoute{
 			Path: path,
 			Menu: resourceMenuLabel(path),

@@ -14,7 +14,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/management"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
+	"github.com/yangshoulai/codex-turn-state-manager/web"
 )
 
 // fakeCaller stands in for the C ABI so the translation layer is testable
@@ -391,8 +393,13 @@ func TestHostClient_LogNeverFailsTheCaller(t *testing.T) {
 // management API query-parameter based: routes are matched by exact path, and
 // wildcards are rejected at registration.
 func TestManagementRoutesAreExactPaths(t *testing.T) {
+	declared := management.Routes()
+	if len(declared) == 0 {
+		t.Fatal("the route table is empty")
+	}
+
 	seen := map[string]bool{}
-	for _, r := range managementRoutes {
+	for _, r := range declared {
 		key := r.Method + " " + r.Path
 		if seen[key] {
 			t.Errorf("duplicate route %s", key)
@@ -404,6 +411,16 @@ func TestManagementRoutesAreExactPaths(t *testing.T) {
 		}
 		if !strings.HasPrefix(r.Path, "/") {
 			t.Errorf("route %s must be absolute", key)
+		}
+	}
+}
+
+// TestWebAssetsExist guards the resource list against a rename: a path declared
+// to the host that has no embedded file would serve a 404 to the panel.
+func TestWebAssetsExist(t *testing.T) {
+	for _, name := range web.Assets {
+		if _, err := web.FS().Open(name[1:]); err != nil {
+			t.Errorf("declared asset %s is not embedded: %v", name, err)
 		}
 	}
 }
@@ -422,11 +439,24 @@ func TestManagementRegister_ReturnsRoutesAndResources(t *testing.T) {
 		t.Fatalf("decode management registration: %v", err)
 	}
 
-	if len(resp.Routes) != len(managementRoutes) {
-		t.Errorf("routes = %d, want %d", len(resp.Routes), len(managementRoutes))
+	// The registration must declare exactly the routes the plugin serves: a
+	// route missing here is unreachable, and an extra one hands the host a
+	// path that would 404.
+	declared := management.Routes()
+	if len(resp.Routes) != len(declared) {
+		t.Fatalf("routes declared = %d, want %d", len(resp.Routes), len(declared))
 	}
-	if len(resp.Resources) != len(resourceRoutes) {
-		t.Errorf("resources = %d, want %d", len(resp.Resources), len(resourceRoutes))
+	byKey := map[string]bool{}
+	for _, r := range declared {
+		byKey[r.Method+" "+r.Path] = true
+	}
+	for _, r := range resp.Routes {
+		if !byKey[r.Method+" "+r.Path] {
+			t.Errorf("registered route %s %s has no handler", r.Method, r.Path)
+		}
+	}
+	if len(resp.Resources) != len(web.Assets) {
+		t.Errorf("resources = %d, want %d", len(resp.Resources), len(web.Assets))
 	}
 
 	// The panel's entry point is labelled so it appears in the management UI;

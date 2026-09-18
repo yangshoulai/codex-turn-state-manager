@@ -395,7 +395,7 @@ func (b *bindingAPI) do(method, path string) (int, []byte) {
 
 func (b *bindingAPI) history() []map[string]any {
 	b.t.Helper()
-	code, body := b.do(http.MethodGet, "/bindings/codex-auth-1/gpt-5-codex/history")
+	code, body := b.do(http.MethodGet, "/bindings/history?authIndex=codex-auth-1&model=gpt-5-codex")
 	if code != http.StatusOK {
 		b.t.Fatalf("GET history = %d (%s)", code, body)
 	}
@@ -464,7 +464,7 @@ func TestApp_DeleteBindingEndpoint(t *testing.T) {
 		t.Fatalf("ProbeNow did not clear the backoff: %v (ok=%v)", at, ok)
 	}
 
-	code, body := api.do(http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex")
+	code, body := api.do(http.MethodDelete, "/bindings?authIndex=codex-auth-1&model=gpt-5-codex")
 	if code != http.StatusOK {
 		t.Fatalf("DELETE binding = %d (%s)", code, body)
 	}
@@ -541,7 +541,7 @@ func TestApp_BindingHistoryEndpoint(t *testing.T) {
 
 	// expand=1 is the documented way to reveal the whole value (design doc 5.3).
 	code, body := api.do(http.MethodGet,
-		"/bindings/codex-auth-1/gpt-5-codex/history?expand=1")
+		"/bindings/history?authIndex=codex-auth-1&model=gpt-5-codex&expand=1")
 	if code != http.StatusOK {
 		t.Fatalf("GET history?expand=1 = %d (%s)", code, body)
 	}
@@ -572,7 +572,7 @@ func TestApp_ClearBindingHistoryEndpoint(t *testing.T) {
 		t.Fatalf("history rows = %d, want 1", got)
 	}
 
-	code, body := api.do(http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex/history")
+	code, body := api.do(http.MethodDelete, "/bindings/history?authIndex=codex-auth-1&model=gpt-5-codex")
 	if code != http.StatusOK {
 		t.Fatalf("DELETE history = %d (%s)", code, body)
 	}
@@ -600,7 +600,7 @@ func TestApp_DeleteMissingBindingIsIdempotent(t *testing.T) {
 	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
 
 	for i := 0; i < 2; i++ {
-		code, body := api.do(http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex")
+		code, body := api.do(http.MethodDelete, "/bindings?authIndex=codex-auth-1&model=gpt-5-codex")
 		if code != http.StatusOK {
 			t.Fatalf("delete attempt %d = %d (%s)", i+1, code, body)
 		}
@@ -657,7 +657,7 @@ func TestApp_ProbeToggleEndpoint(t *testing.T) {
 	defer srv.Close()
 	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
 
-	const path = "/accounts/codex-auth-1/models/gpt-5-codex/probe"
+	const path = "/accounts/models/probe?authIndex=codex-auth-1&model=gpt-5-codex"
 
 	for _, want := range []bool{true, false, true} {
 		code, body := api.do(http.MethodPut, path,
@@ -703,7 +703,7 @@ func TestApp_AccountModelsEndpoint(t *testing.T) {
 	defer srv.Close()
 	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
 
-	code, body := api.do(http.MethodGet, "/accounts/codex-auth-1/models", "")
+	code, body := api.do(http.MethodGet, "/accounts/models?authIndex=codex-auth-1", "")
 	if code != http.StatusOK {
 		t.Fatalf("GET models = %d (%s)", code, body)
 	}
@@ -744,7 +744,7 @@ func TestApp_AccountModelsEndpoint(t *testing.T) {
 	}
 
 	// An unknown account is a 404, not an empty table.
-	if code, _ := api.do(http.MethodGet, "/accounts/nope/models", ""); code != http.StatusNotFound {
+	if code, _ := api.do(http.MethodGet, "/accounts/models?authIndex=nope", ""); code != http.StatusNotFound {
 		t.Errorf("GET models for an unknown account = %d, want 404", code)
 	}
 }
@@ -824,5 +824,161 @@ func TestApp_ReplaceProxiesEndpoint(t *testing.T) {
 	if code, _ := api.do(http.MethodPut, "/proxy-nodes",
 		`{"proxies":[{"id":"bad","url":""}]}`); code != http.StatusBadRequest {
 		t.Errorf("PUT with an empty url = %d, want 400", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// time window endpoints
+//
+// These three were the last uncovered management handlers, and they are also
+// the ones the route rework touched, so they are tested through the same HTTP
+// path the host uses.
+
+func TestApp_TimeWindowEndpoints(t *testing.T) {
+	a := newTestApp(t, mockHost(1))
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	type window struct {
+		ID         string `json:"id"`
+		Label      string `json:"label"`
+		DaysOfWeek []int  `json:"daysOfWeek"`
+		StartTime  string `json:"startTime"`
+		EndTime    string `json:"endTime"`
+		Enabled    bool   `json:"enabled"`
+	}
+
+	// Create.
+	code, body := api.do(http.MethodPost, "/time-windows",
+		`{"label":"work","daysOfWeek":[1,2,3,4,5],"startTime":"08:00","endTime":"20:00","enabled":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("POST /time-windows = %d (%s)", code, body)
+	}
+	var created window
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatalf("decode created window: %v", err)
+	}
+	if created.ID == "" {
+		t.Fatal("the created window has no id")
+	}
+
+	// List.
+	code, body = api.do(http.MethodGet, "/time-windows", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /time-windows = %d", code)
+	}
+	var list struct {
+		Windows []window `json:"windows"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("decode window list: %v", err)
+	}
+	if len(list.Windows) != 1 {
+		t.Fatalf("windows = %d, want 1", len(list.Windows))
+	}
+
+	// Update by query parameter.
+	code, body = api.do(http.MethodPut, "/time-windows?id="+created.ID,
+		`{"label":"work","daysOfWeek":[1],"startTime":"22:00","endTime":"06:00","enabled":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT /time-windows = %d (%s)", code, body)
+	}
+	if got := len(a.Windows().All()); got != 1 {
+		t.Fatalf("windows after update = %d, want 1", got)
+	}
+	stored := a.Windows().All()[0]
+	if stored.StartTime != "22:00" || stored.EndTime != "06:00" {
+		t.Errorf("window = %s-%s, want 22:00-06:00", stored.StartTime, stored.EndTime)
+	}
+	// A cross-midnight window must admit its evening leg. The window is
+	// Monday-only, so the instant has to be a Monday too.
+	monday := time.Date(2026, 9, 21, 23, 0, 0, 0, time.UTC)
+	if monday.Weekday() != time.Monday {
+		t.Fatalf("fixture is %s, expected Monday", monday.Weekday())
+	}
+	if !a.Windows().ShouldProbeNow(monday) {
+		t.Error("a Monday 22:00-06:00 window should admit Monday 23:00")
+	}
+	// ...and its next-day morning leg, which belongs to Monday's window.
+	if !a.Windows().ShouldProbeNow(time.Date(2026, 9, 22, 5, 0, 0, 0, time.UTC)) {
+		t.Error("the Tuesday morning leg should belong to Monday's window")
+	}
+	// ...but not the same clock time on a Tuesday evening.
+	if a.Windows().ShouldProbeNow(time.Date(2026, 9, 22, 23, 0, 0, 0, time.UTC)) {
+		t.Error("Tuesday 23:00 is outside a Monday-only window")
+	}
+
+	// Delete by query parameter.
+	code, body = api.do(http.MethodDelete, "/time-windows?id="+created.ID, "")
+	if code != http.StatusOK {
+		t.Fatalf("DELETE /time-windows = %d (%s)", code, body)
+	}
+	if got := len(a.Windows().All()); got != 0 {
+		t.Errorf("windows after delete = %d, want 0", got)
+	}
+}
+
+func TestApp_TimeWindowEndpointsValidateInput(t *testing.T) {
+	a := newTestApp(t, mockHost(1))
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{"update without an id", http.MethodPut, "/time-windows", `{"startTime":"08:00","endTime":"20:00"}`, http.StatusBadRequest},
+		{"delete without an id", http.MethodDelete, "/time-windows", "", http.StatusBadRequest},
+		{"unpadded clock is rejected", http.MethodPost, "/time-windows", `{"label":"x","startTime":"8:00","endTime":"20:00"}`, http.StatusBadRequest},
+		{"invalid day is rejected", http.MethodPost, "/time-windows", `{"label":"x","startTime":"08:00","endTime":"20:00","daysOfWeek":[9]}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, body := api.do(tc.method, tc.path, tc.body)
+			if code != tc.want {
+				t.Errorf("%s %s = %d (%s), want %d", tc.method, tc.path, code, body, tc.want)
+			}
+		})
+	}
+
+	if got := len(a.Windows().All()); got != 0 {
+		t.Errorf("windows = %d, want 0 after only rejected writes", got)
+	}
+}
+
+// TestApp_ManagementRoutesCarryNoPathParameters guards the constraint that
+// forced the query-parameter design: the host matches exact paths and rejects
+// anything containing a wildcard.
+func TestApp_ManagementRoutesCarryNoPathParameters(t *testing.T) {
+	a := newTestApp(t, mockHost(1))
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	// A path segment where a query parameter belongs must not accidentally
+	// reach a handler.
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex"},
+		{http.MethodGet, "/bindings/codex-auth-1/gpt-5-codex/history"},
+		{http.MethodGet, "/accounts/codex-auth-1/models"},
+	} {
+		code, _ := api.do(tc.method, tc.path, "")
+		if code != http.StatusNotFound {
+			t.Errorf("%s %s = %d, want 404; path parameters must not be routed", tc.method, tc.path, code)
+		}
+	}
+
+	// And the query-parameter form must reject a missing pair rather than
+	// silently operating on an empty account id.
+	if code, _ := api.do(http.MethodDelete, "/bindings", ""); code != http.StatusBadRequest {
+		t.Errorf("DELETE /bindings without parameters = %d, want 400", code)
+	}
+	if code, _ := api.do(http.MethodDelete, "/bindings?authIndex=only", ""); code != http.StatusBadRequest {
+		t.Errorf("DELETE /bindings with a partial pair = %d, want 400", code)
 	}
 }

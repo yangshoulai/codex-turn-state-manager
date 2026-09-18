@@ -74,7 +74,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 1 | 仅差「可被 CPA 加载」这一条，见 #0。 |
 | 5 | correlation 机制已整体移除（CPA 在 `Metadata` 里直接给出选中账号），单测完整。剩余缺口是真实环境中的回调时序确认，随 #0 一并验证。 |
 | 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行。 |
-| 9 | 前端功能齐全、静态资源可正常返回、JS 通过语法检查，但**未在浏览器中实际点击验证过**。路由需改为查询参数形式（CPA 只接受精确路径，见设计文档 §5.5），带路径参数的两个端点 `GET /accounts/{a}/models`、`GET\|DELETE /bindings/{a}/{m}/history` 因此尚未注册；时间窗口的三个端点覆盖率仍为 0%。 |
+| 9 | 路由已改为查询参数形式并全部注册（CPA 只接受精确路径），`internal/management` 内**已无 0% 覆盖率的端点**。仍缺的是**在浏览器里实际点击验证**。 |
 | 11 | API 侧（探测历史查询、代理健康统计）已完成并有测试；可视化部分随 #9 一并验证。 |
 
 ### 关于第 0 项
@@ -83,9 +83,9 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 ### 建议的推进顺序
 
-1. **#9 管理 API 改为查询参数 + 补测**——把带路径参数的端点改成查询参数并注册，补上时间窗口端点的 HTTP 层测试。这一步不需要 CPA 实例。
-2. **#0 真实加载验证**——拿到实例后加载共享库，确认注册握手、拦截链路、调度干预、响应捕获的实际时序。
-3. **#5、#8、#11 收口**——随 #0 的实例验证一并完成，面板在浏览器里点一遍。
+1. **#0 真实加载验证**——当前唯一阻塞点。共享库已导出四个 ABI 符号、与管理 API 的路由表一致，但从未被真实加载过。
+2. **#9、#11 收口**——面板在浏览器里点一遍；管理 API 侧已无未测端点。
+3. **#5、#8 收口**——随 #0 的实例验证一并完成。
 
 ---
 
@@ -245,7 +245,9 @@ GET    /probe-history?limit=50
 ```
 
 The panel's own assets are served from `/v0/resource/plugins/codex-turn-state-manager/`,
-which bypasses management auth. Nothing secret is ever served from there: state values
+which bypasses management auth. Note the entry point is `/index.html`, not the bare
+base path: CPA rejects a resource route whose path trims to empty, so a bare `/`
+cannot be registered. Nothing secret is ever served from there: state values
 are returned as prefixes through the Management API, and the management key is held in
 page memory only.
 

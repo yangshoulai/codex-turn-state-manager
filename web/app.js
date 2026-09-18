@@ -84,6 +84,17 @@ async function api(method, path, body) {
   return payload;
 }
 
+// qs builds a query string. CPA dispatches plugin management routes by exact
+// path, so anything variable travels as a query parameter rather than a path
+// segment.
+function qs(params) {
+  const search = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) search.set(k, String(v));
+  }
+  return search.toString();
+}
+
 function fmtDuration(seconds) {
   if (seconds === null || seconds === undefined) return "—";
   if (seconds <= 0) return "已过期";
@@ -273,7 +284,7 @@ async function saveWindow(id, row) {
     return;
   }
   try {
-    await api("PUT", `/time-windows/${encodeURIComponent(id)}`, {
+    await api("PUT", `/time-windows?${qs({ id })}`, {
       label: read("label").value || id,
       daysOfWeek: days,
       startTime: read("start").value.trim(),
@@ -290,7 +301,7 @@ async function saveWindow(id, row) {
 
 async function deleteWindow(id) {
   try {
-    await api("DELETE", `/time-windows/${encodeURIComponent(id)}`);
+    await api("DELETE", `/time-windows?${qs({ id })}`);
     await loadWindows();
     toast("窗口已删除");
   } catch (err) {
@@ -365,7 +376,7 @@ async function loadModels(authIndex, container) {
   container.append(el("div", { class: "empty", text: "加载中…" }));
   let payload;
   try {
-    payload = await api("GET", `/accounts/${encodeURIComponent(authIndex)}/models`);
+    payload = await api("GET", `/accounts/models?${qs({ authIndex })}`);
   } catch (err) {
     clear(container);
     container.append(el("div", { class: "empty", text: err.message }));
@@ -380,7 +391,7 @@ async function loadModels(authIndex, container) {
     probeToggle.addEventListener("change", async () => {
       try {
         await api("PUT",
-          `/accounts/${encodeURIComponent(authIndex)}/models/${encodeURIComponent(m.model)}/probe`,
+          `/accounts/models/probe?${qs({ authIndex, model: m.model })}`,
           { enabled: probeToggle.checked });
         toast(`${m.model} 探测已${probeToggle.checked ? "开启" : "关闭"}`);
       } catch (err) {
@@ -423,7 +434,7 @@ async function loadModels(authIndex, container) {
 async function deleteBinding(authIndex, model) {
   if (!confirm(`删除 ${authIndex} / ${model} 的绑定 State？\n\n删除后该组合会在下次扫描时重新探测。`)) return;
   try {
-    await api("DELETE", `/bindings/${encodeURIComponent(authIndex)}/${encodeURIComponent(model)}`);
+    await api("DELETE", `/bindings?${qs({ authIndex, model })}`);
     toast("绑定已删除");
     await refresh();
   } catch (err) {
@@ -446,7 +457,7 @@ async function showHistory(authIndex, model) {
 
   try {
     const payload = await api("GET",
-      `/bindings/${encodeURIComponent(authIndex)}/${encodeURIComponent(model)}/history?limit=100`);
+      `/bindings/history?${qs({ authIndex, model, limit: 100 })}`);
     const rows = (payload.history || []).map((h) => el("tr", null, [
       el("td", { class: "mono", text: fmtTime(h.createdAt) }),
       el("td", null, el("span", {
@@ -483,8 +494,7 @@ $("modal-clear").addEventListener("click", async () => {
   if (!confirm("清除该组合的全部绑定历史？此操作不可撤销。")) return;
   const { authIndex, model } = modalContext;
   try {
-    await api("DELETE",
-      `/bindings/${encodeURIComponent(authIndex)}/${encodeURIComponent(model)}/history`);
+    await api("DELETE", `/bindings/history?${qs({ authIndex, model })}`);
     toast("历史已清除");
     showHistory(authIndex, model);
   } catch (err) {
