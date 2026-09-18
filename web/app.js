@@ -1409,6 +1409,21 @@ async function loadStatus() {
     parts.push(`捕获 ${p.captured || 0}${p.capturedReused ? `+${p.capturedReused}续期` : ""}`);
   }
   if (p.invalidated) parts.push(`自愈 ${p.invalidated}`);
+
+  // Whether the scan loop is alive. A stalled loop looks exactly like an idle
+  // one from every other number on this page -- pairs overdue, no new rows --
+  // so the age of the last scan is the one figure that separates them.
+  const scan = status.scheduler || {};
+  if (scan.lastScanAt) {
+    const age = Math.max(0, Math.round((Date.now() - new Date(scan.lastScanAt).getTime()) / 1000));
+    parts.push(`扫描 ${age}s 前`);
+    const interval = (status.settings && status.settings.scanIntervalSec) || 60;
+    // Three intervals of silence is well past a slow tick and into "stuck".
+    if (age > interval * 3) {
+      node.classList.add("pipeline-stale");
+      node.title = `扫描循环已停止 ${age} 秒（间隔 ${interval} 秒）。探测不会进行；重启 CPA 可恢复。`;
+    }
+  }
   if (p.unresolvedAuth) parts.push(`账号未知 ${p.unresolvedAuth}`);
   node.textContent = parts.length ? parts.join(" · ") : "";
   node.title = parts.length

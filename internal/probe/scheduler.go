@@ -64,6 +64,9 @@ type Scheduler struct {
 	pairs map[states.Pair]*pairState
 	// lastSync is when accounts were last pulled from CPA; zero means never.
 	lastSync time.Time
+	// lastScanAt is stamped at the top of every scan, before any gate. Zero
+	// means the loop has never ticked.
+	lastScanAt time.Time
 
 	// sem is the probe concurrency limit. It is re-sized when the configured
 	// value changes, which is why it is rebuilt rather than fixed at start.
@@ -162,6 +165,12 @@ func (s *Scheduler) loop(ctx context.Context) {
 
 // Scan runs one scheduling pass.
 func (s *Scheduler) Scan(ctx context.Context) {
+	// Stamped before every gate below, so a scan that is gated off still proves
+	// the loop is ticking. Without this, "the loop is not running" and "the loop
+	// runs and nothing is due" are identical from the outside: both leave every
+	// pair with a next_probe_at in the past and no new history rows.
+	s.markScanned(s.now())
+
 	caps := s.src.SettingsManager().Current().Capabilities()
 	if !caps.Probe {
 		// Master switch off, or the probe sub-switch off. Nothing to do.
@@ -462,6 +471,45 @@ func (s *Scheduler) NextProbeAt(p states.Pair) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return st.nextProbeAt, true
+}
+
+// ScanHealth reports whether the scan loop is alive and how its slots are used.
+//
+// The distinction matters because a stalled loop and an idle one are identical
+// from the outside: both leave every pair with a next_probe_at in the past and
+// no new history rows. An operator watching a panel can only tell them apart if
+// the loop says when it last ran.
+type ScanHealth struct {
+	LastScanAt    time.Time
+	SlotsInUse    int
+	SlotsTotal    int
+	InFlightPairs int
+}
+
+func (s *Scheduler) markScanned(at time.Time) {
+	s.mu.Lock()
+	s.lastScanAt = at
+	s.mu.Unlock()
+}
+
+// ScanHealth reports the loop's liveness and slot usage.
+func (s *Scheduler) ScanHealth() ScanHealth {
+	s.mu.Lock()
+	health := ScanHealth{LastScanAt: s.lastScanAt}
+	for _, st := range s.pairs {
+		if st.inFlight {
+			health.InFlightPairs++
+		}
+	}
+	s.mu.Unlock()
+
+	s.semMu.Lock()
+	if s.sem != nil {
+		health.SlotsInUse = len(s.sem)
+	}
+	health.SlotsTotal = s.semSize
+	s.semMu.Unlock()
+	return health
 }
 
 // InFlight reports whether a pair is currently being probed.

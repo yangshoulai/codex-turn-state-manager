@@ -480,3 +480,38 @@ func TestLogLevelFields_AreSerialisable(t *testing.T) {
 		t.Errorf("log calls = %d, want 1", calls)
 	}
 }
+
+// TestSchedulerScanHealthStampsEveryTick guards the figure that tells a stalled
+// scan loop apart from an idle one.
+//
+// The two are identical from every other signal the panel has: pairs overdue,
+// no new probe rows, no error. Only the age of the last scan separates them, so
+// the stamp has to happen before any gate -- including the ones that return
+// without probing anything, which is exactly the state an operator is in when
+// they go looking.
+func TestSchedulerScanHealthStampsEveryTick(t *testing.T) {
+	h := newSchedHarness(t, nil)
+
+	if got := h.scheduler.ScanHealth().LastScanAt; !got.IsZero() {
+		t.Fatalf("LastScanAt = %v before any scan, want the zero time", got)
+	}
+
+	// Probing off: the scan returns at its first gate without doing anything.
+	// It still has to record that it ran.
+	off := false
+	if _, err := h.settings.Update(context.Background(), settings.Patch{
+		GlobalProbeEnabled: &off,
+	}); err != nil {
+		t.Fatalf("settings.Update: %v", err)
+	}
+
+	h.scheduler.Scan(context.Background())
+
+	stamped := h.scheduler.ScanHealth().LastScanAt
+	if stamped.IsZero() {
+		t.Fatal("a gated-off scan did not stamp LastScanAt; a stalled loop would be invisible")
+	}
+	if !stamped.Equal(h.clock.Now()) {
+		t.Errorf("LastScanAt = %v, want the scheduler clock %v", stamped, h.clock.Now())
+	}
+}

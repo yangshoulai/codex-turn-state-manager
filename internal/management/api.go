@@ -153,6 +153,21 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 			"route":   caps.Route,
 		},
 		"proxies": map[string]int{"total": len(proxies), "healthy": healthy},
+		// Whether the scan loop is running at all. Without it a stalled loop
+		// and an idle one are indistinguishable: both show every pair overdue
+		// and no new probe rows.
+		"scheduler": func() map[string]any {
+			h := a.svc.ProbeScheduler().ScanHealth()
+			out := map[string]any{
+				"slotsInUse":    h.SlotsInUse,
+				"slotsTotal":    h.SlotsTotal,
+				"inFlightPairs": h.InFlightPairs,
+			}
+			if !h.LastScanAt.IsZero() {
+				out["lastScanAt"] = h.LastScanAt.UTC()
+			}
+			return out
+		}(),
 		// Counters rather than log lines: this is how the panel can say whether
 		// the plugin has ever actually injected, which a header rewrite
 		// otherwise leaves no trace of.

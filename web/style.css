@@ -533,6 +533,11 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .num { font-variant-numeric: tabular-nums; }
 
+/* The scan loop has stopped. Colour rather than only text, because this sits in
+   a line of otherwise identical counters and has to be noticeable without being
+   read. */
+.pipeline-stale { color: var(--bad); }
+
 /* Weekday picker: seven small boxes that fit one row without widening the
    column, so a window does not become the widest thing in the table. */
 .days { display: flex; gap: 2px; align-items: center; }
