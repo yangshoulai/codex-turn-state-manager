@@ -1202,7 +1202,10 @@ async function loadAll() {
 }
 
 async function refresh() {
-  await Promise.allSettled([loadAccounts(), loadProxies(), loadProbes()]);
+  // loadStatus belongs here: without it the pipeline counters freeze at
+  // whatever they were when the panel connected, which is the one moment they
+  // are guaranteed to read zero.
+  await Promise.allSettled([loadStatus(), loadAccounts(), loadProxies(), loadProbes()]);
 }
 
 on("sync-accounts", "click", async () => {

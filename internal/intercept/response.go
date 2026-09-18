@@ -3,6 +3,7 @@ package intercept
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -109,6 +110,7 @@ func (c *Collector) capture(
 	rec, hasRec := c.corr.Complete(requestID)
 
 	if !caps.Capture {
+		c.stats.skipSwitchOff.Add(1)
 		return CaptureResult{Action: CaptureSkipped, AuthIndex: authIndex}
 	}
 
@@ -118,6 +120,7 @@ func (c *Collector) capture(
 		authIndex = rec.AuthIndex
 	}
 	if authIndex == "" {
+		c.stats.skipNoAuth.Add(1)
 		return CaptureResult{Action: CaptureNoAuth}
 	}
 
@@ -125,17 +128,28 @@ func (c *Collector) capture(
 		model = rec.Model
 	}
 	if model == "" {
+		c.stats.skipNoAuth.Add(1)
 		return CaptureResult{Action: CaptureNoAuth, AuthIndex: authIndex}
 	}
 
 	value := headers.Get(header, headers.TurnState)
 	if value == "" {
+		c.stats.skipNoState.Add(1)
+		// The header names present are protocol metadata, not values, and
+		// without them "the response carried no state" is indistinguishable
+		// from "we looked in the wrong place".
+		c.log(hostapi.LogDebug, "header-init carried no turn state", map[string]any{
+			"requestId": requestID,
+			"model":     model,
+			"headers":   headerNames(header),
+		})
 		return CaptureResult{Action: CaptureIgnored, AuthIndex: authIndex}
 	}
 
 	policy := c.settings.Current()
 	if len(value) != policy.TargetStateLength {
 		// Wrong length: recorded nowhere, bound never (F-15).
+		c.stats.skipNonTarget.Add(1)
 		return CaptureResult{Action: CaptureNonTarget, AuthIndex: authIndex, StateLen: len(value)}
 	}
 
@@ -247,6 +261,20 @@ func (c *Collector) ObserveCompletion(ctx context.Context, comp hostapi.Completi
 		"status": comp.StatusCode, "reason": reason,
 	})
 	return FailureSignal{Invalidated: true, AuthIndex: rec.AuthIndex, Reason: reason}
+}
+
+// headerNames lists the header names on a response, sorted, for diagnostics.
+// Names only: values are never read here.
+func headerNames(header http.Header) []string {
+	if header == nil {
+		return nil
+	}
+	out := make([]string, 0, len(header))
+	for name := range header {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func bodyMentions(body []byte, marker string) bool {

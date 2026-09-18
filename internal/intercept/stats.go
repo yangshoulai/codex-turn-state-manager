@@ -24,6 +24,13 @@ type Stats struct {
 	streamChunks  atomic.Int64
 	streamHeaders atomic.Int64
 	nonStream     atomic.Int64
+
+	// Why a header-init call produced no binding. "Captured nothing" is a
+	// symptom; these name the cause.
+	skipSwitchOff atomic.Int64
+	skipNoAuth    atomic.Int64
+	skipNoState   atomic.Int64
+	skipNonTarget atomic.Int64
 }
 
 // StatsSnapshot is a point-in-time copy for the panel.
@@ -52,6 +59,13 @@ type StatsSnapshot struct {
 	StreamHeaders int64 `json:"streamHeaders"`
 	// NonStream counts non-streaming response callbacks received.
 	NonStream int64 `json:"nonStream"`
+
+	// The reasons a header-init call yielded no binding, in the order the
+	// capture logic checks them.
+	SkipSwitchOff int64 `json:"skipSwitchOff"`
+	SkipNoAuth    int64 `json:"skipNoAuth"`
+	SkipNoState   int64 `json:"skipNoState"`
+	SkipNonTarget int64 `json:"skipNonTarget"`
 }
 
 // Snapshot returns the current counters.
@@ -67,5 +81,9 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		StreamChunks:   s.streamChunks.Load(),
 		StreamHeaders:  s.streamHeaders.Load(),
 		NonStream:      s.nonStream.Load(),
+		SkipSwitchOff:  s.skipSwitchOff.Load(),
+		SkipNoAuth:     s.skipNoAuth.Load(),
+		SkipNoState:    s.skipNoState.Load(),
+		SkipNonTarget:  s.skipNonTarget.Load(),
 	}
 }
