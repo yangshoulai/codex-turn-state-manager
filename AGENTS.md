@@ -2,7 +2,7 @@
 
 Instructions for AI coding agents working in this repository. Read this before
 touching any code. The authoritative specification is
-[`插件开发文档.md`](./插件开发文档.md) — where this file and that document
+[`docs/插件开发文档.md`](./docs/插件开发文档.md) — where this file and that document
 disagree, the design document wins and this file is the bug.
 
 ---
@@ -388,7 +388,7 @@ the plugin's side and none of which are visible without a real instance:
 
 - **The design document is the spec.** If code and document disagree, either fix
   the code or update the document — do not leave them divergent. Any behavioural
-  change means editing `插件开发文档.md` in the same change.
+  change means editing `docs/插件开发文档.md` in the same change.
 - **One truth per rule.** The switch matrix lives in
   `settings.Values.Capabilities`; the naming convention lives here; the schema
   lives in `storage.migrations`. Do not duplicate a rule into a second place

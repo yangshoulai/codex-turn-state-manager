@@ -12,7 +12,7 @@ adds only what is specific to working here as Claude Code.
 ## Start here
 
 1. Read `AGENTS.md`.
-2. Skim [`插件开发文档.md`](./插件开发文档.md) — it is the specification. Sections
+2. Skim [`docs/插件开发文档.md`](./docs/插件开发文档.md) — it is the specification. Sections
    3.3 (switch matrix), 3.4 (time windows), 3.7 (proxy traversal), 3.10
    (backoff), and chapter 7 (migrations) are where the subtle rules live.
 3. Run `make run` to bring up the dev harness — mock CPA host, real management
@@ -80,7 +80,7 @@ make fmt vet test-race && make build
 
 Then confirm, against `AGENTS.md` section 9:
 
-- Behaviour change → is `插件开发文档.md` updated in the same change?
+- Behaviour change → is `docs/插件开发文档.md` updated in the same change?
 - Schema change → new migration appended **and** `CurrentSchemaVersion` bumped?
 - New host capability → added to `hostapi.Host` **and** `hostapi.MockHost`?
 - New runtime knob → reachable from the panel or the settings table?

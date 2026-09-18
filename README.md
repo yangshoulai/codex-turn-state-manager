@@ -14,14 +14,14 @@ outbound requests, and harvests fresh values from ordinary traffic responses.
 > be turned off entirely, a bad binding is dropped automatically after a failed request,
 > and a failure to inject never fails the request.
 
-The full specification lives in [`插件开发文档.md`](./插件开发文档.md). Agent-facing
+The full specification lives in [`docs/插件开发文档.md`](./docs/插件开发文档.md). Agent-facing
 working rules live in [`AGENTS.md`](./AGENTS.md).
 
 ---
 
 ## 开发计划
 
-对应设计文档 [§6.1 阶段划分](./插件开发文档.md)。**本表是开发进度的唯一记录，完成一项就更新一次状态。**
+对应设计文档 [§6.1 阶段划分](./docs/插件开发文档.md)。**本表是开发进度的唯一记录，完成一项就更新一次状态。**
 
 | 图例 | 含义 |
 |:---:|---|
