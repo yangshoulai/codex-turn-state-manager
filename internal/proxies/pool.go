@@ -223,10 +223,13 @@ func (p *Pool) MarkSuccess(ctx context.Context, id string, latency time.Duration
 	return p.store.UpsertProxy(ctx, n)
 }
 
-// MarkFailure records a failure. cooldown is applied only for genuine proxy
-// faults -- upstream 400/401/403/429 must not evict a healthy node (design doc
-// 3.7.4).
-func (p *Pool) MarkFailure(ctx context.Context, id string, cooldown time.Duration, now time.Time) (Node, error) {
+// MarkFailure records a failure and applies the cooldown.
+//
+// resetAfterCooldown is set by the caller once the ladder has reached its cap:
+// the counter then drops back to zero so the next failure starts at one minute
+// again. Without it a node that has failed seven times would sit at the cap
+// forever, and a proxy whose outage outlasts an hour would never be retried.
+func (p *Pool) MarkFailure(ctx context.Context, id string, cooldown time.Duration, now time.Time, resetAfterCooldown bool) (Node, error) {
 	n, err := p.mutate(id, func(n *Node) {
 		n.FailureCount++
 		n.ConsecutiveFailures++
@@ -235,6 +238,28 @@ func (p *Pool) MarkFailure(ctx context.Context, id string, cooldown time.Duratio
 			until := now.Add(cooldown)
 			n.CooldownUntil = &until
 		}
+		if resetAfterCooldown {
+			n.ConsecutiveFailures = 0
+		}
+	})
+	if err != nil {
+		return Node{}, err
+	}
+	return n, p.store.UpsertProxy(ctx, n)
+}
+
+// ResetFailure clears a node's cooldown and both failure counters, returning it
+// to the pool immediately.
+//
+// The counters are cleared too, not just the cooldown: an operator pressing
+// reset after fixing a proxy means "start over", and leaving the ladder where it
+// was would put the node straight back into a long cooldown on its next hiccup.
+func (p *Pool) ResetFailure(ctx context.Context, id string, now time.Time) (Node, error) {
+	n, err := p.mutate(id, func(n *Node) {
+		n.ConsecutiveFailures = 0
+		n.FailureCount = 0
+		n.CooldownUntil = nil
+		n.LastFailure = nil
 	})
 	if err != nil {
 		return Node{}, err

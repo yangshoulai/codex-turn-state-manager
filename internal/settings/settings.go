@@ -31,6 +31,7 @@ const (
 	KeyAccountRoutingStrategy = "account_routing_strategy"
 	KeyAccountSyncSec         = "account_sync_interval_sec"
 	KeyProbeRetentionHours    = "probe_history_retention_hours"
+	KeyMaxProxiesPerProbe     = "max_proxies_per_probe"
 )
 
 // RoutingStrategy selects how the credential scheduler picks among candidates.
@@ -82,6 +83,12 @@ type Values struct {
 	// history is operational telemetry, not an audit log: the panel reads the
 	// last day and older rows are cost without benefit.
 	ProbeRetention time.Duration
+
+	// MaxProxiesPerProbe caps how many nodes one probe may try before giving
+	// up for this round. A pool deep enough to walk in full can spend a long
+	// time failing; the cap bounds the cost of a round without changing which
+	// nodes are eligible.
+	MaxProxiesPerProbe int
 }
 
 // Defaults returns the documented default configuration (design doc 3.3/3.5).
@@ -100,6 +107,7 @@ func Defaults() Values {
 		RoutingStrategy:          StrategyRespectCPAPriority,
 		AccountSyncInterval:      5 * time.Minute,
 		ProbeRetention:           24 * time.Hour,
+		MaxProxiesPerProbe:       10,
 	}
 }
 
@@ -114,6 +122,8 @@ const (
 	MinMaxProbeDuration  = 5 * time.Second
 	MinProbeRetention    = time.Hour
 	MaxProbeRetention    = 365 * 24 * time.Hour
+	MinProxiesPerProbe   = 1
+	MaxProxiesPerProbe   = 100
 )
 
 // Store persists settings. Implemented by storage.SettingsStore.
@@ -213,6 +223,7 @@ type Patch struct {
 	RoutingStrategy          *RoutingStrategy
 	AccountSyncInterval      *time.Duration
 	ProbeRetention           *time.Duration
+	MaxProxiesPerProbe       *int
 }
 
 // Update applies a patch, validates it, persists it and publishes a new
@@ -262,6 +273,9 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	if p.ProbeRetention != nil {
 		next.ProbeRetention = *p.ProbeRetention
 	}
+	if p.MaxProxiesPerProbe != nil {
+		next.MaxProxiesPerProbe = *p.MaxProxiesPerProbe
+	}
 
 	if err := next.Validate(); err != nil {
 		return nil, err
@@ -303,6 +317,10 @@ func (v *Values) Validate() error {
 		return fmt.Errorf("settings: probe_history_retention_hours must be between %s and %s, got %s",
 			MinProbeRetention, MaxProbeRetention, v.ProbeRetention)
 	}
+	if v.MaxProxiesPerProbe < MinProxiesPerProbe || v.MaxProxiesPerProbe > MaxProxiesPerProbe {
+		return fmt.Errorf("settings: max_proxies_per_probe must be between %d and %d, got %d",
+			MinProxiesPerProbe, MaxProxiesPerProbe, v.MaxProxiesPerProbe)
+	}
 	if v.MaxProbeDuration < MinMaxProbeDuration {
 		return fmt.Errorf("settings: max_probe_duration must be at least %s, got %s", MinMaxProbeDuration, v.MaxProbeDuration)
 	}
@@ -332,6 +350,7 @@ func encode(v Values) (map[string]string, error) {
 		KeyAccountRoutingStrategy: string(v.RoutingStrategy),
 		KeyAccountSyncSec:         strconv.Itoa(int(v.AccountSyncInterval / time.Second)),
 		KeyProbeRetentionHours:    strconv.Itoa(int(v.ProbeRetention / time.Hour)),
+		KeyMaxProxiesPerProbe:     strconv.Itoa(v.MaxProxiesPerProbe),
 	}, nil
 }
 
@@ -415,6 +434,7 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	secsAt(KeyMaxProbeDurationSec, &v.MaxProbeDuration)
 	secsAt(KeyAccountSyncSec, &v.AccountSyncInterval)
 	hoursAt(KeyProbeRetentionHours, &v.ProbeRetention)
+	intAt(KeyMaxProxiesPerProbe, &v.MaxProxiesPerProbe)
 
 	if s, ok := raw[KeyAccountRoutingStrategy]; ok && strings.TrimSpace(s) != "" {
 		strategy, err := ParseRoutingStrategy(strings.TrimSpace(s))

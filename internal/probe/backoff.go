@@ -147,23 +147,35 @@ func (b Backoff) jitter(n time.Duration) time.Duration {
 	return time.Duration(rand.Int63n(int64(n)))
 }
 
-// proxyCooldownSteps is the per-node failure backoff ladder.
-var proxyCooldownSteps = []time.Duration{
-	1 * time.Minute,
-	2 * time.Minute,
-	5 * time.Minute,
-	10 * time.Minute,
-}
+// proxyCooldownBase and proxyCooldownCap define the per-node failure ladder:
+// 1, 2, 4, 8, 16, 32, 64 minutes, doubling and then holding at the cap. The
+// counter is reset by the caller once the cap is reached, so the ladder starts
+// again rather than pinning a node out of the pool forever -- a node that keeps
+// failing is still tried once an hour, which is how a transient outage that
+// lasts longer than an hour gets noticed at all.
+const (
+	proxyCooldownBase = time.Minute
+	proxyCooldownCap  = 64 * time.Minute
+)
 
 // ProxyCooldown returns the cooldown for a node that has failed
 // consecutivelyFailed times in a row, saturating at the top of the ladder.
 func ProxyCooldown(consecutivelyFailed int) time.Duration {
 	if consecutivelyFailed <= 0 {
-		return proxyCooldownSteps[0]
+		return proxyCooldownBase
 	}
-	idx := consecutivelyFailed - 1
-	if idx >= len(proxyCooldownSteps) {
-		idx = len(proxyCooldownSteps) - 1
+	cooldown := proxyCooldownBase
+	for i := 1; i < consecutivelyFailed && cooldown < proxyCooldownCap; i++ {
+		cooldown *= 2
+		if cooldown > proxyCooldownCap {
+			cooldown = proxyCooldownCap
+		}
 	}
-	return proxyCooldownSteps[idx]
+	return cooldown
+}
+
+// ProxyCooldownReachedCap reports whether a failure count has reached the top of
+// the ladder, which is when the counter is reset rather than left to climb.
+func ProxyCooldownReachedCap(consecutivelyFailed int) bool {
+	return ProxyCooldown(consecutivelyFailed) >= proxyCooldownCap
 }

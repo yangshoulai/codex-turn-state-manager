@@ -139,6 +139,7 @@ const DEFAULTS = {
   targetStateLength: 292,
   maxProbeDurationSec: 90,
   probeHistoryRetentionHours: 24,
+  maxProxiesPerProbe: 10,
   routingStrategy: "respect_cpa_priority",
 };
 
@@ -614,6 +615,7 @@ function fillSettingsForm(values) {
   $("s-reverse").checked = values.globalReverseBindEnabled;
   $("s-routing").checked = values.statePriorityEnabled;
   $("s-retention").value = values.probeHistoryRetentionHours;
+  $("s-maxproxies").value = values.maxProxiesPerProbe;
   $("s-scan").value = values.scanIntervalSec;
   $("s-concurrency").value = values.probeConcurrency;
   $("s-ttl").value = values.stateTtlMin;
@@ -679,6 +681,7 @@ on("save-settings", "click", async () => {
     targetStateLength: Number($("s-length").value),
     maxProbeDurationSec: Number($("s-maxprobe").value),
     probeHistoryRetentionHours: Number($("s-retention").value),
+    maxProxiesPerProbe: Number($("s-maxproxies").value),
     routingStrategy: strategy ? strategy.value : undefined,
   };
   try {
@@ -713,17 +716,14 @@ function renderWindows() {
       el("td", null, el("input", { type: "text", value: win.label || "", "data-k": "label" })),
       el("td", null, el("div", {
         class: "days", "data-k": "days",
-        title: "勾选生效的星期；一个都不勾表示每天",
+        title: "勾选生效的星期；全选表示每天",
       },
-        DAY_NAMES.map((name, index) => el("label", {
+        daysToChecked(win.daysOfWeek).map((on, index) => el("label", {
           class: "day",
-          title: index === 0 ? "周日" : "周" + name,
+          title: index === 0 ? "周日" : "周" + DAY_NAMES[index],
         }, [
-          el("input", {
-            type: "checkbox",
-            checked: (win.daysOfWeek || []).includes(index),
-          }),
-          el("span", { text: name }),
+          el("input", { type: "checkbox", checked: on }),
+          el("span", { text: DAY_NAMES[index] }),
         ])))),
       el("td", null, el("input", { type: "text", value: win.startTime, "data-k": "start" })),
       el("td", null, el("input", { type: "text", value: win.endTime, "data-k": "end" })),
@@ -738,9 +738,23 @@ function renderWindows() {
   }
 }
 
-// readDays returns the checked weekdays. No boxes checked means every day,
-// which is how the backend reads an empty list.
-function readDays(cell) {
+// daysToChecked maps a stored day list onto the seven checkboxes.
+//
+// An empty list means "every day" -- that is how the server reads it, and it is
+// what an operator gets before choosing anything -- so it has to render as all
+// seven checked. Rendering it as none checked made the panel unable to show the
+// state it had just saved: selecting all seven, saving, and watching the
+// selection vanish was the visible result.
+function daysToChecked(daysOfWeek) {
+  const days = daysOfWeek || [];
+  if (!days.length) return DAY_NAMES.map(() => true);
+  return DAY_NAMES.map((_, index) => days.includes(index));
+}
+
+// checkedToDays is the inverse, and canonicalises back to the empty list when
+// every day is selected so the stored form does not depend on how the operator
+// arrived at it.
+function checkedToDays(cell) {
   const boxes = [...cell.querySelectorAll("input[type=\"checkbox\"]")];
   const days = boxes.flatMap((box, index) => (box.checked ? [index] : []));
   return days.length === boxes.length ? [] : days;
@@ -748,7 +762,7 @@ function readDays(cell) {
 
 async function saveWindow(id, row) {
   const read = (k) => row.querySelector(`[data-k="${k}"]`);
-  const days = readDays(read("days"));
+  const days = checkedToDays(read("days"));
   try {
     await api("PUT", `/time-windows?${qs({ id })}`, {
       label: read("label").value || id,
@@ -859,6 +873,36 @@ function toggleAccount(authIndex) {
 
 // loadModelCatalog reads the account model list the plugin maintains from the
 // same manifest CPA syncs.
+// probeNow runs one on-demand probe and reports what happened.
+//
+// The outcome is surfaced verbatim, including a non-target length: "it answered
+// with 312" is a result, not a failure, and hiding it behind a generic error
+// would make the button useless for the question people press it to answer.
+async function probeNow(authIndex, model, button) {
+  if (button) {
+    button.disabled = true;
+    button.textContent = "探测中…";
+  }
+  try {
+    const r = await api("POST", `/accounts/models/probe-now?${qs({ authIndex, model })}`);
+    const bits = [r.outcome];
+    if (r.stateLength) bits.push(`长度 ${r.stateLength}`);
+    if (r.proxyId) bits.push(proxyLabel(r.proxyId));
+    if (r.latencyMs) bits.push(`${r.latencyMs}ms`);
+    if (r.error) bits.push(r.error);
+    toast(`${model}：${bits.join(" · ")}`, !r.succeeded && r.outcome !== "SUCCESS_NON_TARGET");
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "立即探测";
+    }
+    invalidate("probes");
+    refresh();
+  }
+}
+
 async function loadModelCatalog() {
   try {
     const payload = await api("GET", "/models");
@@ -954,6 +998,9 @@ function renderModels(authIndex, container, blockedReason) {
     });
 
     const actions = el("div", { class: "row-actions" }, [
+      el("button", { class: "btn btn-sm", type: "button", text: "立即探测",
+        title: "用一个代理探测一次，无论结果如何都结束",
+        onclick: (ev) => probeNow(authIndex, m.model, ev.target) }),
       el("button", { class: "btn btn-sm", type: "button", text: "删除绑定",
         onclick: () => deleteBinding(authIndex, m.model) }),
       el("button", { class: "btn btn-sm", type: "button", text: "历史",
@@ -1125,22 +1172,56 @@ function renderProxies() {
       el("td", null, el("span", { class: "pill " + statusCls, text: node.status })),
       el("td", { class: "num", text: node.lastLatencyMs ? node.lastLatencyMs + "ms" : "—" }),
       el("td", { class: "num", text: `${node.successCount || 0} / ${node.failureCount || 0}` }),
+      el("td", null, [
+        el("div", { class: "muted small", text: cooldownText(node) }),
+        node.consecutiveFailures
+          ? el("div", { class: "muted small", text: `连败 ${node.consecutiveFailures} 次` })
+          : null,
+      ]),
       el("td", { class: "muted small", text: fmtAgo(node.lastUsedAt) }),
-      el("td", null, el("div", { class: "row-actions" },
+      el("td", null, el("div", { class: "row-actions" }, [
+        el("button", { class: "btn btn-sm", type: "button", text: "重置冷却",
+          title: "清除冷却与失败计数，让该节点立即回到池中",
+          onclick: () => resetProxy(node.id) }),
         el("button", { class: "btn btn-sm btn-danger", type: "button", text: "移除",
           onclick: () => {
-          proxiesState.splice(index, 1);
-          invalidate("proxies");
-          renderProxies();
-          saveProxies();
-        } }))),
+            proxiesState.splice(index, 1);
+            invalidate("proxies");
+            renderProxies();
+            saveProxies();
+          } }),
+      ])),
     ]);
   });
 
   host.append(table(
     [{ label: "地址" }, { label: "启用" }, { label: "状态" }, { label: "延迟" },
-     { label: "成功/失败" }, { label: "最近使用" }, { label: "" }],
+     { label: "成功/失败" }, { label: "冷却" }, { label: "最近使用" }, { label: "" }],
     rows, "代理池为空"));
+}
+
+// cooldownText explains a node's availability, and why it is unavailable.
+//
+// "cooling" on its own does not say for how long, and the reason is what tells
+// an operator whether to wait or to fix something. Both are one line here
+// because a cooldown that has to be investigated is a cooldown that gets
+// worked around by deleting the node.
+function cooldownText(node) {
+  if (!node.cooldownUntil) return "—";
+  const until = new Date(node.cooldownUntil);
+  if (Number.isNaN(until.getTime()) || until <= new Date()) return "—";
+  const secs = Math.round((until - Date.now()) / 1000);
+  return `冷却 ${fmtDuration(secs)}（至 ${fmtTime(node.cooldownUntil)}）`;
+}
+
+async function resetProxy(nodeId) {
+  try {
+    await api("POST", `/proxy-nodes/reset?${qs({ nodeId })}`);
+    toast("已重置该节点的冷却与计数");
+    await loadProxies();
+  } catch (err) {
+    toast(err.message, true);
+  }
 }
 
 on("add-proxy", "click", () => {

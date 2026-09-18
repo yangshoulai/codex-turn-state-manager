@@ -576,3 +576,64 @@ func TestPanelAssetRoutesCarryAContentHash(t *testing.T) {
 		t.Error("the bare app.js route still resolves; it must not be served")
 	}
 }
+
+// TestPanelWeekdayMappingRoundTrips covers the day-list mapping in both
+// directions.
+//
+// An empty list means "every day" to the server, and the panel used to render
+// that as none-checked -- so choosing all seven, saving, and watching the
+// selection disappear was reproducible, and the panel could not display the
+// state it had just written. The two directions are pure functions now so this
+// is asserted rather than eyeballed.
+func TestPanelWeekdayMappingRoundTrips(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping panel weekday check")
+	}
+
+	script := `
+const fs = require('fs');
+const src = fs.readFileSync('app.js', 'utf8');
+const start = src.indexOf('const DAY_NAMES');
+const end = src.indexOf('async function saveWindow');
+if (start < 0 || end < 0) { console.error('weekday helpers not found'); process.exit(2); }
+const build = new Function(src.slice(start, end) + '\nreturn { daysToChecked, checkedToDays };');
+const { daysToChecked, checkedToDays } = build();
+
+function fail(msg) { console.error(msg); process.exit(1); }
+function eq(got, want, label) {
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    fail(label + ': got ' + JSON.stringify(got) + ', want ' + JSON.stringify(want));
+  }
+}
+
+// "Every day" has to show as all seven selected, which is the bug being fixed.
+eq(daysToChecked([]), [true, true, true, true, true, true, true], 'empty means every day');
+eq(daysToChecked(undefined), [true, true, true, true, true, true, true], 'missing means every day');
+eq(daysToChecked([1, 2, 3, 4, 5]), [false, true, true, true, true, true, false], 'weekdays');
+eq(daysToChecked([0, 6]), [true, false, false, false, false, false, true], 'weekend');
+
+// A fake cell: checkedToDays only reads checkbox inputs.
+function cell(checked) {
+  return { querySelectorAll: () => checked.map((on) => ({ checked: on })) };
+}
+eq(checkedToDays(cell([true, true, true, true, true, true, true])), [], 'all checked canonicalises to every day');
+eq(checkedToDays(cell([false, true, true, true, true, true, false])), [1, 2, 3, 4, 5], 'weekdays');
+eq(checkedToDays(cell([false, true, false, false, false, false, false])), [1], 'single day');
+
+// Round trip: what is rendered must parse back to the same stored value.
+for (const stored of [[], [1, 2, 3, 4, 5], [0, 6], [3]]) {
+  const rendered = daysToChecked(stored);
+  const reparsed = checkedToDays(cell(rendered));
+  const want = stored.length === 7 ? [] : stored;
+  eq(reparsed, want, 'round trip of ' + JSON.stringify(stored));
+}
+process.exit(0);
+`
+	cmd := exec.Command(node, "-e", script)
+	cmd.Dir = "."
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("panel weekday check failed: %v\n%s", err, out)
+	}
+}

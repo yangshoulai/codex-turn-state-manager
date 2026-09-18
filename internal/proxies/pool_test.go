@@ -153,7 +153,7 @@ func TestPool_MarkFailureCoolsDown(t *testing.T) {
 
 	pool := mustPool(t, Node{ID: "a", URL: "http://a", Enabled: true})
 
-	n, err := pool.MarkFailure(ctx, "a", 2*time.Minute, now)
+	n, err := pool.MarkFailure(ctx, "a", 2*time.Minute, now, false)
 	if err != nil {
 		t.Fatalf("MarkFailure: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestPool_MarkFailureWithoutCooldown(t *testing.T) {
 
 	// A zero cooldown is how a non-proxy fault (upstream 4xx) is recorded: the
 	// counters move but the node stays in service.
-	n, err := pool.MarkFailure(ctx, "a", 0, now)
+	n, err := pool.MarkFailure(ctx, "a", 0, now, false)
 	if err != nil {
 		t.Fatalf("MarkFailure: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestPool_MarkSuccessClearsCooldownAndStreak(t *testing.T) {
 	now := time.Now()
 
 	pool := mustPool(t, Node{ID: "a", URL: "http://a", Enabled: true})
-	if _, err := pool.MarkFailure(ctx, "a", time.Minute, now); err != nil {
+	if _, err := pool.MarkFailure(ctx, "a", time.Minute, now, false); err != nil {
 		t.Fatalf("MarkFailure: %v", err)
 	}
 	if err := pool.MarkSuccess(ctx, "a", 120*time.Millisecond, now.Add(time.Second)); err != nil {

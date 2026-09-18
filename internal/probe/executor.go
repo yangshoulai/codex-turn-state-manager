@@ -92,6 +92,9 @@ func (r Result) Succeeded() bool { return r.Outcome == OutcomeSuccessTarget }
 type ExecutorPolicy struct {
 	TargetStateLength int
 	MaxProbeDuration  time.Duration
+	// MaxProxies caps one traversal. Zero means no cap, which is what the
+	// tests that predate the setting rely on.
+	MaxProxies int
 }
 
 // Executor probes one (authIndex, model) pair, walking the proxy pool until it
@@ -145,12 +148,27 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 // SetClock overrides the time source. Tests only.
 func (e *Executor) SetClock(now func() time.Time) { e.now = now }
 
+// ProbeOnce runs a single-attempt probe: one node, then stop whatever the
+// outcome.
+//
+// This is the on-demand probe behind the panel's button. Its purpose is to
+// answer "what does this pair do right now", so it deliberately does not walk
+// the pool -- walking it would take minutes and report on the pool rather than
+// on the pair.
+func (e *Executor) ProbeOnce(ctx context.Context, authIndex, model string) Result {
+	return e.probe(ctx, authIndex, model, 1)
+}
+
 // Probe runs the full traversal for one pair.
 //
 // Structure follows design doc 3.7.3: proxies are visited least-recently-used
 // first, each is stamped as used *before* its request is sent, and the walk
 // stops early on a target hit or on an error no other proxy could fix.
 func (e *Executor) Probe(ctx context.Context, authIndex, model string) Result {
+	return e.probe(ctx, authIndex, model, e.policy().MaxProxies)
+}
+
+func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxies int) Result {
 	started := e.now()
 	policy := e.policy()
 
@@ -171,6 +189,13 @@ func (e *Executor) Probe(ctx context.Context, authIndex, model string) Result {
 	result := Result{Outcome: OutcomeNoProxyAvailable}
 
 	for _, node := range available {
+		if maxProxies > 0 && result.ProxiesTried >= maxProxies {
+			// The round is over. Report the last attempt's outcome rather than
+			// a special one: what the operator needs to know is how the last
+			// node behaved, and that the pool was not exhausted is visible in
+			// ProxiesTried.
+			break
+		}
 		if !e.now().Before(deadline) {
 			result.Outcome = OutcomeTimeoutAllProxies
 			result.ProxyID = ""
@@ -214,18 +239,34 @@ func (e *Executor) Probe(ctx context.Context, authIndex, model string) Result {
 			result.Latency = e.now().Sub(started)
 			return result
 
-		case attempt.Outcome.ProxyFault():
-			cooldown := ProxyCooldown(e.consecutiveFailures(node.ID))
-			if _, err := e.pool.MarkFailure(runCtx, node.ID, cooldown, e.now()); err != nil {
-				e.log(hostapi.LogWarn, "could not cool down proxy", map[string]any{
-					"proxyId": node.ID, "error": err.Error(),
-				})
-			}
+		case attempt.Outcome.ProxyFault(), attempt.Outcome == OutcomeSuccessNonTarget:
+			// Two different reasons to prefer another node next time. A proxy
+			// fault is the node's problem. A non-target length is not a fault at
+			// all -- the request succeeded -- but this node is not yielding what
+			// the pair needs, so it steps aside for the rest of the ladder. The
+			// upstream errors that must not evict a node (400/401/403/429) are
+			// Terminal, and returned above.
+			e.coolDown(runCtx, node.ID)
 		}
 	}
 
 	result.Latency = e.now().Sub(started)
 	return result
+}
+
+// coolDown applies the next step of a node's failure ladder.
+//
+// The count is taken before the increment so the first failure gets the base
+// delay, and it is cleared when the ladder reaches its cap so the next failure
+// starts over rather than holding the node out indefinitely.
+func (e *Executor) coolDown(ctx context.Context, id string) {
+	failures := e.consecutiveFailures(id)
+	cooldown := ProxyCooldown(failures)
+	if _, err := e.pool.MarkFailure(ctx, id, cooldown, e.now(), ProxyCooldownReachedCap(failures)); err != nil {
+		e.log(hostapi.LogWarn, "could not cool down proxy", map[string]any{
+			"proxyId": id, "error": err.Error(),
+		})
+	}
 }
 
 // record appends one probe_history row. History is best-effort: losing a row

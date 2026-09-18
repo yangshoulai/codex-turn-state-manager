@@ -852,3 +852,87 @@ func TestExecutor_AbandonsTheStreamWithoutReadingIt(t *testing.T) {
 		t.Errorf("probe took %s; it waited for the stream instead of closing the body", elapsed)
 	}
 }
+
+// TestExecutor_MaxProxiesCapsTheRound covers the setting an operator asked for:
+// one round tries at most N nodes, then stops.
+//
+// Without the cap a deep pool is walked in full, which on a bad day means every
+// probe spends the whole traversal budget before reporting anything. The cap
+// bounds the cost of a round; it does not change which nodes are eligible,
+// because the order is still least-recently-used.
+func TestExecutor_MaxProxiesCapsTheRound(t *testing.T) {
+	h := newExecHarness(t)
+
+	// Four nodes that all answer with a non-target length, so the walk has no
+	// reason to stop early on its own.
+	var nodes []*fakeProxy
+	for _, id := range []string{"p1", "p2", "p3", "p4"} {
+		nodes = append(nodes, h.addProxy(t, id, respondWith(http.StatusOK, "short", "")))
+	}
+
+	h.policy.MaxProxies = 2
+
+	got := h.probe(t)
+	if got.ProxiesTried != 2 {
+		t.Errorf("ProxiesTried = %d, want 2 with the cap set", got.ProxiesTried)
+	}
+	contacted := 0
+	for _, n := range nodes {
+		contacted += n.count()
+	}
+	if contacted != 2 {
+		t.Errorf("%d nodes were contacted, want 2", contacted)
+	}
+}
+
+// TestExecutor_ProbeOnceStopsAfterOneNode is the panel's button: one node, then
+// report, whatever happened.
+func TestExecutor_ProbeOnceStopsAfterOneNode(t *testing.T) {
+	h := newExecHarness(t)
+
+	var nodes []*fakeProxy
+	for _, id := range []string{"p1", "p2", "p3"} {
+		nodes = append(nodes, h.addProxy(t, id, respondWith(http.StatusOK, "short", "")))
+	}
+
+	got := h.executor.ProbeOnce(context.Background(), "codex-auth-1", "gpt-5-codex")
+	if got.ProxiesTried != 1 {
+		t.Errorf("ProxiesTried = %d, want 1", got.ProxiesTried)
+	}
+	contacted := 0
+	for _, n := range nodes {
+		contacted += n.count()
+	}
+	if contacted != 1 {
+		t.Errorf("%d nodes were contacted, want exactly 1", contacted)
+	}
+}
+
+// TestExecutor_NonTargetCoolsTheProxy pins the second cooldown trigger an
+// operator asked for: a node that returns the wrong state length steps aside so
+// the next round prefers a different one.
+func TestExecutor_NonTargetCoolsTheProxy(t *testing.T) {
+	h := newExecHarness(t)
+	h.addProxy(t, "only", respondWith(http.StatusOK, "short", ""))
+
+	if got := h.probe(t); got.Outcome != OutcomeSuccessNonTarget {
+		t.Fatalf("outcome = %s, want a non-target success", got.Outcome)
+	}
+
+	node, ok := h.pool.Get("only")
+	if !ok {
+		t.Fatal("node disappeared")
+	}
+	if node.CooldownUntil == nil {
+		t.Fatal("a non-target result did not cool the node down")
+	}
+	if node.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", node.ConsecutiveFailures)
+	}
+	if node.FailureCount != 1 {
+		t.Errorf("FailureCount = %d, want 1", node.FailureCount)
+	}
+	if node.Healthy(time.Now()) {
+		t.Error("the node is still healthy immediately after a non-target result")
+	}
+}

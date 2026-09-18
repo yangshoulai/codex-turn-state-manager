@@ -290,14 +290,24 @@ request path.
 **Only target-length values bind.** A harvested value whose length is not
 `target_state_length` is recorded and discarded — never bound.
 
-**Least-recently-used proxy rotation.** Each probe walks the whole pool in LRU order,
+**Least-recently-used proxy rotation.** Each probe walks the pool in LRU order, up to
+`max_proxies_per_probe` nodes,
 stamping `last_used_at` *before* each request so concurrent probes never pick the same
 node. The walk stops early on a target hit, or on an account- or model-level error that
 another proxy could not fix.
 
 **Failure classification.** Timeouts, connect errors, TLS errors and 407 are proxy
-faults and cool the node down (1m → 2m → 5m → 10m). Upstream 400/401/403/429 are not, and
-never evict a healthy node.
+faults. Upstream 400/401/403/429 are not, and never evict a healthy node — the walk stops
+on them instead.
+
+**Proxy cooldown ladder.** A node that deserves a rest steps aside for 1, 2, 4, 8, 16, 32
+then 64 minutes, doubling and holding at the cap; at the cap its counter resets so the
+next failure starts at a minute again, which is what keeps an outage longer than an hour
+from removing a node permanently. Two things earn a cooldown: a proxy fault, and a
+response whose state length is not the target — the request succeeded, but this node is
+not yielding what the pair needs, so the next round prefers another. A node in cooldown
+is not selectable. The panel shows the remaining time and offers a reset that clears both
+the cooldown and the counters.
 
 **Scanning is not probing.** A one-minute scan only enqueues probes that are actually
 due; a non-target-length result backs off for minutes, not seconds.
@@ -323,7 +333,8 @@ Set from the panel or the Management API. Defaults:
 | `state_ttl_min` | `60` | Binding lifetime |
 | `refresh_threshold_pct` | `15` | Re-probe once this much of the TTL remains |
 | `target_state_length` | `292` | The only length that binds |
-| `max_probe_duration_sec` | `90` | Cap on one pair's traversal of the whole pool |
+| `max_probe_duration_sec` | `90` | Wall-clock cap on one pair's traversal |
+| `max_proxies_per_probe` | `10` | Nodes one round may try before it stops, whatever the pool depth |
 | `account_sync_interval_sec` | `300` | How often the account list is re-read from CPA |
 | `probe_history_retention_hours` | `24` | Probe rows older than this are pruned |
 | `account_routing_strategy` | `respect_cpa_priority` | or `state_first` |
@@ -358,6 +369,7 @@ GET    /models
 GET    /accounts
 POST   /accounts/sync
 GET    /accounts/models?authIndex=…     # omit authIndex for every account at once
+POST   /accounts/models/probe-now?authIndex=…&model=…
 DELETE /accounts/models?authIndex=…&model=…
 PUT    /accounts/models/probe?authIndex=…&model=…
 GET    /bindings
@@ -366,6 +378,7 @@ GET    /bindings/history?authIndex=…&model=…&expand=1&limit=&offset=
 DELETE /bindings/history?authIndex=…&model=…
 GET    /proxy-nodes
 PUT    /proxy-nodes
+POST   /proxy-nodes/reset?nodeId=…
 GET    /probe-history?authIndex=&model=&limit=50&offset=0
 ```
 

@@ -41,7 +41,7 @@ type Service interface {
 	PipelineStats() intercept.StatsSnapshot
 
 	SyncAccounts(ctx context.Context) (int, error)
-	TriggerProbe(ctx context.Context, authIndex, model string) error
+	TriggerProbe(ctx context.Context, authIndex, model string) (probe.Result, error)
 }
 
 // API serves the Management API.
@@ -98,6 +98,7 @@ func Routes() []Route {
 		{http.MethodGet, "/accounts/models", func(a *API) http.HandlerFunc { return a.listAccountModels }},
 		{http.MethodPut, "/accounts/models/probe", func(a *API) http.HandlerFunc { return a.setProbeEnabled }},
 		{http.MethodDelete, "/accounts/models", func(a *API) http.HandlerFunc { return a.forgetModel }},
+		{http.MethodPost, "/accounts/models/probe-now", func(a *API) http.HandlerFunc { return a.probeNow }},
 
 		{http.MethodGet, "/bindings", func(a *API) http.HandlerFunc { return a.listBindings }},
 		{http.MethodDelete, "/bindings", func(a *API) http.HandlerFunc { return a.deleteBinding }},
@@ -105,6 +106,7 @@ func Routes() []Route {
 		{http.MethodDelete, "/bindings/history", func(a *API) http.HandlerFunc { return a.clearBindingHistory }},
 
 		{http.MethodGet, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.listProxies }},
+		{http.MethodPost, "/proxy-nodes/reset", func(a *API) http.HandlerFunc { return a.resetProxy }},
 		{http.MethodPut, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.replaceProxies }},
 
 		{http.MethodGet, "/probe-history", func(a *API) http.HandlerFunc { return a.probeHistory }},
@@ -192,6 +194,7 @@ type settingsDTO struct {
 	RoutingStrategy          string `json:"routingStrategy"`
 	AccountSyncIntervalSec   int    `json:"accountSyncIntervalSec"`
 	ProbeRetentionHours      int    `json:"probeHistoryRetentionHours"`
+	MaxProxiesPerProbe       int    `json:"maxProxiesPerProbe"`
 }
 
 func toSettingsDTO(v *settings.Values) settingsDTO {
@@ -209,6 +212,7 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		RoutingStrategy:          string(v.RoutingStrategy),
 		AccountSyncIntervalSec:   int(v.AccountSyncInterval / time.Second),
 		ProbeRetentionHours:      int(v.ProbeRetention / time.Hour),
+		MaxProxiesPerProbe:       v.MaxProxiesPerProbe,
 	}
 }
 
@@ -231,6 +235,7 @@ type settingsPatchDTO struct {
 	RoutingStrategy          *string `json:"routingStrategy"`
 	AccountSyncIntervalSec   *int    `json:"accountSyncIntervalSec"`
 	ProbeRetentionHours      *int    `json:"probeHistoryRetentionHours"`
+	MaxProxiesPerProbe       *int    `json:"maxProxiesPerProbe"`
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +273,7 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		d := time.Duration(*dto.ProbeRetentionHours) * time.Hour
 		patch.ProbeRetention = &d
 	}
+	patch.MaxProxiesPerProbe = dto.MaxProxiesPerProbe
 	if dto.RoutingStrategy != nil {
 		strategy, err := settings.ParseRoutingStrategy(*dto.RoutingStrategy)
 		if err != nil {
@@ -773,4 +779,52 @@ func prefix(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// ---------------------------------------------------------------------------
+// on-demand probe and proxy reset
+
+// probeNow runs one probe of a pair using a single node, for the panel's button.
+func (a *API) probeNow(w http.ResponseWriter, r *http.Request) {
+	pair, ok := pairQuery(w, r)
+	if !ok {
+		return
+	}
+	result, err := a.svc.TriggerProbe(r.Context(), pair.AuthIndex, pair.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// A non-target result is not an error: it is the answer. Reporting it as
+	// one would make the button look broken exactly when it worked.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"outcome":     string(result.Outcome),
+		"succeeded":   result.Succeeded(),
+		"stateLength": result.StateLength,
+		"proxyId":     result.ProxyID,
+		"latencyMs":   result.Latency.Milliseconds(),
+		"error":       errorString(result.Err),
+	})
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// resetProxy clears a node's cooldown and failure counters.
+func (a *API) resetProxy(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.URL.Query().Get("nodeId"))
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("nodeId query parameter is required"))
+		return
+	}
+	node, err := a.svc.Proxies().ResetFailure(r.Context(), nodeID, a.now())
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
 }

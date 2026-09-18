@@ -153,6 +153,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			return probe.ExecutorPolicy{
 				TargetStateLength: v.TargetStateLength,
 				MaxProbeDuration:  v.MaxProbeDuration,
+				MaxProxies:        v.MaxProxiesPerProbe,
 			}
 		},
 		BaseURL: cfg.UpstreamBaseURL,
@@ -408,23 +409,37 @@ func (e enabledPairs) Sync(ctx context.Context) (int, error) { return e.registry
 // SyncAccounts pulls the account list from CPA.
 func (a *App) SyncAccounts(ctx context.Context) (int, error) { return a.accounts.Sync(ctx) }
 
-// TriggerProbe runs an on-demand probe for one pair.
-func (a *App) TriggerProbe(ctx context.Context, authIndex, model string) error {
+// TriggerProbe runs one on-demand probe for a pair, using a single node.
+//
+// Deliberately not a full traversal: the operator is asking what this pair does
+// right now, and walking the pool would take minutes and answer a different
+// question. The outcome is reported rather than treated as an error -- a
+// non-target length is a legitimate answer to "what happens if I probe this".
+//
+// The probe toggle is not consulted. That switch decides what the *scheduler*
+// may do unattended; an explicit click is a different kind of consent, and a
+// pair whose scheduled probing is off is exactly the pair someone would want to
+// test by hand.
+func (a *App) TriggerProbe(ctx context.Context, authIndex, model string) (probe.Result, error) {
 	v := a.settings.Current()
 	if !v.Capabilities().Probe {
-		return errors.New("app: probing is disabled")
+		return probe.Result{}, errors.New("app: probing is disabled")
 	}
-	if !a.accounts.ProbeEnabled(authIndex, model) {
-		return fmt.Errorf("app: probing is not enabled for %s/%s", authIndex, model)
+	modelStates, ok := a.accounts.Models(authIndex)
+	if !ok {
+		return probe.Result{}, fmt.Errorf("app: unknown account %q", authIndex)
 	}
-	result := a.executor.Probe(ctx, authIndex, model)
-	if result.Err != nil {
-		return fmt.Errorf("app: probe %s/%s: %w (%s)", authIndex, model, result.Err, result.Outcome)
+	known := false
+	for _, ms := range modelStates {
+		if ms.Model == model {
+			known = true
+			break
+		}
 	}
-	if !result.Succeeded() {
-		return fmt.Errorf("app: probe %s/%s finished with %s", authIndex, model, result.Outcome)
+	if !known {
+		return probe.Result{}, fmt.Errorf("app: model %q is not offered by account %q", model, authIndex)
 	}
-	return nil
+	return a.executor.ProbeOnce(ctx, authIndex, model), nil
 }
 
 // ManagementAPI returns the Management API handler.
