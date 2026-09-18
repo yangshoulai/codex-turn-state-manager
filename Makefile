@@ -21,6 +21,19 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 override VERSION := $(patsubst v%,%,$(VERSION))
 LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
 
+# Windows only: Go hands the external linker a generated .def file, and the
+# binutils ld shipped on the Windows runners (2.46) fails to parse it whenever
+# the output name embeds the version -- "name-v0.1.0.dll" gives
+# "export_file.def:1: syntax error", while "name.dll" links fine. lld reads the
+# same file without complaint, so the Windows build routes through it.
+#
+# Verified by isolation on a Windows runner: dot-in-name fails, long names
+# without one pass, and the same command succeeds with -fuse-ld=lld. Remove this
+# once binutils accepts what Go emits.
+ifeq ($(shell go env GOOS),windows)
+C_SHARED_LDFLAGS := -extldflags "-fuse-ld=lld"
+endif
+
 .DEFAULT_GOAL := help
 .PHONY: help build build-shared build-dev build-linux release-archive test test-race vet fmt lint tidy clean run db-shell cpa-docker-up cpa-docker-down cpa-docker-logs
 
@@ -35,7 +48,8 @@ build-shared: ## Build the C-ABI plugin shared library for the host OS
 		windows) ext=dll ;; \
 		*) ext=so ;; \
 	esac; \
-	go build -buildmode=c-shared -tags cshared -trimpath -ldflags "$(LDFLAGS)" \
+	go build -buildmode=c-shared -tags cshared -trimpath \
+		-ldflags '$(LDFLAGS) $(C_SHARED_LDFLAGS)' \
 		-o $(BIN_DIR)/$(PLUGIN_NAME).$$ext ./cmd/plugin; \
 	echo "built $(BIN_DIR)/$(PLUGIN_NAME).$$ext"
 
@@ -61,7 +75,8 @@ release-archive: ## Build and package the store archive for the host platform
 		*) ext=so ;; \
 	esac; \
 	lib=$(BIN_DIR)/$(PLUGIN_NAME)-v$(VERSION).$$ext; \
-	go build -buildmode=c-shared -tags cshared -trimpath -ldflags "$(LDFLAGS)" \
+	go build -buildmode=c-shared -tags cshared -trimpath \
+		-ldflags '$(LDFLAGS) $(C_SHARED_LDFLAGS)' \
 		-o $$lib ./cmd/plugin && \
 	go run ./cmd/release-archive \
 		-lib $$lib \
