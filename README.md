@@ -385,7 +385,11 @@ response actually carried — which is how the reverse-bind limitation above was
 established.
 
 The panel's own assets are served from `/v0/resource/plugins/codex-turn-state-manager/`,
-which bypasses management auth. Note the entry point is `/index.html`, not the bare
+which bypasses management auth. The two cacheable assets carry a content hash in
+their route (`/app.<hash>.js`, `/style.<hash>.css`) and are served `immutable`;
+`index.html` keeps a stable address and is served `no-cache`, because it is what
+records which asset build is current. That pairing is what makes an update take
+effect immediately even behind a CDN that caches by file extension. Note the entry point is `/index.html`, not the bare
 base path: CPA rejects a resource route whose path trims to empty, so a bare `/`
 cannot be registered. Nothing secret is ever served from there: state values
 are returned as prefixes through the Management API, and the management key is held in

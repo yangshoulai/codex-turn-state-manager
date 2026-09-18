@@ -198,7 +198,9 @@ func serveResource(path, base, method string) ([]byte, error) {
 		name = "/index.html"
 	}
 
-	raw, err := web.ReadAsset(name)
+	// ServedAsset, not ReadAsset: the asset carries the panel's cache-busting
+	// version, and serving the raw file here would quietly drop it.
+	raw, err := web.ServedAsset(name)
 	if err != nil {
 		return okEnvelope(pluginapi.ManagementResponse{
 			StatusCode: http.StatusNotFound,
@@ -210,7 +212,7 @@ func serveResource(path, base, method string) ([]byte, error) {
 		StatusCode: http.StatusOK,
 		Headers: http.Header{
 			"Content-Type":  []string{web.ContentType(name)},
-			"Cache-Control": []string{"no-cache"},
+			"Cache-Control": []string{web.CacheControl(name)},
 		},
 		Body: raw,
 	})

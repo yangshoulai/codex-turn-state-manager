@@ -26,8 +26,24 @@ const BASE = "/v0/management/codex-turn-state-manager";
  * it ever changes, decoding fails and the panel falls back to asking.
  */
 const CPA_SESSION_KEY = "cli-proxy-auth";
-const CPA_OBFUSCATION_PREFIX = "enc::v1::";
 const CPA_OBFUSCATION_SALT = "cli-proxy-api-webui::secure-storage";
+
+/*
+ * Two obfuscation versions are in the wild under the same storage key.
+ *
+ * v1 is what CPA's own management center writes, and it derives the XOR key
+ * from the origin *and the user agent*. v2 is what CPA-Manager-Plus writes
+ * after its migration, and it drops the user agent -- precisely because tying a
+ * stored session to the UA breaks it whenever the browser updates itself.
+ *
+ * Reading only v1 is why a session written by the other panel came back
+ * "format not recognised" and the operator was asked for a key they had already
+ * entered. Both are accepted; neither is written, here or anywhere else.
+ */
+const OBFUSCATION = [
+  { prefix: "enc::v2::", key: () => `${CPA_OBFUSCATION_SALT}|v2|${location.host}` },
+  { prefix: "enc::v1::", key: () => `${CPA_OBFUSCATION_SALT}|${location.host}|${navigator.userAgent}` },
+];
 
 function xorBytes(bytes, keyBytes) {
   const out = new Uint8Array(bytes.length);
@@ -35,18 +51,21 @@ function xorBytes(bytes, keyBytes) {
   return out;
 }
 
-// decodePanelStorage accepts either an obfuscated blob or plain JSON.
+// decodePanelStorage accepts either obfuscation version, or plain JSON.
+//
+// The version is taken from the prefix rather than tried in turn: an XOR with
+// the wrong key produces bytes that decode to garbage instead of throwing, so
+// guessing would risk parsing nonsense rather than failing cleanly.
 function decodePanelStorage(raw) {
   if (!raw) return null;
   let text = raw;
-  if (text.startsWith(CPA_OBFUSCATION_PREFIX)) {
-    const binary = atob(text.slice(CPA_OBFUSCATION_PREFIX.length));
+  for (const { prefix, key } of OBFUSCATION) {
+    if (!text.startsWith(prefix)) continue;
+    const binary = atob(text.slice(prefix.length));
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const keyBytes = new TextEncoder().encode(
-      `${CPA_OBFUSCATION_SALT}|${location.host}|${navigator.userAgent}`
-    );
-    text = new TextDecoder().decode(xorBytes(bytes, keyBytes));
+    text = new TextDecoder().decode(xorBytes(bytes, new TextEncoder().encode(key())));
+    break;
   }
   return JSON.parse(text);
 }

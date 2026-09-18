@@ -7,12 +7,13 @@
 package web
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"io/fs"
 	"net/http"
+	"sort"
 	"strings"
-
-	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
 )
 
 //go:embed index.html app.js style.css
@@ -27,12 +28,71 @@ func ReadAsset(name string) ([]byte, error) {
 	return assets.ReadFile(strings.TrimPrefix(name, "/"))
 }
 
-// Assets lists the files the panel is made of.
+// The panel's files, and the routes they are served from.
+//
+// The route names are not the file names for the two assets that get cached:
+// each carries a hash of its own contents, so a new build is a URL that no cache
+// has ever seen. This is stronger than a version query string, which a cache is
+// free to ignore when it keys on the path alone.
+//
+// Measured against a real deployment: a CDN in front of CPA cached .js and .css
+// with its own four-hour TTL, overriding the Cache-Control this package sets,
+// while .html passed through untouched. A browser refresh could not get past the
+// edge cache -- a hard refresh only bypasses the browser's own -- so for hours
+// after an update the previous release's panel kept loading and calling
+// management routes that no longer existed.
+//
+// index.html is deliberately NOT hashed. It is the entry point the host's menu
+// links to, so it has to keep one stable address, and it is the one file a CDN
+// leaves alone -- which is exactly what makes it the right place to record which
+// app and style build to fetch.
+const (
+	indexPath = "/index.html"
+	appFile   = "app.js"
+	styleFile = "style.css"
+)
+
+// assetRoutes maps a route path to the embedded file it serves. Computed once:
+// the contents are embedded, so the hashes cannot change at runtime.
+var assetRoutes = func() map[string]string {
+	routes := map[string]string{indexPath: indexPath}
+
+	// A short hash is enough: the goal is telling two builds apart, not
+	// resisting a collision attack on a file that ships inside this library.
+	hashed := func(file string) string {
+		raw, err := assets.ReadFile(file)
+		if err != nil {
+			// Unreachable: the embed directive above lists the file. Panicking
+			// at init beats serving a panel whose routes are quietly missing.
+			panic("web: embedded asset " + file + " is unreadable: " + err.Error())
+		}
+		sum := sha256.Sum256(raw)
+		ext := file[strings.LastIndex(file, "."):]
+		return "/" + strings.TrimSuffix(file, ext) + "." + hex.EncodeToString(sum[:])[:12] + ext
+	}
+
+	routes[hashed(appFile)] = appFile
+	routes[hashed(styleFile)] = styleFile
+	return routes
+}()
+
+// Assets lists the routes the panel is served from, in declaration order.
 //
 // CPA registers resource routes one exact path at a time -- there is no static
 // directory and no wildcard -- so this list is also what gets declared to the
-// host, and every entry must be a file that exists above.
-var Assets = []string{"/index.html", "/app.js", "/style.css"}
+// host, and every entry must resolve through ServedAsset.
+var Assets = func() []string {
+	out := make([]string, 0, len(assetRoutes))
+	out = append(out, indexPath)
+	for route, file := range assetRoutes {
+		if file != indexPath {
+			out = append(out, route)
+		}
+	}
+	// Stable order: sort so the declaration does not depend on map iteration.
+	sort.Strings(out[1:])
+	return out
+}()
 
 // Handler serves the panel's assets.
 //
@@ -55,40 +115,67 @@ func Handler() http.Handler {
 }
 
 func serveAsset(w http.ResponseWriter, r *http.Request, name string) {
-	raw, err := assets.ReadFile(name[1:])
+	raw, err := ServedAsset(name)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", ContentType(name))
-	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(stampAssetReferences(name, raw))
+	w.Header().Set("Cache-Control", CacheControl(name))
+	_, _ = w.Write(raw)
 }
 
-// stampAssetReferences appends the build version to the panel's asset URLs.
+// ServedAsset returns the bytes to send for a route: the embedded file, with the
+// panel's asset references rewritten to their hashed routes.
 //
-// Cache-Control: no-cache is not enough. A CDN in front of CPA classifies by
-// file extension: .html passes through untouched, but .js and .css are cached
-// with the CDN's own TTL, which overrides this header. Measured against a real
-// deployment, app.js and style.css came back as max-age=14400 while index.html
-// kept no-cache, so a browser refresh -- even a hard one, which only bypasses
-// the browser's own cache -- kept loading the previous release's panel for four
-// hours. That is how an update left an open panel calling routes that no longer
-// existed.
-//
-// The version in the URL makes each release a distinct resource, which no cache
-// can confuse with the last one. index.html is the right place to do it because
-// it is the one asset the CDN leaves alone, so it is always the current copy
-// that decides which app.js and style.css to fetch.
-func stampAssetReferences(name string, raw []byte) []byte {
-	if !strings.HasSuffix(name, ".html") {
-		return raw
+// Every path that serves an asset goes through this rather than ReadAsset. The
+// first version of this rewriting was wired into the development harness only,
+// and the production handler in internal/pluginabi kept calling ReadAsset -- so
+// the fix was absent from the released binary while every test passed. One entry
+// point is what stops the two from diverging again.
+func ServedAsset(route string) ([]byte, error) {
+	file, ok := assetRoutes[route]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	raw, err := ReadAsset(file)
+	if err != nil {
+		return nil, err
+	}
+	if file != indexPath {
+		return raw, nil
 	}
 	out := string(raw)
-	for _, asset := range []string{"app.js", "style.css"} {
-		out = strings.ReplaceAll(out, `"`+asset+`"`, `"`+asset+`?v=`+version.Version+`"`)
+	for route, source := range assetRoutes {
+		if source == indexPath {
+			continue
+		}
+		// Relative, not absolute: index.html is served from
+		// /v0/resource/plugins/<id>/, and the original references are relative
+		// to it. A leading slash would resolve to the site root and 404.
+		out = strings.ReplaceAll(out, `"`+source+`"`, `"`+strings.TrimPrefix(route, "/")+`"`)
 	}
-	return []byte(out)
+	return []byte(out), nil
+}
+
+// ImmutableRoute reports whether a route's contents can never change, so it may
+// be cached indefinitely. Asset routes carry a content hash, so a change to the
+// file changes the route; index.html does not, and must be revalidated.
+func ImmutableRoute(route string) bool {
+	return route != indexPath && assetRoutes[route] != ""
+}
+
+// CacheControl is the Cache-Control value for a route.
+//
+// The hashed asset routes are immutable by construction, so they are the ones
+// that can be cached hard. index.html keeps no-cache because it is what records
+// which asset build is current: caching it is how a page ends up loading the
+// previous release.
+func CacheControl(route string) string {
+	if ImmutableRoute(route) {
+		return "public, max-age=31536000, immutable"
+	}
+	return "no-cache"
 }
 
 // ContentType maps an asset name to its Content-Type.

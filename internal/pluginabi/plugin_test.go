@@ -502,12 +502,28 @@ func TestManagementRoutesAreExactPaths(t *testing.T) {
 }
 
 // TestWebAssetsExist guards the resource list against a rename: a path declared
-// to the host that has no embedded file would serve a 404 to the panel.
+// to the host that cannot be served would hand the panel a 404.
+//
+// It asserts resolvability through ServedAsset rather than an embedded file of
+// the same name, because the two deliberately differ now: asset routes carry a
+// content hash, so /app.<hash>.js is served from app.js. Checking the file name
+// would pass for a route the panel cannot actually load.
 func TestWebAssetsExist(t *testing.T) {
 	for _, name := range web.Assets {
-		if _, err := web.FS().Open(name[1:]); err != nil {
-			t.Errorf("declared asset %s is not embedded: %v", name, err)
+		body, err := web.ServedAsset(name)
+		if err != nil {
+			t.Errorf("declared asset %s cannot be served: %v", name, err)
+			continue
 		}
+		if len(body) == 0 {
+			t.Errorf("declared asset %s served an empty body", name)
+		}
+	}
+
+	// The hashed routes must not be guessable into serving a different file:
+	// the bare names are no longer routes at all.
+	if _, err := web.ServedAsset("/app.js"); err == nil {
+		t.Error("the bare /app.js still resolves as a route")
 	}
 }
 
@@ -716,5 +732,79 @@ func TestManagementHandleServesResourcePaths(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404 for an unknown asset", resp.StatusCode)
+	}
+}
+
+// TestServeResourceStampsThePanelVersion covers the production resource path.
+//
+// It had no test, which is how its first cache-busting change came to be wired
+// into the development harness only: the released binary served the raw asset
+// while the harness served the stamped one, and everything stayed green.
+func TestServeResourceStampsThePanelVersion(t *testing.T) {
+	base := "/v0/resource/plugins/" + version.PluginName
+
+	raw, err := serveResource(base+"/index.html", base, http.MethodGet)
+	if err != nil {
+		t.Fatalf("serveResource: %v", err)
+	}
+	var resp pluginapi.ManagementResponse
+	if err := json.Unmarshal(resultOf(t, raw), &resp); err != nil {
+		t.Fatalf("decode management response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	served := string(resp.Body)
+
+	// The served HTML must point at the hashed routes, not at the bare file
+	// names, or a CDN will happily serve the previous release's assets again.
+	for _, bare := range []string{`"app.js"`, `"style.css"`} {
+		if strings.Contains(served, bare) {
+			t.Errorf("index.html is served still referring to %s", bare)
+		}
+	}
+	// Relative, because the panel is served from a subpath: a leading slash
+	// would resolve to the site root.
+	if !strings.Contains(served, `"app.`) || !strings.Contains(served, `"style.`) {
+		t.Error("index.html does not refer to hashed asset routes")
+	}
+	if strings.Contains(served, `"/app.`) || strings.Contains(served, `"/style.`) {
+		t.Error("index.html refers to asset routes absolutely; they would resolve outside the plugin's path")
+	}
+
+	// Every declared route must resolve, and the hashed ones must be cacheable
+	// forever -- their address changes when their contents do.
+	for _, route := range web.Assets {
+		assetRaw, err := serveResource(base+route, base, http.MethodGet)
+		if err != nil {
+			t.Fatalf("serveResource(%s): %v", route, err)
+		}
+		var asset pluginapi.ManagementResponse
+		if err := json.Unmarshal(resultOf(t, assetRaw), &asset); err != nil {
+			t.Fatalf("decode %s: %v", route, err)
+		}
+		if asset.StatusCode != http.StatusOK {
+			t.Errorf("%s status = %d, want 200", route, asset.StatusCode)
+			continue
+		}
+		cacheControl := asset.Headers.Get("Cache-Control")
+		if route == "/index.html" {
+			if cacheControl != "no-cache" {
+				t.Errorf("index.html Cache-Control = %q, want no-cache", cacheControl)
+			}
+			continue
+		}
+		if !strings.Contains(cacheControl, "immutable") {
+			t.Errorf("%s Cache-Control = %q, want an immutable directive", route, cacheControl)
+		}
+	}
+
+	// ReadAsset stays raw: the rewriting belongs to serving, not to reading.
+	direct, err := web.ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("ReadAsset: %v", err)
+	}
+	if strings.Contains(string(direct), "?v=") {
+		t.Error("ReadAsset returned rewritten bytes; the rewriting must live in ServedAsset")
 	}
 }

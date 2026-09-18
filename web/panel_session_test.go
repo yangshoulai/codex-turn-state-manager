@@ -28,17 +28,22 @@ func TestPanelDecodesManagementSession(t *testing.T) {
 	script := `
 const fs = require('fs');
 
-// CPA's encoder, transcribed from the shipped management bundle.
-const ml = 'enc::v1::';
+// The two encoders in the wild, transcribed from the panels that write them.
 const hl = 'cli-proxy-api-webui::secure-storage';
-const enc = new TextEncoder(), dec = new TextDecoder();
-const keyBytes = enc.encode(hl + '|example.test:8317|Mozilla/5.0 (Test)');
+const HOST = 'example.test:8317';
+const UA = 'Mozilla/5.0 (Test)';
+const enc = new TextEncoder();
 function xor(a, b) { const o = new Uint8Array(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] ^ b[i % b.length]; return o; }
-function encode(e) {
-  const x = xor(enc.encode(e), keyBytes);
+function obfuscate(prefix, key, e) {
+  const x = xor(enc.encode(e), enc.encode(key));
   let s = ''; for (const b of x) s += String.fromCharCode(b);
-  return ml + btoa(s);
+  return prefix + btoa(s);
 }
+// v1: what CPA's own management center writes. Keyed on the user agent.
+const encode = (e) => obfuscate('enc::v1::', hl + '|' + HOST + '|' + UA, e);
+// v2: what CPA-Manager-Plus writes. The user agent is gone, which is the point
+// of the version -- v1 stops decoding whenever the browser updates.
+const encodeV2 = (e) => obfuscate('enc::v2::', hl + '|v2|' + HOST, e);
 
 const src = fs.readFileSync('app.js', 'utf8');
 const start = src.indexOf('const CPA_SESSION_KEY');
@@ -49,8 +54,7 @@ const build = new Function('location', 'navigator', 'localStorage', 'atob', 'bto
   src.slice(start, end) + '\nreturn { readInheritedKey };');
 
 function inherit(store) {
-  return build({ host: 'example.test:8317' }, { userAgent: 'Mozilla/5.0 (Test)' },
-    store, atob, btoa).readInheritedKey();
+  return build({ host: HOST }, { userAgent: UA }, store, atob, btoa).readInheritedKey();
 }
 function expect(name, got, want) {
   if (got.key !== want.key || got.reason !== want.reason) {
@@ -76,6 +80,20 @@ expect('plain session',
 expect('session without key',
   inherit({ getItem: () => encode(JSON.stringify({ state: { apiBase: '/v0/management', rememberPassword: false } })) }),
   { key: '', reason: 'session-without-key' });
+
+// A session written by CPA-Manager-Plus instead of CPA's own panel. Reading
+// only v1 reported "undecodable", which is the login prompt operators hit when
+// the two panels share one browser.
+expect('v2 session from the other panel',
+  inherit({ getItem: () => encodeV2(JSON.stringify({ state: { managementKey: 'v2-key' } })) }),
+  { key: 'v2-key', reason: 'ok' });
+
+// v2 deliberately omits the user agent, so a different UA must not matter.
+expect('v2 session survives a browser update',
+  build({ host: HOST }, { userAgent: 'Mozilla/5.0 (Updated)' },
+    { getItem: () => encodeV2(JSON.stringify({ state: { managementKey: 'v2-key' } })) },
+    atob, btoa).readInheritedKey(),
+  { key: 'v2-key', reason: 'ok' });
 
 expect('no session', inherit({ getItem: () => null }), { key: '', reason: 'no-session' });
 
@@ -491,29 +509,70 @@ func ruleForSelector(sheet, want string) string {
 // passed through untouched. A browser refresh -- even a hard one, which only
 // bypasses the browser's cache -- therefore kept loading the previous release's
 // panel. The version in the URL is what makes each release a distinct resource.
-func TestPanelAssetURLsCarryTheVersion(t *testing.T) {
-	html, err := ReadAsset("index.html")
+func TestPanelAssetRoutesCarryAContentHash(t *testing.T) {
+	served, err := ServedAsset("/index.html")
 	if err != nil {
-		t.Fatalf("read index.html: %v", err)
+		t.Fatalf("serve index.html: %v", err)
 	}
-	served := string(stampAssetReferences("/index.html", html))
+	html := string(served)
 
-	for _, asset := range []string{"app.js", "style.css"} {
-		if strings.Contains(served, `"`+asset+`"`) {
-			t.Errorf("%s is referenced without a cache-busting version", asset)
-		}
-		if !strings.Contains(served, `"`+asset+`?v=`) {
-			t.Errorf("%s is not referenced with ?v=", asset)
+	// The served HTML must ask for the hashed routes, not the bare file names.
+	for _, bare := range []string{`"app.js"`, `"style.css"`} {
+		if strings.Contains(html, bare) {
+			t.Errorf("index.html still refers to %s", bare)
 		}
 	}
 
-	// Non-HTML assets are served byte for byte; rewriting them would corrupt
-	// them, and there is nothing in them to rewrite.
-	js, err := ReadAsset("app.js")
+	var hashed []string
+	for _, route := range Assets {
+		if route == "/index.html" {
+			continue
+		}
+		hashed = append(hashed, route)
+		// Relative: the panel is served from a subpath, so an absolute
+		// reference would resolve to the site root and 404.
+		if !strings.Contains(html, `"`+strings.TrimPrefix(route, "/")+`"`) {
+			t.Errorf("index.html does not refer to %s", route)
+		}
+		// A hash in the name is what makes the route safe to cache forever.
+		if !regexp.MustCompile(`/[a-z]+\.[0-9a-f]{12}\.(js|css)$`).MatchString(route) {
+			t.Errorf("asset route %q does not carry a content hash", route)
+		}
+		if !strings.Contains(CacheControl(route), "immutable") {
+			t.Errorf("asset route %q is not cacheable immutably", route)
+		}
+	}
+	if len(hashed) != 2 {
+		t.Fatalf("expected 2 hashed routes, got %d: %v", len(hashed), hashed)
+	}
+
+	// index.html is the entry point the host menu links to, so its address is
+	// fixed and it must stay revalidated.
+	if CacheControl("/index.html") != "no-cache" {
+		t.Errorf("index.html Cache-Control = %q, want no-cache", CacheControl("/index.html"))
+	}
+
+	// Asset bodies are served byte for byte: rewriting them would corrupt them.
+	raw, err := ReadAsset("app.js")
 	if err != nil {
 		t.Fatalf("read app.js: %v", err)
 	}
-	if got := string(stampAssetReferences("/app.js", js)); got != string(js) {
+	jsRoute := ""
+	for _, route := range Assets {
+		if strings.HasSuffix(route, ".js") {
+			jsRoute = route
+		}
+	}
+	got, err := ServedAsset(jsRoute)
+	if err != nil {
+		t.Fatalf("serve %s: %v", jsRoute, err)
+	}
+	if string(got) != string(raw) {
 		t.Error("app.js was modified on the way out")
+	}
+
+	// An unknown route is not a file.
+	if _, err := ServedAsset("/app.js"); err == nil {
+		t.Error("the bare app.js route still resolves; it must not be served")
 	}
 }
