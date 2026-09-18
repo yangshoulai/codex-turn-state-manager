@@ -72,14 +72,20 @@ function readInheritedKey() {
   try {
     const parsed = decodePanelStorage(raw);
     state = parsed && parsed.state ? parsed.state : parsed;
-  } catch {
+  } catch (err) {
+    // Worth surfacing: a decode failure means the stored blob was written with
+    // a different origin or user agent, which is the one cause the operator
+    // cannot see from the outside.
+    console.warn("[turn-state] could not decode " + CPA_SESSION_KEY +
+      " for this origin/user-agent:", err && err.message);
     return { key: "", reason: "undecodable" };
   }
   if (!state) return { key: "", reason: "undecodable" };
 
   const value = state.managementKey;
   if (typeof value !== "string" || !value.trim()) {
-    // The session was found but the key was not persisted with it.
+    console.info("[turn-state] session found but it carries no managementKey; " +
+      "fields present: " + Object.keys(state).join(", "));
     return { key: "", reason: "session-without-key" };
   }
   return { key: value.trim(), reason: "ok" };
@@ -110,6 +116,39 @@ const modelCache = new Map();
 /* ------------------------------------------------------------------ utils */
 
 const $ = (id) => document.getElementById(id);
+
+/*
+ * on binds a listener without letting a missing element take the whole script
+ * down.
+ *
+ * The panel is a single file of top-level bindings, so one null lookup used to
+ * abort everything after it -- including the bootstrap that decides whether to
+ * inherit a key or ask for one. The visible symptom was a login form, which
+ * pointed at authentication rather than at the missing element that actually
+ * caused it.
+ */
+function on(id, event, handler) {
+  const node = $(id);
+  if (!node) {
+    console.error(`[turn-state] element #${id} is missing; binding ${event} skipped`);
+    return;
+  }
+  node.addEventListener(event, handler);
+}
+
+// fail shows an unrecoverable panel error rather than leaving a blank page or a
+// misleading login form.
+function fail(message) {
+  const node = $("fatal");
+  if (node) {
+    node.textContent = message;
+    node.hidden = false;
+  }
+}
+
+window.addEventListener("error", (event) => {
+  console.error("[turn-state] uncaught error:", event.message, event.filename, event.lineno);
+});
 
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -299,14 +338,14 @@ async function connectWith(key, inheritedKey) {
   enterPanel(inheritedKey);
 }
 
-$("session-switch").addEventListener("click", () => {
+on("session-switch", "click", () => {
   managementKey = "";
   $("key").value = "";
   showGate();
   $("key").focus();
 });
 
-$("gate-form").addEventListener("submit", async (event) => {
+on("gate-form", "submit", async (event) => {
   event.preventDefault();
   const key = $("key").value.trim();
   if (!key) return;
@@ -321,7 +360,13 @@ $("gate-form").addEventListener("submit", async (event) => {
 // Bootstrap: try to inherit the session the management center already holds,
 // and only ask when that is unavailable or no longer valid.
 (async function bootstrap() {
+  console.info("[turn-state] panel script loaded");
   const inherited = readInheritedKey();
+  console.info("[turn-state] key inheritance:", inherited.reason,
+    "| host:", location.host,
+    "| has storage entry:", (() => {
+      try { return !!localStorage.getItem(CPA_SESSION_KEY); } catch { return "unavailable"; }
+    })());
   if (inherited.key) {
     try {
       await connectWith(inherited.key, inherited.key);
@@ -335,7 +380,13 @@ $("gate-form").addEventListener("submit", async (event) => {
     }
   }
   showGate(inheritHint(inherited.reason));
-})();
+})().catch((err) => {
+  // Bootstrap itself failed. Say so instead of leaving the login form up, which
+  // would send the operator looking for a key problem that does not exist.
+  console.error("[turn-state] bootstrap failed:", err);
+  fail("面板初始化失败：" + (err && err.message ? err.message : String(err)) +
+       "\n请刷新页面；若持续出现，请把控制台的 [turn-state] 日志一并反馈。");
+});
 
 /* ------------------------------------------------------------- settings */
 
@@ -358,13 +409,13 @@ function fillSettingsForm(values) {
   $("s-reverse").disabled = !values.globalEnabled;
 }
 
-$("s-global").addEventListener("change", () => {
+on("s-global", "change", () => {
   const on = $("s-global").checked;
   $("s-probe").disabled = !on;
   $("s-reverse").disabled = !on;
 });
 
-$("save-settings").addEventListener("click", async () => {
+on("save-settings", "click", async () => {
   const strategy = document.querySelector('input[name="strategy"]:checked');
   const patch = {
     globalEnabled: $("s-global").checked,
@@ -469,7 +520,7 @@ async function deleteWindow(id) {
   }
 }
 
-$("add-window").addEventListener("click", async () => {
+on("add-window", "click", async () => {
   try {
     await api("POST", "/time-windows", {
       label: "工作时段",
@@ -645,11 +696,11 @@ async function showHistory(authIndex, model) {
   }
 }
 
-$("modal-close").addEventListener("click", () => { $("modal").hidden = true; });
-$("modal").addEventListener("click", (event) => {
+on("modal-close", "click", () => { $("modal").hidden = true; });
+on("modal", "click", (event) => {
   if (event.target === $("modal")) $("modal").hidden = true;
 });
-$("modal-clear").addEventListener("click", async () => {
+on("modal-clear", "click", async () => {
   if (!modalContext) return;
   if (!confirm("清除该组合的全部绑定历史？此操作不可撤销。")) return;
   const { authIndex, model } = modalContext;
@@ -703,7 +754,7 @@ function renderProxies() {
     rows, "代理池为空"));
 }
 
-$("add-proxy").addEventListener("click", () => {
+on("add-proxy", "click", () => {
   const id = "proxy-" + Math.random().toString(36).slice(2, 8);
   proxiesState.push({
     id, url: "", enabled: true, successCount: 0, failureCount: 0,
@@ -712,7 +763,7 @@ $("add-proxy").addEventListener("click", () => {
   renderProxies();
 });
 
-$("save-proxies").addEventListener("click", async () => {
+on("save-proxies", "click", async () => {
   const payload = proxiesState
     .filter((n) => n.url)
     .map((n) => ({
@@ -764,8 +815,8 @@ function renderProbes(probes) {
     rows, "暂无探测记录"));
 }
 
-$("refresh-probes").addEventListener("click", () => loadProbes());
-$("probe-limit").addEventListener("change", () => loadProbes());
+on("refresh-probes", "click", () => loadProbes());
+on("probe-limit", "change", () => loadProbes());
 
 /* ----------------------------------------------------------------- load */
 
@@ -815,7 +866,7 @@ async function refresh() {
   await Promise.allSettled([loadAccounts(), loadProxies(), loadProbes()]);
 }
 
-$("sync-accounts").addEventListener("click", async () => {
+on("sync-accounts", "click", async () => {
   try {
     const resp = await api("POST", "/accounts/sync");
     await loadAccounts();

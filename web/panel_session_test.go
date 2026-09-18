@@ -133,3 +133,44 @@ func TestPanelKeepsTheInheritedKeyOutOfTheLoginForm(t *testing.T) {
 		t.Error("the inherited key is being pre-filled into the login form")
 	}
 }
+
+// TestPanelBindsListenersDefensively guards the failure that made the panel ask
+// for a key it should have inherited.
+//
+// The panel is one script of top-level bindings. A single null element lookup
+// aborts everything after it, including the bootstrap that decides between
+// inheriting a key and asking for one -- and because the login form is the
+// visible fallback, the symptom points at authentication instead of at the
+// missing element. Every binding goes through on(), and the form starts hidden
+// so a dead script is not mistaken for a prompt.
+func TestPanelBindsListenersDefensively(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+
+	// No unguarded top-level binding may remain.
+	for _, line := range strings.Split(string(js), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), `$("`) &&
+			strings.Contains(line, "addEventListener") {
+			t.Errorf("unguarded top-level binding: %s", strings.TrimSpace(line))
+		}
+	}
+
+	if !strings.Contains(string(js), "function on(id, event, handler)") {
+		t.Error("app.js has no guarded binding helper")
+	}
+	// Bootstrap must report its own failure rather than leaving the gate up.
+	if !strings.Contains(string(js), "bootstrap failed") {
+		t.Error("a bootstrap failure would be silent")
+	}
+	// The login form must start hidden: showing it while the script is still
+	// deciding is what made a dead script look like an auth problem.
+	if !strings.Contains(string(html), `id="gate" hidden`) {
+		t.Error("the login gate is visible by default")
+	}
+}

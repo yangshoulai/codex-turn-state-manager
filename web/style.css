@@ -89,6 +89,19 @@ h3 { font-size: 13px; color: var(--ink-soft); }
   white-space: nowrap;
 }
 
+.fatal {
+  margin: 20px auto 0;
+  max-width: 1120px;
+  padding: 12px 16px;
+  border: 1px solid #f0c2bf;
+  background: var(--bad-soft);
+  color: var(--bad);
+  border-radius: var(--radius);
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+.fatal[hidden] { display: none; }
+
 /* ---------- layout ---------- */
 
 main {
