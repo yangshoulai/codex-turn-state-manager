@@ -527,14 +527,20 @@ func TestManagementRegister_ReturnsRoutesAndResources(t *testing.T) {
 
 	// The registration must declare exactly the routes the plugin serves, each
 	// carrying the plugin path segment. The host resolves a management route as
-	// <BasePath> + <Path>, so a route without the segment lands somewhere
-	// unreachable and is dropped without a warning.
+	// <BasePath> + <Path> and BasePath is only "/v0/management", so a route
+	// without the segment lands somewhere unreachable -- or worse, somewhere
+	// that belongs to another owner -- and is dropped without a warning.
+	//
+	// The segment is deliberately not "plugins/<id>": see version.ManagementBasePath.
 	declared := management.Routes()
 	if len(resp.Routes) != len(declared) {
 		t.Fatalf("routes declared = %d, want %d", len(resp.Routes), len(declared))
 	}
 
-	const wantPrefix = "/plugins/" + version.PluginName
+	const wantPrefix = "/" + version.PluginName
+	if strings.Contains(wantPrefix, "/plugins/") {
+		t.Fatal("the management prefix must not be nested under CPA's own /plugins namespace")
+	}
 	byKey := map[string]bool{}
 	for _, r := range declared {
 		byKey[r.Method+" "+wantPrefix+r.Path] = true

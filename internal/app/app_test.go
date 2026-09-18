@@ -237,7 +237,7 @@ func TestApp_ManagementAPI(t *testing.T) {
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
 
-	base := srv.URL + "/v0/management/plugins/codex-turn-state-manager"
+	base := srv.URL + version.ManagementBasePath
 
 	get := func(path string) (int, map[string]any) {
 		t.Helper()
@@ -341,7 +341,7 @@ func TestApp_ManagementAPINeverLeaksFullStateValues(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	base := srv.URL + "/v0/management/plugins/codex-turn-state-manager"
+	base := srv.URL + version.ManagementBasePath
 
 	resp, err := http.Get(base + "/bindings")
 	if err != nil {
@@ -453,7 +453,7 @@ func TestApp_DeleteBindingEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &bindingAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	if got := api.bindingCount(); got != 1 {
 		t.Fatalf("bindings = %d, want 1", got)
@@ -518,7 +518,7 @@ func TestApp_BindingHistoryEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &bindingAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	history := api.history()
 	if len(history) != 1 {
@@ -569,7 +569,7 @@ func TestApp_ClearBindingHistoryEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &bindingAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	if got := len(api.history()); got != 1 {
 		t.Fatalf("history rows = %d, want 1", got)
@@ -600,7 +600,7 @@ func TestApp_DeleteMissingBindingIsIdempotent(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &bindingAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	for i := 0; i < 2; i++ {
 		code, body := api.do(http.MethodDelete, "/bindings?authIndex=codex-auth-1&model=gpt-5-codex")
@@ -658,7 +658,7 @@ func TestApp_ProbeToggleEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	const path = "/accounts/models/probe?authIndex=codex-auth-1&model=gpt-5-codex"
 
@@ -709,7 +709,7 @@ func TestApp_AccountModelsEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	code, body := api.do(http.MethodGet, "/accounts/models?authIndex=codex-auth-1", "")
 	if code != http.StatusOK {
@@ -763,7 +763,7 @@ func TestApp_AccountSyncEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	if got := len(a.Accounts().All()); got != 0 {
 		t.Fatalf("accounts before sync = %d, want 0", got)
@@ -798,7 +798,7 @@ func TestApp_ReplaceProxiesEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	payload := `{"proxies":[` +
 		`{"id":"p1","url":"http://proxy1:8080","enabled":true},` +
@@ -846,7 +846,7 @@ func TestApp_TimeWindowEndpoints(t *testing.T) {
 	a := newTestApp(t, mockHost(1))
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	type window struct {
 		ID         string `json:"id"`
@@ -931,7 +931,7 @@ func TestApp_TimeWindowEndpointsValidateInput(t *testing.T) {
 	a := newTestApp(t, mockHost(1))
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	cases := []struct {
 		name   string
@@ -966,7 +966,7 @@ func TestApp_ManagementRoutesCarryNoPathParameters(t *testing.T) {
 	a := newTestApp(t, mockHost(1))
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	// A path segment where a query parameter belongs must not accidentally
 	// reach a handler.
@@ -1091,7 +1091,7 @@ func TestApp_ForgetModelRemovesBindingAndConfig(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	code, body := api.do(http.MethodDelete,
 		"/accounts/models?authIndex=codex-auth-1&model="+model, "")
@@ -1255,7 +1255,7 @@ func TestApp_AccountModelsBulkEndpoint(t *testing.T) {
 
 	srv := httptest.NewServer(a.Handler(nil))
 	defer srv.Close()
-	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+	api := &panelAPI{t: t, base: srv.URL + version.ManagementBasePath}
 
 	code, body := api.do(http.MethodGet, "/accounts/models", "")
 	if code != http.StatusOK {

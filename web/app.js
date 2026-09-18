@@ -7,7 +7,7 @@
  */
 "use strict";
 
-const BASE = "/v0/management/plugins/codex-turn-state-manager";
+const BASE = "/v0/management/codex-turn-state-manager";
 
 /*
  * The management key can be inherited rather than typed.

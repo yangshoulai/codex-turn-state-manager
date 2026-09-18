@@ -65,7 +65,7 @@ func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 	if prefix == version.ManagementBasePath {
 		// BasePath did not match what this build expects; fall back to the
 		// documented layout rather than registering unreachable routes.
-		prefix = "/plugins/" + version.PluginName
+		prefix = "/" + version.PluginName
 	}
 
 	declared := management.Routes()

@@ -336,8 +336,15 @@ Proxy nodes are ordinary HTTP/HTTPS/SOCKS5 URLs.
 
 ## Management API
 
-All routes are under `/v0/management/plugins/codex-turn-state-manager/` and require CPA's
+All routes are under `/v0/management/codex-turn-state-manager/` and require CPA's
 management auth.
+
+**Note the path is flat — there is no `plugins/` segment.** The host offers plugins
+`BasePath` `/v0/management` and resolves routes as `<BasePath> + <Path>`, so the plugin
+segment is ours to choose. Nested under `plugins/` it would share a namespace with
+CLIProxyAPI's own plugin administration API, and third-party management front ends that
+treat `plugins` as a reserved segment would demand their own credentials before reaching
+it. Resource routes are the opposite: the host inserts `/plugins/<id>` there itself.
 
 ```
 GET    /status
