@@ -157,6 +157,7 @@ type settingsDTO struct {
 	GlobalEnabled            bool   `json:"globalEnabled"`
 	GlobalProbeEnabled       bool   `json:"globalProbeEnabled"`
 	GlobalReverseBindEnabled bool   `json:"globalReverseBindEnabled"`
+	StatePriorityEnabled     bool   `json:"statePriorityEnabled"`
 	ScanIntervalSec          int    `json:"scanIntervalSec"`
 	ProbeConcurrency         int    `json:"probeConcurrency"`
 	StateTTLMin              int    `json:"stateTtlMin"`
@@ -172,6 +173,7 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		GlobalEnabled:            v.GlobalEnabled,
 		GlobalProbeEnabled:       v.GlobalProbeEnabled,
 		GlobalReverseBindEnabled: v.GlobalReverseBindEnabled,
+		StatePriorityEnabled:     v.StatePriorityEnabled,
 		ScanIntervalSec:          int(v.ScanInterval / time.Second),
 		ProbeConcurrency:         v.ProbeConcurrency,
 		StateTTLMin:              int(v.StateTTL / time.Minute),
@@ -192,6 +194,7 @@ type settingsPatchDTO struct {
 	GlobalEnabled            *bool   `json:"globalEnabled"`
 	GlobalProbeEnabled       *bool   `json:"globalProbeEnabled"`
 	GlobalReverseBindEnabled *bool   `json:"globalReverseBindEnabled"`
+	StatePriorityEnabled     *bool   `json:"statePriorityEnabled"`
 	ScanIntervalSec          *int    `json:"scanIntervalSec"`
 	ProbeConcurrency         *int    `json:"probeConcurrency"`
 	StateTTLMin              *int    `json:"stateTtlMin"`
@@ -212,6 +215,7 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		GlobalEnabled:            dto.GlobalEnabled,
 		GlobalProbeEnabled:       dto.GlobalProbeEnabled,
 		GlobalReverseBindEnabled: dto.GlobalReverseBindEnabled,
+		StatePriorityEnabled:     dto.StatePriorityEnabled,
 		ProbeConcurrency:         dto.ProbeConcurrency,
 		RefreshThresholdPct:      dto.RefreshThresholdPct,
 		TargetStateLength:        dto.TargetStateLength,

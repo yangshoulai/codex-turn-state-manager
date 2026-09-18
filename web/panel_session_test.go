@@ -96,13 +96,16 @@ process.exit(0);
 	}
 }
 
-// TestPanelKeepsTheInheritedKeyOutOfTheLoginForm pins the deliberate choice not
-// to pre-fill the management key input.
+// TestPanelSurfacesTheKeyInTheConfigArea covers the layout the operator asked
+// for: the key is visible and editable in one place, rather than hidden behind
+// a toggle in the chrome.
 //
-// The input only appears when authentication failed, where the useful value is
-// a different key -- pre-filling a rejected one is misleading. The key is shown
-// in the session banner instead, masked until the operator asks for it.
-func TestPanelKeepsTheInheritedKeyOutOfTheLoginForm(t *testing.T) {
+// The earlier design masked it behind a "show" button in the top bar, which
+// meant answering "is a key configured, and is it the right one?" took two
+// clicks and still did not show the value in place. A password input in the
+// config area answers both at a glance while still not printing the key on
+// screen by default.
+func TestPanelSurfacesTheKeyInTheConfigArea(t *testing.T) {
 	html, err := ReadAsset("index.html")
 	if err != nil {
 		t.Fatalf("read index.html: %v", err)
@@ -111,26 +114,116 @@ func TestPanelKeepsTheInheritedKeyOutOfTheLoginForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read app.js: %v", err)
 	}
+	page := string(html)
 
-	if !strings.Contains(string(html), `id="session"`) {
-		t.Error("index.html has no session banner to report an inherited key")
+	for _, want := range []string{`id="mgmt-key"`, `id="mgmt-key-apply"`, `id="mgmt-key-source"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html is missing %s", want)
+		}
 	}
-	if !strings.Contains(string(html), `id="session-switch"`) {
-		t.Error("the banner offers no way to switch to another key")
+	// It must be a password field: shown in place, still not printed by default.
+	if !strings.Contains(page, `id="mgmt-key" type="password"`) {
+		t.Error("the key field should be a password input")
 	}
+	// The key belongs inside the config section, not in the top bar.
+	keyAt := strings.Index(page, `id="mgmt-key"`)
+	configAt := strings.Index(page, `id="config-body"`)
+	accountsAt := strings.Index(page, `id="accounts"`)
+	if !(configAt < keyAt && keyAt < accountsAt) {
+		t.Error("the key field should sit inside the config section, above the account list")
+	}
+	// And it has to be seeded, or "is a key configured" is unanswerable.
+	if !strings.Contains(string(js), "function fillKeyField(value, source)") {
+		t.Error("app.js never fills the key field")
+	}
+	if !strings.Contains(string(js), "fillKeyField(inheritedKey || managementKey") {
+		t.Error("enterPanel does not seed the key field with the working key")
+	}
+}
 
-	// enterPanel must take the inherited key so the banner can report it.
-	if !strings.Contains(string(js), "function enterPanel(inheritedKey)") {
-		t.Error("enterPanel does not receive the inherited key")
+// TestPanelCollapsesConfigByDefault pins that the account matrix is the
+// protagonist: configuration is one click away, not in the way.
+func TestPanelCollapsesConfigByDefault(t *testing.T) {
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
 	}
-	// The form field is only ever cleared, never seeded with a key.
-	if !strings.Contains(string(js), `$("key").value = ""`) {
-		t.Error("switching keys should clear the field rather than pre-fill it")
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
 	}
-	// The top-level `key` JSON field and the form field share a name in some
-	// refactors; make sure the form is not being written from the session.
-	if strings.Contains(string(js), `$("key").value = inherited`) {
-		t.Error("the inherited key is being pre-filled into the login form")
+	page := string(html)
+
+	if !strings.Contains(page, `id="config-body" hidden`) {
+		t.Error("the config body should start collapsed")
+	}
+	if !strings.Contains(page, `id="config-toggle"`) {
+		t.Error("no control expands the config")
+	}
+	if !strings.Contains(page, `aria-expanded="false"`) {
+		t.Error("the toggle should start with aria-expanded=false")
+	}
+	// The collapsed header must still say something useful.
+	if !strings.Contains(string(js), "function refreshConfigSummary()") {
+		t.Error("the collapsed header has no summary")
+	}
+	// Collapse state is a UI preference, not a secret, so remembering it is fine.
+	if !strings.Contains(string(js), "CONFIG_OPEN_KEY") {
+		t.Error("the collapse state is not remembered")
+	}
+}
+
+// TestPanelGroupsProxyPoolWithConfig covers the requested move: the proxy pool
+// is configuration, so it lives with the rest of it rather than as a peer card
+// competing with the account list.
+func TestPanelGroupsProxyPoolWithConfig(t *testing.T) {
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(html)
+
+	configAt := strings.Index(page, `id="config-body"`)
+	proxiesAt := strings.Index(page, `id="proxies"`)
+	accountsAt := strings.Index(page, `id="accounts"`)
+	if proxiesAt < 0 {
+		t.Fatal("no proxy list in the page")
+	}
+	if !(configAt < proxiesAt && proxiesAt < accountsAt) {
+		t.Error("the proxy pool should sit inside the config section, above the account list")
+	}
+}
+
+// TestPanelShipsDefaults keeps the restore action honest: it can only offer
+// defaults it actually knows.
+func TestPanelShipsDefaults(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := string(js)
+
+	for _, field := range []string{
+		"globalEnabled", "globalProbeEnabled", "globalReverseBindEnabled",
+		"statePriorityEnabled", "scanIntervalSec", "probeConcurrency",
+		"stateTtlMin", "refreshThresholdPct", "targetStateLength",
+		"maxProbeDurationSec", "routingStrategy",
+	} {
+		if !strings.Contains(src, field+":") {
+			t.Errorf("DEFAULTS is missing %s", field)
+		}
+	}
+	if !strings.Contains(src, `on("restore-defaults"`) {
+		t.Error("no control restores the defaults")
+	}
+	// Every numeric input should say what its default is, so the field is
+	// readable without the restore action.
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	if got := strings.Count(string(html), "field-hint"); got < 6 {
+		t.Errorf("%d field hints, want at least one per numeric setting", got)
 	}
 }
 

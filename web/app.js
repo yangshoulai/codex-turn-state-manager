@@ -105,6 +105,23 @@ function inheritHint(reason) {
   }
 }
 
+// Defaults mirror settings.Defaults() on the Go side. They exist so the panel
+// can offer a restore action and label each field; the server remains the
+// authority, and whatever it returns overwrites these on load.
+const DEFAULTS = {
+  globalEnabled: true,
+  globalProbeEnabled: true,
+  globalReverseBindEnabled: true,
+  statePriorityEnabled: true,
+  scanIntervalSec: 60,
+  probeConcurrency: 2,
+  stateTtlMin: 60,
+  refreshThresholdPct: 15,
+  targetStateLength: 292,
+  maxProbeDurationSec: 90,
+  routingStrategy: "respect_cpa_priority",
+};
+
 let managementKey = "";
 let settingsState = null;
 let proxiesState = [];
@@ -286,38 +303,68 @@ function table(headers, rows, emptyText) {
   return el("table", { class: "table" }, [thead, tbody]);
 }
 
-/* ------------------------------------------------------------------ gate */
+/* ---------------------------------------------------------------- config */
 
-// showSessionNotice reports where the working key came from.
-//
-// It is deliberately not pre-filled into the login input: that field only
-// appears when authentication failed, where the useful value is a *different*
-// key. The banner is where "which key am I using" belongs, and it stays masked
-// until asked so the key is not sitting in the DOM by default.
-function showSessionNotice(inheritedKey) {
-  const node = $("session");
-  const reveal = $("session-reveal");
-  if (!inheritedKey) {
-    node.hidden = true;
+const CONFIG_OPEN_KEY = "codex-turn-state-manager:config-open";
+
+function setConfigOpen(open) {
+  const body = $("config-body");
+  const toggle = $("config-toggle");
+  if (!body || !toggle) return;
+  body.hidden = !open;
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  try { localStorage.setItem(CONFIG_OPEN_KEY, open ? "1" : "0"); } catch { /* preference only */ }
+}
+
+on("config-toggle", "click", () => {
+  setConfigOpen($("config-body").hidden);
+});
+
+function restoreConfigOpen() {
+  let open = false;
+  try { open = localStorage.getItem(CONFIG_OPEN_KEY) === "1"; } catch { /* default closed */ }
+  setConfigOpen(open);
+}
+
+// refreshConfigSummary gives the collapsed header something useful to say, so
+// the state is legible without expanding it.
+function refreshConfigSummary() {
+  const node = $("config-summary");
+  if (!node || !settingsState) return;
+  const parts = [];
+  parts.push(settingsState.globalEnabled ? "总开关 开" : "总开关 关");
+  if (settingsState.globalEnabled) {
+    parts.push(settingsState.globalProbeEnabled ? "探测 开" : "探测 关");
+    parts.push(settingsState.globalReverseBindEnabled ? "反向绑定 开" : "反向绑定 关");
+    parts.push(settingsState.statePriorityEnabled ? "调度干预 开" : "调度干预 关");
+  }
+  const windows = windowsState.filter((w) => w.enabled).length;
+  parts.push(windows ? `${windows} 个时间窗口` : "全天可探测");
+  const proxies = proxiesState.length;
+  parts.push(proxies ? `${proxies} 个代理节点` : "无代理节点");
+  node.textContent = parts.join(" · ");
+}
+
+function refreshAccountsSummary() {
+  const node = $("accounts-summary");
+  if (!node) return;
+  if (!accountsState.length) {
+    // This runs after a successful load, so "never synced" would be wrong: the
+    // sync happened and CPA reported no Codex accounts.
+    node.textContent = "CPA 中暂无 Codex 账号";
     return;
   }
-  let shown = false;
-  const paint = () => {
-    reveal.textContent = shown ? inheritedKey : "显示";
-    reveal.title = shown ? "隐藏密钥" : "显示或隐藏密钥";
-  };
-  paint();
-  reveal.onclick = () => {
-    shown = !shown;
-    paint();
-  };
-  node.hidden = false;
+  let bound = 0;
+  for (const account of accountsState) bound += account.bindings || 0;
+  node.textContent = `${accountsState.length} 个账号 · ${bound} 个 State 绑定`;
 }
+
+/* ------------------------------------------------------------------ gate */
 
 function enterPanel(inheritedKey) {
   $("gate").hidden = true;
   $("panel").hidden = false;
-  showSessionNotice(inheritedKey);
+  fillKeyField(inheritedKey || managementKey, inheritedKey ? "inherited" : "manual");
   setConn("已连接", "pill-ok");
 }
 
@@ -343,6 +390,30 @@ async function connectWith(key, inheritedKey) {
 }
 
 // describeError renders an exception usefully in a UI string.
+/*
+ * The management key is shown, not hidden.
+ *
+ * An operator needs to answer "is a key configured, and is it the right one"
+ * at a glance. A banner that conceals the value behind a toggle answers
+ * neither, so the key sits in the config area as a password field: masked by
+ * the browser, readable when someone chooses to look, and editable in place.
+ * The plugin still never writes it anywhere -- readInheritedKey only reads.
+ */
+function fillKeyField(value, source) {
+  const field = $("mgmt-key");
+  if (field) field.value = value || "";
+  const note = $("mgmt-key-source");
+  if (!note) return;
+  const length = (value || "").length;
+  if (!length) {
+    note.textContent = "未设置。从 CPA 管理面板打开本页可自动沿用，也可直接在此填入。";
+    return;
+  }
+  note.textContent = source === "inherited"
+    ? `已沿用 CPA 管理面板的会话密钥（长度 ${length}）。可直接修改后点「应用」。`
+    : `当前使用手动输入的密钥（长度 ${length}）。`;
+}
+
 function describeError(err) {
   if (!err) return "未知错误";
   if (err.message) return err.message;
@@ -372,6 +443,7 @@ on("gate-form", "submit", async (event) => {
 // and only ask when that is unavailable or no longer valid.
 (async function bootstrap() {
   console.info("[turn-state] panel script loaded");
+  restoreConfigOpen();
   const inherited = readInheritedKey();
   console.info("[turn-state] key inheritance:", inherited.reason,
     "| host:", location.host,
@@ -392,6 +464,10 @@ on("gate-form", "submit", async (event) => {
       return;
     }
   }
+  if (inherited.reason !== "no-session") {
+    const reason = $("gate-reason");
+    if (reason) reason.textContent = inheritHint(inherited.reason);
+  }
   showGate(inheritHint(inherited.reason));
 })().catch((err) => {
   // Bootstrap itself failed. Say so instead of leaving the login form up, which
@@ -407,6 +483,7 @@ function fillSettingsForm(values) {
   $("s-global").checked = values.globalEnabled;
   $("s-probe").checked = values.globalProbeEnabled;
   $("s-reverse").checked = values.globalReverseBindEnabled;
+  $("s-routing").checked = values.statePriorityEnabled;
   $("s-scan").value = values.scanIntervalSec;
   $("s-concurrency").value = values.probeConcurrency;
   $("s-ttl").value = values.stateTtlMin;
@@ -416,11 +493,41 @@ function fillSettingsForm(values) {
   for (const radio of document.querySelectorAll('input[name="strategy"]')) {
     radio.checked = radio.value === values.routingStrategy;
   }
-  // The two sub-switches are inert while the master switch is off; disable
-  // them so the UI matches what the runtime actually does.
+  // The sub-switches are inert while the master switch is off; disable them so
+  // the UI matches what the runtime actually does.
   $("s-probe").disabled = !values.globalEnabled;
   $("s-reverse").disabled = !values.globalEnabled;
+  $("s-routing").disabled = !values.globalEnabled;
+  refreshConfigSummary();
 }
+
+on("s-routing", "change", () => {});
+
+on("mgmt-key-apply", "click", async () => {
+  const candidate = ($("mgmt-key").value || "").trim();
+  if (!candidate) {
+    toast("请先填入管理密钥", true);
+    return;
+  }
+  const previous = managementKey;
+  try {
+    await connectWith(candidate);
+    fillKeyField(candidate, "manual");
+    toast("密钥已应用");
+  } catch (err) {
+    // Restore the working key so a typo does not lock the operator out of a
+    // panel that was fine a moment ago.
+    managementKey = previous;
+    fillKeyField(previous, "manual");
+    toast("密钥无效：" + describeError(err), true);
+  }
+});
+
+on("restore-defaults", "click", () => {
+  if (!settingsState) return;
+  fillSettingsForm(DEFAULTS);
+  toast("已填入默认值，点「保存配置」生效");
+});
 
 on("s-global", "change", () => {
   const on = $("s-global").checked;
@@ -434,6 +541,7 @@ on("save-settings", "click", async () => {
     globalEnabled: $("s-global").checked,
     globalProbeEnabled: $("s-probe").checked,
     globalReverseBindEnabled: $("s-reverse").checked,
+    statePriorityEnabled: $("s-routing").checked,
     scanIntervalSec: Number($("s-scan").value),
     probeConcurrency: Number($("s-concurrency").value),
     stateTtlMin: Number($("s-ttl").value),
@@ -842,18 +950,21 @@ async function loadWindows() {
   const payload = await api("GET", "/time-windows");
   windowsState = payload.windows || [];
   renderWindows();
+  refreshConfigSummary();
 }
 
 async function loadAccounts() {
   const payload = await api("GET", "/accounts");
   accountsState = payload.accounts || [];
   renderAccounts();
+  refreshAccountsSummary();
 }
 
 async function loadProxies() {
   const payload = await api("GET", "/proxy-nodes");
   proxiesState = payload.proxies || [];
   renderProxies();
+  refreshConfigSummary();
 }
 
 async function loadProbes() {

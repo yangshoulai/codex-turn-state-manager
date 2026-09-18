@@ -1,21 +1,46 @@
+/*
+ * Codex Turn State Manager — admin panel.
+ *
+ * This is an operations console, not a marketing page. Two rules drive the
+ * styling:
+ *
+ *   1. Colour carries status and nothing else. Fresh, refresh-due, expired and
+ *      unbound are the only things allowed to be colourful; structure,
+ *      controls and chrome stay neutral so a glance at the page reads as a
+ *      health summary rather than decoration.
+ *   2. The account x model matrix is the protagonist. Configuration is
+ *      collapsed by default and visually quieter: it is read once, the matrix
+ *      is read constantly.
+ */
+
 :root {
-  --bg: #f6f7f9;
+  --bg: #f4f4f2;
   --surface: #ffffff;
-  --line: #e4e7ec;
-  --line-strong: #d0d5dd;
-  --ink: #16191f;
-  --ink-soft: #5b6472;
-  --ink-faint: #8b93a1;
-  --accent: #2f5bd7;
-  --accent-soft: #eaf0fe;
-  --ok: #16794c;
-  --ok-soft: #e6f5ee;
-  --warn: #9a5b06;
-  --warn-soft: #fdf3e2;
-  --bad: #b3261e;
-  --bad-soft: #fdeceb;
+  --surface-sunken: #fafaf9;
+  --line: #e3e3df;
+  --line-strong: #cbcbc4;
+
+  --ink: #191b18;
+  --ink-soft: #5c6058;
+  --ink-faint: #8b8f85;
+
+  /* One structural accent, used only for focus and the primary action. */
+  --accent: #2f4f45;
+  --accent-ink: #ffffff;
+  --accent-soft: #e7eeea;
+
+  --ok: #1c6b4a;
+  --ok-soft: #e3f1ea;
+  --warn: #8a5410;
+  --warn-soft: #fbeed8;
+  --bad: #9c2a22;
+  --bad-soft: #fbe6e4;
+
   --radius: 10px;
+  --radius-sm: 7px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -25,9 +50,9 @@
  *
  * An author `display` declaration outranks the user agent's [hidden] rule, so
  * an element styled `display: flex` stays visible while hidden unless this is
- * stated. That is not hypothetical: it made the login gate render on top of a
- * working panel, and the DOM property still read hidden=true, so every
- * programmatic check said the panel was fine.
+ * stated. That is not hypothetical: it once made the login gate render on top
+ * of a working panel while the DOM property still read hidden=true, so every
+ * programmatic check reported success.
  *
  * Do not add per-selector [hidden] rules; they would be a second source of truth.
  */
@@ -37,19 +62,19 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font: 14px/1.55 var(--sans);
   -webkit-font-smoothing: antialiased;
 }
 
 h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-h1 { font-size: 15px; }
+h1 { font-size: 14px; }
 h2 { font-size: 14px; }
-h3 { font-size: 13px; color: var(--ink-soft); }
+h3 { font-size: 13px; }
 
 .muted { color: var(--ink-soft); }
 .small { font-size: 12px; }
-.error { color: var(--bad); font-size: 13px; margin: 10px 0 0; }
+.error { color: var(--bad); font-size: 13px; }
+.right { justify-content: flex-end; }
 
 /* ---------- top bar ---------- */
 
@@ -70,77 +95,97 @@ h3 { font-size: 13px; color: var(--ink-soft); }
 .brand { display: flex; align-items: center; gap: 10px; }
 
 .mark {
-  width: 9px; height: 9px; border-radius: 2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
   background: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 
-.session {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--ink-soft);
-  padding: 3px 6px 3px 9px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: #fbfcfd;
-}
-.session code {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--ink);
-  background: var(--accent-soft);
-  padding: 1px 6px;
-  border-radius: 4px;
-  max-width: 22ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fatal {
-  margin: 20px auto 0;
-  max-width: 1120px;
-  padding: 12px 16px;
-  border: 1px solid #f0c2bf;
-  background: var(--bad-soft);
-  color: var(--bad);
-  border-radius: var(--radius);
-  font-size: 13px;
-  white-space: pre-wrap;
-}
-
 /* ---------- layout ---------- */
 
 main {
-  max-width: 1120px;
+  max-width: 1080px;
   margin: 0 auto;
   padding: 20px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 16px 18px 18px;
 }
+
+.card > .card-head,
+.card > .as-button { padding: 14px 18px; }
+.card > #accounts,
+.card > #probes { padding: 0 18px 16px; }
+
+/* The account matrix is the reason this page exists; give it more presence
+   than the surrounding cards without resorting to a heavier border. */
+.card-primary { border-color: var(--line-strong); }
+.card-primary > .card-head {
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-sunken);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+.card-body { padding: 0 18px 18px; }
 
 .card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 14px;
 }
 
-.card-head.sub { margin: 18px 0 8px; }
-.card-actions { display: flex; align-items: center; gap: 8px; }
+.head-main { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.actions { display: flex; align-items: center; gap: 8px; }
+.card-actions { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
+
+/* A whole header that expands what is below it. */
+.as-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: none;
+  border: 0;
+  border-radius: var(--radius);
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.as-button:hover { background: var(--surface-sunken); }
+.as-button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.chevron {
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid var(--ink-faint);
+  border-bottom: 1.5px solid var(--ink-faint);
+  transform: rotate(45deg);
+  transition: transform 140ms ease;
+  flex: none;
+  margin-right: 4px;
+}
+.as-button[aria-expanded="true"] .chevron { transform: rotate(-135deg); }
+
+.sub-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.divider { height: 1px; background: var(--line); margin: 18px 0; }
 
 /* ---------- controls ---------- */
 
@@ -148,49 +193,62 @@ main {
   font: inherit;
   font-size: 13px;
   padding: 6px 12px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line-strong);
   background: var(--surface);
   color: var(--ink);
   cursor: pointer;
   transition: background 120ms ease, border-color 120ms ease;
 }
-.btn:hover { background: #f2f4f7; }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn-primary:hover { background: #274db8; }
-.btn-danger { color: var(--bad); border-color: #f0c2bf; }
+.btn:hover { background: #f1f1ef; }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn-primary:hover { background: #263f37; }
+.btn-danger { color: var(--bad); border-color: #e2c3c0; }
 .btn-danger:hover { background: var(--bad-soft); }
 .btn-ghost { border-color: transparent; }
 .btn-sm { padding: 3px 8px; font-size: 12px; }
 
-input[type="text"], input[type="number"], input[type="password"], select {
+input[type="text"], input[type="number"], input[type="password"] {
   font: inherit;
   font-size: 13px;
   padding: 6px 9px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line-strong);
   background: var(--surface);
   color: var(--ink);
   width: 100%;
 }
-input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px;
   margin-top: 16px;
 }
 
-.grid label, .inline {
+.grid label {
   display: flex;
   flex-direction: column;
   gap: 5px;
   font-size: 12px;
   color: var(--ink-soft);
 }
-.inline { flex-direction: row; align-items: center; gap: 6px; }
-.inline input { width: 72px; }
+
+.field-hint { color: var(--ink-faint); font-size: 11.5px; line-height: 1.4; }
+
+.inline { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-soft); }
+.inline input { width: 74px; }
+
+/* ---------- management key ---------- */
+
+.key-row { display: flex; flex-direction: column; gap: 6px; }
+.key-row > label { font-size: 12px; color: var(--ink-soft); }
+.key-control { display: flex; gap: 8px; max-width: 460px; }
+.key-control input { font-family: var(--mono); letter-spacing: 0.02em; flex: 1 1 auto; min-width: 0; }
+/* The label is two CJK glyphs; without this the flex row wraps it mid-word. */
+.key-control .btn { flex: none; white-space: nowrap; }
 
 /* ---------- switches ---------- */
 
@@ -207,8 +265,9 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .switch input { opacity: 0; width: 0; height: 0; }
 
 .slider {
-  position: absolute; inset: 0;
-  background: #cfd4dd;
+  position: absolute;
+  inset: 0;
+  background: #d2d2cc;
   border-radius: 999px;
   cursor: pointer;
   transition: background 140ms ease;
@@ -221,11 +280,12 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
   background: #fff;
   border-radius: 50%;
   transition: transform 140ms ease;
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.2);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.18);
 }
 .switch input:checked + .slider { background: var(--accent); }
 .switch input:checked + .slider::before { transform: translateX(16px); }
-.switch input:disabled + .slider { opacity: 0.45; cursor: not-allowed; }
+.switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch input:disabled + .slider { opacity: 0.4; cursor: not-allowed; }
 
 .switch-text { display: flex; flex-direction: column; gap: 2px; }
 .switch-text strong { font-size: 13px; font-weight: 600; }
@@ -238,7 +298,7 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
   align-items: center;
   gap: 16px;
   flex-wrap: wrap;
-  margin-top: 16px;
+  margin-top: 18px;
   padding-top: 14px;
   border-top: 1px solid var(--line);
 }
@@ -252,33 +312,43 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .table th {
   text-align: left;
   font-weight: 500;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--ink-faint);
-  padding: 6px 8px;
+  padding: 7px 8px;
   border-bottom: 1px solid var(--line);
   white-space: nowrap;
 }
-.table td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.table td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 .table tr:last-child td { border-bottom: none; }
 .table input[type="text"], .table input[type="number"] { width: 100%; min-width: 70px; }
-.table td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+.mono { font-family: var(--mono); font-size: 12px; }
 
-/* ---------- account blocks ---------- */
+/* The probe history is dense reference data; keep it lighter than the matrix. */
+#probes .table td { padding: 6px 8px; }
 
-.account { border: 1px solid var(--line); border-radius: 9px; margin-bottom: 10px; overflow: hidden; }
+/* ---------- accounts ---------- */
+
+.account { border: 1px solid var(--line); border-radius: var(--radius-sm); margin-bottom: 10px; overflow: hidden; }
 .account-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 12px;
-  background: #fbfcfd;
+  padding: 11px 13px;
+  background: var(--surface-sunken);
   cursor: pointer;
+  border: 0;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  text-align: left;
 }
+.account-head:hover { background: #f3f3f1; }
+.account-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .account-head .who { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .account-head .who strong { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-head .meta { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-soft); }
-.account-body { padding: 2px 12px 12px; }
+.account-body { padding: 4px 13px 12px; }
 
 /* ---------- pills ---------- */
 
@@ -294,20 +364,20 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .pill-ok { background: var(--ok-soft); color: var(--ok); }
 .pill-warn { background: var(--warn-soft); color: var(--warn); }
 .pill-bad { background: var(--bad-soft); color: var(--bad); }
-.pill-idle { background: #eef0f3; color: var(--ink-soft); }
-.pill-accent { background: var(--accent-soft); color: var(--accent); }
+.pill-idle { background: #ecedea; color: var(--ink-soft); }
 
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 .dot-ok { background: var(--ok); }
-.dot-warn { background: #d98908; }
+.dot-warn { background: #c07a12; }
 .dot-bad { background: var(--bad); }
-.dot-idle { background: #b6bcc7; }
+.dot-idle { background: #b7bab3; }
 
 /* ---------- gate ---------- */
 
 .gate { display: flex; justify-content: center; padding: 72px 20px; }
 .gate-card {
-  width: 100%; max-width: 380px;
+  width: 100%;
+  max-width: 420px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -317,35 +387,55 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 .gate-card p { margin: 0 0 14px; font-size: 12.5px; }
 .gate-card form { display: flex; gap: 8px; }
 .gate-card button {
-  font: inherit; font-size: 13px;
+  font: inherit;
+  font-size: 13px;
   padding: 7px 16px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-ink);
   cursor: pointer;
   white-space: nowrap;
+}
+
+.fatal {
+  margin: 20px auto 0;
+  max-width: 1080px;
+  padding: 12px 16px;
+  border: 1px solid #e2c3c0;
+  background: var(--bad-soft);
+  color: var(--bad);
+  border-radius: var(--radius);
+  font-size: 13px;
+  white-space: pre-wrap;
 }
 
 /* ---------- modal ---------- */
 
 .modal {
-  position: fixed; inset: 0;
-  background: rgba(16, 24, 40, 0.42);
-  display: flex; align-items: center; justify-content: center;
+  position: fixed;
+  inset: 0;
+  background: rgba(24, 26, 23, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 24px;
   z-index: 40;
 }
 .modal-card {
   background: var(--surface);
   border-radius: 12px;
-  width: 100%; max-width: 720px;
+  width: 100%;
+  max-width: 720px;
   max-height: 82vh;
-  display: flex; flex-direction: column;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
 .modal-head, .modal-foot {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 14px 18px;
 }
 .modal-head { border-bottom: 1px solid var(--line); }
@@ -356,9 +446,10 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 
 .toast {
   position: fixed;
-  bottom: 22px; left: 50%;
+  bottom: 22px;
+  left: 50%;
   transform: translateX(-50%);
-  background: #1f2430;
+  background: #20231f;
   color: #fff;
   font-size: 13px;
   padding: 9px 16px;
@@ -368,8 +459,10 @@ input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color:
 }
 .toast.bad { background: var(--bad); }
 
-/* ---------- misc ---------- */
-
 .empty { padding: 18px 4px; color: var(--ink-faint); font-size: 13px; }
 .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .num { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}

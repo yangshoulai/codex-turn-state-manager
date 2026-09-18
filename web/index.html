@@ -10,98 +10,143 @@
 
 <header class="topbar">
   <div class="brand">
-    <span class="mark"></span>
+    <span class="mark" aria-hidden="true"></span>
     <h1>Codex Turn State Manager</h1>
   </div>
   <div class="topbar-right">
-    <span id="session" class="session" hidden>
-      <span class="dot dot-ok"></span>
-      <span>已沿用管理面板会话密钥</span>
-      <button id="session-reveal" class="btn btn-sm" type="button" title="显示或隐藏密钥">显示</button>
-      <button id="session-switch" class="btn btn-sm" type="button">改用其他密钥</button>
-    </span>
     <span id="conn" class="pill pill-idle">未连接</span>
-    <span id="version" class="muted"></span>
+    <span id="version" class="muted small"></span>
   </div>
 </header>
 
+<div id="fatal" class="fatal" hidden></div>
+
 <section class="gate" id="gate" hidden>
   <div class="gate-card">
-    <h2>管理密钥</h2>
-    <p class="muted">通常不需要手动输入：从 CPA 管理面板打开本页时，会自动沿用你已登录的会话。</p>
-    <p class="muted">密钥仅保存在当前页面内存中，本插件不会把它写入任何存储或日志。</p>
+    <h2>需要管理密钥</h2>
+    <p class="muted" id="gate-reason">从 CPA 管理面板打开本页时会自动沿用会话；直接访问时需要手动输入。</p>
     <form id="gate-form" autocomplete="off">
-      <input id="key" type="password" placeholder="Management key" autocomplete="off" spellcheck="false">
+      <input id="key" type="password" placeholder="Management key" autocomplete="off" spellcheck="false" aria-label="Management key">
       <button type="submit">连接</button>
     </form>
     <p id="gate-error" class="error" hidden></p>
   </div>
 </section>
 
-<div id="fatal" class="fatal" hidden></div>
-
 <main id="panel" hidden>
 
-  <section class="card">
-    <div class="card-head">
-      <h2>全局设置</h2>
-      <div class="card-actions">
-        <button id="save-settings" class="btn btn-primary" type="button">保存设置</button>
+  <!-- 配置：默认收起。账号状态才是这个面板的主角，配置是配角。 -->
+  <section class="card card-config" id="config">
+    <button type="button" class="card-head as-button" id="config-toggle" aria-expanded="false" aria-controls="config-body">
+      <span class="head-main">
+        <h2>配置</h2>
+        <span class="muted small" id="config-summary">—</span>
+      </span>
+      <span class="chevron" aria-hidden="true"></span>
+    </button>
+
+    <div class="card-body" id="config-body" hidden>
+
+      <div class="key-row">
+        <label for="mgmt-key">管理密钥</label>
+        <div class="key-control">
+          <input id="mgmt-key" type="password" autocomplete="off" spellcheck="false"
+                 aria-describedby="mgmt-key-source">
+          <button id="mgmt-key-apply" class="btn" type="button">应用</button>
+        </div>
+        <p class="muted small" id="mgmt-key-source">—</p>
       </div>
-    </div>
 
-    <div class="switch-row">
-      <label class="switch">
-        <input type="checkbox" id="s-global">
-        <span class="slider"></span>
-      </label>
-      <div class="switch-text">
-        <strong>全局总开关</strong>
-        <span class="muted">关闭后探测、请求注入、响应捕获、账号调度干预四项能力全部旁路</span>
+      <div class="divider"></div>
+
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="s-global">
+          <span class="slider"></span>
+        </label>
+        <div class="switch-text">
+          <strong>全局总开关</strong>
+          <span class="muted">关闭后探测、请求注入、响应捕获、账号调度干预四项能力全部旁路</span>
+        </div>
       </div>
-    </div>
 
-    <div class="switch-row">
-      <label class="switch">
-        <input type="checkbox" id="s-probe">
-        <span class="slider"></span>
-      </label>
-      <div class="switch-text">
-        <strong>定时探测</strong>
-        <span class="muted">在全局总开关开启时生效，受时间窗口限制</span>
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="s-probe">
+          <span class="slider"></span>
+        </label>
+        <div class="switch-text">
+          <strong>定时探测</strong>
+          <span class="muted">在全局总开关开启时生效，受时间窗口限制</span>
+        </div>
       </div>
-    </div>
 
-    <div class="switch-row">
-      <label class="switch">
-        <input type="checkbox" id="s-reverse">
-        <span class="slider"></span>
-      </label>
-      <div class="switch-text">
-        <strong>反向绑定</strong>
-        <span class="muted">从正常业务流量响应头中捕获 State 并绑定</span>
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="s-reverse">
+          <span class="slider"></span>
+        </label>
+        <div class="switch-text">
+          <strong>反向绑定</strong>
+          <span class="muted">从正常业务流量响应头中捕获 State 并绑定</span>
+        </div>
       </div>
-    </div>
 
-    <div class="grid">
-      <label>扫描间隔 (秒)<input type="number" id="s-scan" min="5" step="5"></label>
-      <label>探测并发数<input type="number" id="s-concurrency" min="1" max="32"></label>
-      <label>State TTL (分钟)<input type="number" id="s-ttl" min="1"></label>
-      <label>刷新阈值 (%)<input type="number" id="s-threshold" min="0" max="90"></label>
-      <label>目标长度<input type="number" id="s-length" min="1"></label>
-      <label>单次探测总超时 (秒)<input type="number" id="s-maxprobe" min="5"></label>
-    </div>
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="s-routing">
+          <span class="slider"></span>
+        </label>
+        <div class="switch-text">
+          <strong>状态优先调度</strong>
+          <span class="muted">开启后插件才会干预 CPA 的账号选择；关闭时仍正常注入已持有的 State</span>
+        </div>
+      </div>
 
-    <div class="strategy">
-      <span class="label">账号路由策略</span>
-      <label class="radio"><input type="radio" name="strategy" value="respect_cpa_priority"> 优先遵循 CPA priority</label>
-      <label class="radio"><input type="radio" name="strategy" value="state_first"> State 优先</label>
-    </div>
+      <div class="grid">
+        <label>扫描间隔（秒）
+          <input type="number" id="s-scan" min="5" step="5">
+          <span class="field-hint">默认 60。只决定多久扫一次，不等于多久探测一次</span>
+        </label>
+        <label>探测并发数
+          <input type="number" id="s-concurrency" min="1" max="32">
+          <span class="field-hint">默认 2。同时占用槽位的 pair 数</span>
+        </label>
+        <label>State TTL（分钟）
+          <input type="number" id="s-ttl" min="1">
+          <span class="field-hint">默认 60。绑定值的有效期</span>
+        </label>
+        <label>刷新阈值（%）
+          <input type="number" id="s-threshold" min="0" max="90">
+          <span class="field-hint">默认 15。剩余不足此比例即提前重探</span>
+        </label>
+        <label>目标长度
+          <input type="number" id="s-length" min="1">
+          <span class="field-hint">默认 292。只有这个长度会被绑定</span>
+        </label>
+        <label>单次探测总超时（秒）
+          <input type="number" id="s-maxprobe" min="5">
+          <span class="field-hint">默认 90。一个 pair 遍历全部代理的上限</span>
+        </label>
+      </div>
 
-    <div class="windows">
-      <div class="card-head sub">
+      <div class="strategy">
+        <span class="label">账号路由策略</span>
+        <label class="radio"><input type="radio" name="strategy" value="respect_cpa_priority"> 优先遵循 CPA priority</label>
+        <label class="radio"><input type="radio" name="strategy" value="state_first"> State 优先</label>
+        <span class="muted small">State 优先会跨优先级档选择持有 State 的账号</span>
+      </div>
+
+      <div class="card-actions right">
+        <button id="restore-defaults" class="btn" type="button">恢复默认值</button>
+        <button id="save-settings" class="btn btn-primary" type="button">保存配置</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="sub-head">
         <h3>探测时间窗口</h3>
-        <button id="add-window" class="btn" type="button">+ 添加窗口</button>
+        <button id="add-window" class="btn" type="button">添加窗口</button>
       </div>
       <p class="muted small">未配置任何启用窗口时表示全天可探测。窗口支持跨天，例如 22:00–06:00。</p>
       <table class="table" id="windows-table">
@@ -110,38 +155,44 @@
         </thead>
         <tbody></tbody>
       </table>
+
+      <div class="divider"></div>
+
+      <div class="sub-head">
+        <h3>代理池</h3>
+        <span class="actions">
+          <button id="add-proxy" class="btn" type="button">添加节点</button>
+          <button id="save-proxies" class="btn btn-primary" type="button">保存代理池</button>
+        </span>
+      </div>
+      <p class="muted small">探测按「最久未使用优先」遍历，直到命中目标长度或遍历完毕。HTTP / HTTPS / SOCKS5 均可。</p>
+      <div id="proxies"></div>
     </div>
   </section>
 
-  <section class="card">
+  <!-- 账号与模型：面板的主角 -->
+  <section class="card card-primary">
     <div class="card-head">
-      <h2>账号与模型</h2>
-      <div class="card-actions">
+      <span class="head-main">
+        <h2>账号与模型</h2>
+        <span class="muted small" id="accounts-summary">—</span>
+      </span>
+      <span class="actions">
         <button id="sync-accounts" class="btn" type="button">同步账号</button>
-      </div>
+      </span>
     </div>
     <div id="accounts"></div>
   </section>
 
   <section class="card">
     <div class="card-head">
-      <h2>代理池</h2>
-      <div class="card-actions">
-        <button id="save-proxies" class="btn btn-primary" type="button">保存代理池</button>
-        <button id="add-proxy" class="btn" type="button">+ 添加节点</button>
-      </div>
-    </div>
-    <p class="muted small">每行一个节点。探测时按「最久未使用优先」顺序遍历，直到命中目标长度或遍历完毕。</p>
-    <div id="proxies"></div>
-  </section>
-
-  <section class="card">
-    <div class="card-head">
-      <h2>最近探测记录</h2>
-      <div class="card-actions">
+      <span class="head-main">
+        <h2>最近探测记录</h2>
+      </span>
+      <span class="actions">
         <label class="inline">条数 <input type="number" id="probe-limit" value="50" min="10" max="500" step="10"></label>
         <button id="refresh-probes" class="btn" type="button">刷新</button>
-      </div>
+      </span>
     </div>
     <div id="probes"></div>
   </section>
