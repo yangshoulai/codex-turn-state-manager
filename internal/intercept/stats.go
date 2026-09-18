@@ -35,10 +35,11 @@ type Stats struct {
 
 	// Why a header-init call produced no binding. "Captured nothing" is a
 	// symptom; these name the cause.
-	skipSwitchOff atomic.Int64
-	skipNoAuth    atomic.Int64
-	skipNoState   atomic.Int64
-	skipNonTarget atomic.Int64
+	skipSwitchOff  atomic.Int64
+	skipNoAuth     atomic.Int64
+	skipNoState    atomic.Int64
+	skipNonTarget  atomic.Int64
+	staleDiscarded atomic.Int64
 
 	// lastHeaderInit records what the most recent header-init call actually
 	// carried.
@@ -132,6 +133,10 @@ type StatsSnapshot struct {
 	SkipNoAuth    int64 `json:"skipNoAuth"`
 	SkipNoState   int64 `json:"skipNoState"`
 	SkipNonTarget int64 `json:"skipNonTarget"`
+	// StaleDiscarded counts bindings dropped because the upstream returned a
+	// different, unusable value -- the plugin correcting itself rather than
+	// injecting a token upstream has moved past.
+	StaleDiscarded int64 `json:"staleDiscarded"`
 
 	// LastHeaderInit is what the most recent header-init call carried.
 	LastHeaderInit *HeaderInitSnapshot `json:"lastHeaderInit,omitempty"`
@@ -154,6 +159,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		SkipNoAuth:     s.skipNoAuth.Load(),
 		SkipNoState:    s.skipNoState.Load(),
 		SkipNonTarget:  s.skipNonTarget.Load(),
+		StaleDiscarded: s.staleDiscarded.Load(),
 		LastHeaderInit: s.LastHeaderInit(),
 	}
 }

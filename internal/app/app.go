@@ -176,6 +176,9 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
 		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
 		Signals: a.accounts.RecordSignals,
+		// A binding dropped as stale should be refilled by the next scan, not
+		// by a probe whose backoff predates the discovery.
+		OnStale: a.scheduler.ProbeNow,
 	})
 	a.router = routing.NewScheduler(routing.SchedulerConfig{
 		Settings: a.settings, States: a.states, Cursors: db.Cursors(),

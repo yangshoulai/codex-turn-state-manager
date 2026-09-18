@@ -29,6 +29,7 @@ type Collector struct {
 	// id.
 	stats   *Stats
 	signals func(authIndex string, signals headers.Signals)
+	onStale func(pair states.Pair)
 
 	failMu       sync.Mutex
 	serverErrors map[states.Pair]int
@@ -45,6 +46,9 @@ type CollectorConfig struct {
 	// reads the same headers, but its minimal request does not elicit them --
 	// only real turns do, which is where this runs.
 	Signals func(authIndex string, signals headers.Signals)
+	// OnStale is told when a binding was discarded as stale, so the pair can be
+	// probed again promptly.
+	OnStale func(pair states.Pair)
 }
 
 // NewCollector builds a collector.
@@ -59,6 +63,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		logf:         cfg.Log,
 		stats:        cfg.Stats,
 		signals:      cfg.Signals,
+		onStale:      cfg.OnStale,
 		serverErrors: map[states.Pair]int{},
 	}
 }
@@ -81,6 +86,9 @@ const (
 	CaptureRefreshed     = "refreshed"
 	CaptureNoAuth        = "no_auth"
 	CaptureNotHeaderInit = "not_header_init"
+	// CaptureStale means the response carried a different, unusable value, so
+	// the binding was discarded and the pair queued for re-probing.
+	CaptureStale = "stale"
 )
 
 // Observe handles the stream header-init callback
@@ -179,17 +187,37 @@ func (c *Collector) capture(
 		return CaptureResult{Action: CaptureIgnored, AuthIndex: authIndex}
 	}
 
+	pair := states.Pair{AuthIndex: authIndex, Model: model}
 	policy := c.settings.Current()
+
+	// The response is compared against what this request carried.
+	//
+	// A different value means the token the plugin is holding is no longer the
+	// one upstream issues, and the binding has to be reconciled rather than
+	// trusted until its TTL lapses.
+	injected := ""
+	if hasRec && rec.Injected {
+		injected = rec.StateValue
+	}
+	unchanged := injected != "" && injected == value
+
 	if len(value) != policy.TargetStateLength {
-		// Wrong length: recorded nowhere, bound never (F-15).
+		// Wrong length: bound never (F-15).
 		c.stats.skipNonTarget.Add(1)
-		return CaptureResult{Action: CaptureNonTarget, AuthIndex: authIndex, StateLen: len(value)}
+		if unchanged {
+			// We sent this value and got it back; it is simply not a length
+			// this plugin binds. Nothing to reconcile.
+			return CaptureResult{Action: CaptureNonTarget, AuthIndex: authIndex, StateLen: len(value)}
+		}
+		// A value of the wrong length that differs from what we hold says the
+		// binding describes a token upstream no longer issues. Drop it -- TTL
+		// and all -- and let the next scan probe, rather than keep injecting a
+		// value the upstream has already moved past.
+		return c.discardStale(ctx, pair, value, injected)
 	}
 
 	prev, status := c.states.Lookup(authIndex, model)
-	sameValue := status.Usable() && prev.StateValue == value
-
-	pair := states.Pair{AuthIndex: authIndex, Model: model}
+	sameValue := unchanged || (status.Usable() && prev.StateValue == value)
 	if _, err := c.states.Bind(ctx, states.Binding{
 		Pair:       pair,
 		StateValue: value,
@@ -213,11 +241,50 @@ func (c *Collector) capture(
 	c.stats.captured.Add(1)
 	c.log(hostapi.LogInfo, "state captured from traffic", map[string]any{
 		"authIndex": authIndex, "model": model, "length": len(value),
+		"replaced": injected != "" && injected != value,
 	})
 	return CaptureResult{
 		Action: CaptureBound, AuthIndex: authIndex,
 		StateLen: len(value), Bound: true,
 	}
+}
+
+// discardStale drops a binding whose value upstream has moved past, and clears
+// the pair's probe backoff so the next scan refills it.
+//
+// Without this the plugin keeps injecting a token the upstream no longer
+// issues, for as long as the old TTL lasts, while the probe that would fix it
+// waits out a backoff scheduled before the problem existed.
+func (c *Collector) discardStale(ctx context.Context, pair states.Pair, value, injected string) CaptureResult {
+	_, status := c.states.Lookup(pair.AuthIndex, pair.Model)
+	if status == states.StatusMissing {
+		// Nothing was held, so nothing is stale. The pair is already eligible
+		// for probing, and clearing its backoff here would undo a deliberate
+		// one -- a MODEL_UNSUPPORTED cooldown, say -- and turn every response
+		// into a reason to probe again.
+		return CaptureResult{Action: CaptureNonTarget, AuthIndex: pair.AuthIndex, StateLen: len(value)}
+	}
+
+	if err := c.states.Invalidate(ctx, pair); err != nil {
+		c.log(hostapi.LogError, "could not discard stale binding", map[string]any{
+			"authIndex": pair.AuthIndex, "model": pair.Model, "error": err.Error(),
+		})
+		return CaptureResult{Action: CaptureIgnored, AuthIndex: pair.AuthIndex, StateLen: len(value)}
+	}
+	c.stats.staleDiscarded.Add(1)
+	c.log(hostapi.LogWarn, "discarded stale binding: upstream returned a non-target length", map[string]any{
+		"authIndex":   pair.AuthIndex,
+		"model":       pair.Model,
+		"injectedLen": len(injected),
+		"returnedLen": len(value),
+	})
+
+	if c.onStale != nil {
+		// Let the next scan probe this pair instead of waiting out a backoff
+		// that was scheduled before the binding was known to be stale.
+		c.onStale(pair)
+	}
+	return CaptureResult{Action: CaptureStale, AuthIndex: pair.AuthIndex, StateLen: len(value)}
 }
 
 // FailureSignal is what the collector decided to do about a failed request.

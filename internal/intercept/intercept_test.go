@@ -757,3 +757,115 @@ func TestObserveSnapshotRecordsCorrelation(t *testing.T) {
 		t.Errorf("AuthIndex = %q, want codex-auth-1", snap.AuthIndex)
 	}
 }
+
+// TestCaptureReconcilesAgainstInjectedValue covers the rule that a response
+// carrying a different token is reconciled rather than trusted.
+//
+// Three outcomes, and the third is the point: a different, unusable value means
+// the binding describes a token upstream no longer issues, so it is dropped
+// along with its TTL and the pair is queued for a probe -- instead of being
+// injected for the rest of its life while the probe waits out a backoff
+// scheduled before the problem existed.
+func TestCaptureReconcilesAgainstInjectedValue(t *testing.T) {
+	ctx := context.Background()
+	held := stateOf(targetLength)
+
+	setup := func(t *testing.T) (*harness, states.Pair, *[]states.Pair) {
+		t.Helper()
+		h := newHarness(t)
+		h.bind(t, "codex-auth-1", "gpt-5-codex", held)
+		h.corr.Record("req-1", "gpt-5-codex", "auth-id-1", "codex-auth-1")
+		h.corr.MarkInjected("req-1", held)
+
+		var requeued []states.Pair
+		h.collector.onStale = func(p states.Pair) { requeued = append(requeued, p) }
+		return h, states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}, &requeued
+	}
+
+	t.Run("same value keeps the binding", func(t *testing.T) {
+		h, pair, requeued := setup(t)
+
+		got := h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-1", held))
+		if got.Action != CaptureRefreshed {
+			t.Fatalf("action = %s, want refreshed", got.Action)
+		}
+		if binding, status := h.states.Lookup(pair.AuthIndex, pair.Model); !status.Usable() || binding.StateValue != held {
+			t.Error("the binding should have been kept")
+		}
+		if len(*requeued) != 0 {
+			t.Error("nothing should be requeued when the value is unchanged")
+		}
+	})
+
+	t.Run("different target value replaces the binding", func(t *testing.T) {
+		h, pair, requeued := setup(t)
+		fresh := strings.Repeat("n", targetLength)
+
+		got := h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-1", fresh))
+		if got.Action != CaptureBound {
+			t.Fatalf("action = %s, want bound", got.Action)
+		}
+		binding, status := h.states.Lookup(pair.AuthIndex, pair.Model)
+		if !status.Usable() || binding.StateValue != fresh {
+			t.Error("the new value should have been adopted")
+		}
+		if len(*requeued) != 0 {
+			t.Error("a successful adoption needs no re-probe")
+		}
+	})
+
+	t.Run("different non-target value discards the binding", func(t *testing.T) {
+		h, pair, requeued := setup(t)
+		wrong := strings.Repeat("x", targetLength+20)
+
+		got := h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-1", wrong))
+		if got.Action != CaptureStale {
+			t.Fatalf("action = %s, want stale", got.Action)
+		}
+		if _, status := h.states.Lookup(pair.AuthIndex, pair.Model); status != states.StatusMissing {
+			t.Error("the stale binding should have been discarded")
+		}
+		if len(*requeued) != 1 || (*requeued)[0] != pair {
+			t.Errorf("requeued = %v, want the affected pair", *requeued)
+		}
+		if h.injector.stats.Snapshot().StaleDiscarded != 1 {
+			t.Error("the discard was not counted")
+		}
+	})
+
+	t.Run("non-target echo of what we sent is left alone", func(t *testing.T) {
+		// The upstream returning the same wrong-length token it was given is
+		// not evidence of drift, so it must not trigger a discard.
+		h := newHarness(t)
+		wrong := strings.Repeat("x", targetLength+20)
+		h.corr.Record("req-1", "gpt-5-codex", "auth-id-1", "codex-auth-1")
+		h.corr.MarkInjected("req-1", wrong)
+
+		var requeued int
+		h.collector.onStale = func(states.Pair) { requeued++ }
+
+		got := h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-1", wrong))
+		if got.Action != CaptureNonTarget {
+			t.Fatalf("action = %s, want non_target", got.Action)
+		}
+		if requeued != 0 {
+			t.Error("an unchanged value must not trigger a discard")
+		}
+	})
+
+	t.Run("non-target with nothing held is a plain miss", func(t *testing.T) {
+		h := newHarness(t)
+		h.corr.Record("req-1", "gpt-5-codex", "auth-id-1", "codex-auth-1")
+
+		var requeued int
+		h.collector.onStale = func(states.Pair) { requeued++ }
+
+		got := h.collector.Observe(ctx, headerInit("gpt-5-codex", "codex-auth-1", strings.Repeat("x", 10)))
+		if got.Action != CaptureNonTarget {
+			t.Fatalf("action = %s, want non_target", got.Action)
+		}
+		if requeued != 0 {
+			t.Error("there was nothing to discard, so nothing to requeue")
+		}
+	})
+}
