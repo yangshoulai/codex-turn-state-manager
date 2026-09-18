@@ -322,13 +322,17 @@ function enterPanel(inheritedKey) {
 }
 
 function showGate(message) {
-  $("gate").hidden = false;
-  $("panel").hidden = true;
-  $("session").hidden = true;
+  const gate = $("gate");
+  const panel = $("panel");
+  const session = $("session");
+  if (gate) gate.hidden = false;
+  if (panel) panel.hidden = true;
+  if (session) session.hidden = true;
   setConn("未连接", "pill-idle");
-  if (message) {
-    $("gate-error").textContent = message;
-    $("gate-error").hidden = false;
+  const error = $("gate-error");
+  if (error) {
+    error.textContent = message || "";
+    error.hidden = !message;
   }
 }
 
@@ -336,6 +340,13 @@ async function connectWith(key, inheritedKey) {
   managementKey = key;
   await loadAll();
   enterPanel(inheritedKey);
+}
+
+// describeError renders an exception usefully in a UI string.
+function describeError(err) {
+  if (!err) return "未知错误";
+  if (err.message) return err.message;
+  return String(err);
 }
 
 on("session-switch", "click", () => {
@@ -371,11 +382,13 @@ on("gate-form", "submit", async (event) => {
     try {
       await connectWith(inherited.key, inherited.key);
       return;
-    } catch {
-      // The inherited key was rejected, or the API is unreachable. Fall through
-      // to asking rather than leaving the operator with an error they cannot act on.
+    } catch (err) {
+      // Report *why*, not just that it failed. "Rejected key" and "the panel
+      // threw while rendering" look identical otherwise, and they need
+      // completely different responses.
+      console.error("[turn-state] using the inherited key failed:", err);
       managementKey = "";
-      showGate("沿用的管理面板会话已失效，请重新输入密钥。");
+      showGate("沿用管理面板会话失败：" + describeError(err) + "（可在此手动输入密钥）");
       return;
     }
   }
