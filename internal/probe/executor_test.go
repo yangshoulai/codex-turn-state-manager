@@ -180,6 +180,7 @@ type execHarness struct {
 	pool     *proxies.Pool
 	host     *hostapi.MockHost
 	history  *recordingHistory
+	models   *models.Registry
 	policy   ExecutorPolicy
 }
 
@@ -203,10 +204,11 @@ func newExecHarness(t *testing.T) *execHarness {
 			MaxProbeDuration:  5 * time.Second,
 		},
 	}
+	h.models = models.NewRegistry()
 	h.executor = NewExecutor(ExecutorConfig{
 		Host:    host,
 		Pool:    pool,
-		Models:  models.NewRegistry(),
+		Models:  h.models,
 		History: history,
 		Policy:  func() ExecutorPolicy { return h.policy },
 		// Plain HTTP so the node receives a normal proxied request rather than
@@ -304,17 +306,27 @@ func TestBuildProbeBody_MatchesDesignDoc(t *testing.T) {
 
 // TestExecutor_UsesModelReasoningFloor pins that the effort comes from the
 // capability table rather than a hardcoded value.
+//
+// Every model in the current manifest happens to accept "low", so asserting on
+// real slugs would prove nothing. The table is instead given a model whose floor
+// is deliberately different, which is the property that actually matters: an
+// operator-added model with a different floor must not be probed at the wrong
+// effort.
 func TestExecutor_UsesModelReasoningFloor(t *testing.T) {
 	h := newExecHarness(t)
 	fp := h.addProxy(t, "p1", respondWith(http.StatusOK, targetState(), ""))
+
+	h.models.Upsert(models.Capability{Model: "cheap-model", MinReasoning: models.EffortNone, Probeable: true})
+	h.models.Upsert(models.Capability{Model: "dear-model", MinReasoning: models.EffortHigh, Probeable: true})
 
 	cases := []struct {
 		model string
 		want  string
 	}{
-		{"gpt-5-codex", "low"},
-		{"gpt-5-nano", "none"},
-		{"gpt-5", "minimal"},
+		{"cheap-model", "none"},
+		{"dear-model", "high"},
+		// A model the table has never heard of still has to produce a valid probe.
+		{"gpt-5.6-luna", "low"},
 	}
 	for _, tc := range cases {
 		before := fp.count()

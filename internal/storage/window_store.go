@@ -135,6 +135,15 @@ func (s *AccountModelStore) UpsertAccountModel(ctx context.Context, c accounts.C
 	})
 }
 
+// DeleteAccountModel implements accounts.ConfigStore.
+func (s *AccountModelStore) DeleteAccountModel(ctx context.Context, authIndex, model string) error {
+	return s.db.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`DELETE FROM account_model_config WHERE auth_index = ? AND model = ?`, authIndex, model)
+		return err
+	})
+}
+
 var _ accounts.ConfigStore = (*AccountModelStore)(nil)
 
 // CursorStore persists the round-robin position per account so a CPA restart

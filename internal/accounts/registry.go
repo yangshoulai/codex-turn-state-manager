@@ -27,6 +27,7 @@ type Config struct {
 type ConfigStore interface {
 	ListAccountModels(ctx context.Context) ([]Config, error)
 	UpsertAccountModel(ctx context.Context, c Config) error
+	DeleteAccountModel(ctx context.Context, authIndex, model string) error
 }
 
 // Account is a tracked Codex account.
@@ -105,7 +106,6 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	known := r.knownModels()
 	now := time.Now()
 
 	next := make(map[string]Account, len(list))
@@ -125,7 +125,7 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 			Disabled:  a.Disabled,
 			SyncedAt:  now,
 		}
-		synced.Models = candidateModels(known)
+		synced.Models = r.configuredModels(a.AuthIndex)
 		next[a.AuthIndex] = synced
 		if a.AuthID != "" {
 			nextAuthID[a.AuthID] = a.AuthIndex
@@ -149,12 +149,34 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// candidateModels is the model set offered for each account.
+// configuredModels returns the models an operator has explicitly configured for
+// an account, including ones absent from the seed list.
 //
-// CPA's account record does not enumerate models, so the candidate set is the
-// plugin's capability table. Which of them actually work is discovered by
-// probing, not by asking CPA.
-func candidateModels(known []string) []string {
+// CPA's account record does not enumerate models and the host exposes no
+// callback for its model registry, so a custom model name only exists because
+// someone entered it. Those entries have to survive a restart, which is why
+// they are read back from the persisted per-pair configuration rather than
+// remembered in memory.
+func (r *Registry) configuredModels(authIndex string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.configuredModelsLocked(authIndex)
+}
+
+func (r *Registry) configuredModelsLocked(authIndex string) []string {
+	var out []string
+	for key := range r.configs {
+		if key.authIndex == authIndex {
+			out = append(out, key.model)
+		}
+	}
+	return out
+}
+
+// SuggestModels is the seed list offered as suggestions when adding a model.
+//
+// It is advice, not configuration: nothing is probed because it appears here.
+func SuggestModels(known []string) []string {
 	out := make([]string, 0, len(known))
 	for _, m := range known {
 		if m != "" {
@@ -213,6 +235,17 @@ func (r *Registry) ProbeEnabled(authIndex, model string) bool {
 	return r.configs[modelKey{authIndex, model}]
 }
 
+// ModelConfigured reports whether a model has an explicit configuration row for
+// this account, as opposed to merely appearing in the seed list. Removal needs
+// the distinction: dropping a seed entry has to be remembered, or the next sync
+// would offer it again.
+func (r *Registry) ModelConfigured(authIndex, model string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.configs[modelKey{authIndex, model}]
+	return ok
+}
+
 // SetProbeEnabled flips the probe toggle and persists it.
 func (r *Registry) SetProbeEnabled(ctx context.Context, authIndex, model string, enabled bool) error {
 	if err := r.store.UpsertAccountModel(ctx, Config{
@@ -224,6 +257,18 @@ func (r *Registry) SetProbeEnabled(ctx context.Context, authIndex, model string,
 	}
 	r.mu.Lock()
 	r.configs[modelKey{authIndex, model}] = enabled
+	r.mu.Unlock()
+	return nil
+}
+
+// ForgetModel removes an operator-added model from an account, along with its
+// probe toggle. Bindings for the pair are the caller's concern.
+func (r *Registry) ForgetModel(ctx context.Context, authIndex, model string) error {
+	if err := r.store.DeleteAccountModel(ctx, authIndex, model); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	delete(r.configs, modelKey{authIndex, model})
 	r.mu.Unlock()
 	return nil
 }
@@ -253,16 +298,25 @@ func (r *Registry) EnabledPairs() []Config {
 	return out
 }
 
-// Models returns the model list for an account together with its probe toggles.
+// Models returns the models configured for an account, with their probe toggles.
+//
+// Deliberately only what is configured, not a seed list unioned in.
+//
+// The plugin cannot read CPA's model registry, so it does not know which models
+// an account serves. Listing a guessed set as if it were fact is how a stale
+// hardcoded table ended up on screen claiming an account had gpt-5-codex. The
+// seed list survives as suggestions for the add control, where being out of
+// date costs nothing.
 func (r *Registry) Models(authIndex string) ([]ModelState, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	acc, ok := r.byIndex[authIndex]
-	if !ok {
+	if _, ok := r.byIndex[authIndex]; !ok {
 		return nil, false
 	}
-	out := make([]ModelState, 0, len(acc.Models))
-	for _, m := range acc.Models {
+	models := r.configuredModelsLocked(authIndex)
+	sort.Strings(models)
+	out := make([]ModelState, 0, len(models))
+	for _, m := range models {
 		out = append(out, ModelState{
 			Model:        m,
 			ProbeEnabled: r.configs[modelKey{authIndex, m}],

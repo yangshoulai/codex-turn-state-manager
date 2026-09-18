@@ -35,24 +35,35 @@ type Capability struct {
 	Probeable bool `json:"probeable"`
 }
 
-// fallback is used for models absent from the table. "low" is the most widely
-// accepted reasoning floor among Codex models, so an unknown model still
-// produces a valid probe request.
+// fallback is used for models absent from the table. "low" is the floor every
+// model in the current manifest accepts, so an operator-supplied model name
+// still produces a valid probe request rather than being rejected outright.
 var fallback = Capability{
 	MinReasoning:  EffortLow,
 	SupportsTools: false,
 	Probeable:     true,
 }
 
-// known is the built-in capability table. Operators can extend it at runtime
-// through Registry.Upsert; the table is deliberately not authoritative for
-// model existence -- the upstream response is.
+// known is the seed model list.
+//
+// It answers exactly one question: what reasoning level may a probe use, since
+// a probe must pick the cheapest level the model accepts. It is NOT a claim
+// about which models an account can serve -- the plugin cannot read CPA's model
+// registry (the host exposes no callback for it), so the per-account list is
+// configured by the operator and this list only seeds it.
+//
+// The slugs below were taken from the manifest CPA itself syncs,
+// https://github.com/router-for-me/models (codex_client_models.json). Every
+// entry there lists "low" as its lowest supported reasoning level, so the floor
+// is uniform for now. Refresh this list when that manifest changes; the
+// fallback below covers any model it has not heard of.
 var known = []Capability{
-	{Model: "gpt-5-codex", MinReasoning: EffortLow, SupportsTools: false, Probeable: true},
-	{Model: "gpt-5", MinReasoning: EffortMinimal, SupportsTools: false, Probeable: true},
-	{Model: "gpt-5-mini", MinReasoning: EffortMinimal, SupportsTools: false, Probeable: true},
-	{Model: "gpt-5-nano", MinReasoning: EffortNone, SupportsTools: false, Probeable: true},
-	{Model: "codex-mini-latest", MinReasoning: EffortLow, SupportsTools: false, Probeable: true},
+	{Model: "gpt-6-astra", MinReasoning: EffortLow, Probeable: true},
+	{Model: "gpt-5.6-sol", MinReasoning: EffortLow, Probeable: true},
+	{Model: "gpt-5.6-terra", MinReasoning: EffortLow, Probeable: true},
+	{Model: "gpt-5.6-luna", MinReasoning: EffortLow, Probeable: true},
+	{Model: "gpt-5.5", MinReasoning: EffortLow, Probeable: true},
+	{Model: "gpt-5.3-codex-spark", MinReasoning: EffortLow, Probeable: true},
 }
 
 // Registry is a concurrency-safe capability table.

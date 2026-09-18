@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
@@ -692,7 +693,12 @@ func TestApp_AccountModelsEndpoint(t *testing.T) {
 		t.Fatalf("SyncAccounts: %v", err)
 	}
 
-	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5.6-luna"}
+	// The plugin cannot read an account's model list from CPA, so a model exists
+	// only once it is configured.
+	if err := a.Accounts().SetProbeEnabled(ctx, pair.AuthIndex, pair.Model, true); err != nil {
+		t.Fatalf("SetProbeEnabled: %v", err)
+	}
 	if _, err := a.States().Bind(ctx, states.Binding{
 		Pair: pair, StateValue: stateOf(targetLength), Source: states.SourceProbe,
 	}); err != nil {
@@ -725,7 +731,7 @@ func TestApp_AccountModelsEndpoint(t *testing.T) {
 
 	var found bool
 	for _, m := range payload.Models {
-		if m.Model != "gpt-5-codex" {
+		if m.Model != "gpt-5.6-luna" {
 			continue
 		}
 		found = true
@@ -980,5 +986,147 @@ func TestApp_ManagementRoutesCarryNoPathParameters(t *testing.T) {
 	}
 	if code, _ := api.do(http.MethodDelete, "/bindings?authIndex=only", ""); code != http.StatusBadRequest {
 		t.Errorf("DELETE /bindings with a partial pair = %d, want 400", code)
+	}
+}
+
+// TestApp_ModelListIsConfiguredOnly covers what the panel shows per account.
+//
+// The plugin cannot read CPA's model registry, so it must not present a guess
+// as fact. An earlier version unioned a hardcoded seed list into every account
+// and duly claimed the account served gpt-5-codex, which no current model is
+// called. The list is now exactly what an operator configured; the seed list
+// survives only as suggestions on the add control.
+func TestApp_ModelListIsConfiguredOnly(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	modelsFor := func() map[string]bool {
+		t.Helper()
+		list, ok := a.Accounts().Models("codex-auth-1")
+		if !ok {
+			t.Fatal("account missing")
+		}
+		out := map[string]bool{}
+		for _, m := range list {
+			out[m.Model] = true
+		}
+		return out
+	}
+
+	if got := len(modelsFor()); got != 0 {
+		t.Errorf("a fresh account lists %d models, want 0 until configured", got)
+	}
+
+	const custom = "gpt-5.6-luna"
+	if err := a.Accounts().SetProbeEnabled(ctx, "codex-auth-1", custom, true); err != nil {
+		t.Fatalf("SetProbeEnabled: %v", err)
+	}
+	if got := modelsFor(); !got[custom] || len(got) != 1 {
+		t.Errorf("models = %v, want exactly the configured one", got)
+	}
+
+	// And it survives a restart, because it is read back from the store.
+	dir := a.cfg.DataDir
+	a.Stop()
+	restarted, err := New(ctx, Config{DataDir: dir, Host: mockHost(1)})
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	defer restarted.Stop()
+	if _, err := restarted.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts after restart: %v", err)
+	}
+	list, _ := restarted.Accounts().Models("codex-auth-1")
+	if len(list) != 1 || list[0].Model != custom {
+		t.Errorf("after restart models = %v, want [%s]", list, custom)
+	}
+	if !list[0].ProbeEnabled {
+		t.Error("the probe toggle did not survive the restart")
+	}
+}
+
+// TestModelSuggestionsAreCurrent guards the seed list against going stale the
+// way the old hardcoded table did. It is checked against the manifest CPA
+// itself syncs, so the two cannot drift apart silently.
+func TestModelSuggestionsAreCurrent(t *testing.T) {
+	want := []string{
+		"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra",
+		"gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex-spark",
+	}
+	registry := models.NewRegistry()
+	have := map[string]bool{}
+	for _, e := range registry.All() {
+		have[e.Model] = true
+	}
+	for _, slug := range want {
+		if !have[slug] {
+			t.Errorf("seed list is missing %s", slug)
+		}
+	}
+	// The retired slugs must not come back.
+	for _, retired := range []string{"gpt-5-codex", "gpt-5-mini", "gpt-5-nano", "codex-mini-latest"} {
+		if have[retired] {
+			t.Errorf("seed list still carries the retired slug %s", retired)
+		}
+	}
+
+	// An unknown model must still get a usable reasoning floor, or an
+	// operator-supplied name would produce an invalid probe.
+	if got := registry.MinReasoning("some-future-model"); got == "" {
+		t.Error("an unknown model has no reasoning floor")
+	}
+}
+
+func TestApp_ForgetModelRemovesBindingAndConfig(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	const model = "gpt-5.6-luna"
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: model}
+	if err := a.Accounts().SetProbeEnabled(ctx, pair.AuthIndex, model, true); err != nil {
+		t.Fatalf("SetProbeEnabled: %v", err)
+	}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: pair, StateValue: stateOf(targetLength), Source: states.SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	code, body := api.do(http.MethodDelete,
+		"/accounts/models?authIndex=codex-auth-1&model="+model, "")
+	if code != http.StatusOK {
+		t.Fatalf("DELETE /accounts/models = %d (%s)", code, body)
+	}
+
+	// The binding must go too: a state value attached to a pair that no longer
+	// appears in the panel would be invisible and unremovable.
+	if _, status := a.States().Lookup(pair.AuthIndex, pair.Model); status != states.StatusMissing {
+		t.Errorf("binding survived removal (status %s)", status)
+	}
+	if a.Accounts().ProbeEnabled(pair.AuthIndex, model) {
+		t.Error("probe toggle survived removal")
+	}
+	if a.Accounts().ModelConfigured(pair.AuthIndex, model) {
+		t.Error("configured model survived removal")
+	}
+
+	// Removal is permanent: the model does not reappear from a seed list.
+	if list, _ := a.Accounts().Models("codex-auth-1"); len(list) != 0 {
+		t.Errorf("models after removal = %v, want none", list)
+	}
+
+	// Missing parameters are a 400, not a silent no-op.
+	if code, _ := api.do(http.MethodDelete, "/accounts/models?authIndex=only", ""); code != http.StatusBadRequest {
+		t.Errorf("DELETE without a model = %d, want 400", code)
 	}
 }

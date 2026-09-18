@@ -129,6 +129,10 @@ let windowsState = [];
 let accountsState = [];
 let expanded = new Set();
 const modelCache = new Map();
+// Seed model names for the add control. Suggestions only: the plugin cannot
+// read an account's real model list from CPA, so nothing here is probed until
+// an operator adds it.
+let modelSuggestions = [];
 
 /* ------------------------------------------------------------------ utils */
 
@@ -673,7 +677,7 @@ function renderAccounts() {
     const statusClass = account.status === "available" ? "pill-ok"
       : account.disabled ? "pill-idle" : "pill-warn";
 
-    const body = el("div", { class: "account-body" });
+    const body = el("div", { class: "account-body", dataset: { accountBody: account.authIndex } });
     body.hidden = !open;
 
     const head = el("div", {
@@ -703,6 +707,28 @@ function toggleAccount(authIndex) {
   renderAccounts();
 }
 
+async function loadModelSuggestions() {
+  try {
+    const payload = await api("GET", "/models");
+    modelSuggestions = (payload.models || []).map((m) => m.model);
+  } catch {
+    modelSuggestions = [];
+  }
+}
+
+async function addModel(authIndex, container, model) {
+  const name = (model || "").trim();
+  if (!name) return;
+  try {
+    await api("PUT", `/accounts/models/probe?${qs({ authIndex, model: name })}`, { enabled: true });
+    toast(`已添加 ${name} 并开启探测`);
+    await loadModels(authIndex, container);
+    await loadAccounts();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 async function loadModels(authIndex, container) {
   clear(container);
   container.append(el("div", { class: "empty", text: "加载中…" }));
@@ -718,6 +744,7 @@ async function loadModels(authIndex, container) {
   if (!expanded.has(authIndex)) return; // collapsed while loading
 
   clear(container);
+  const configured = new Set((payload.models || []).map((m) => m.model));
   const rows = (payload.models || []).map((m) => {
     const probeToggle = el("input", { type: "checkbox", checked: m.probeEnabled });
     probeToggle.addEventListener("change", async () => {
@@ -733,8 +760,8 @@ async function loadModels(authIndex, container) {
     });
 
     const actions = el("div", { class: "row-actions" }, [
-      el("button", { class: "btn btn-sm", type: "button", text: "删除",
-        onclick: () => deleteBinding(authIndex, m.model) }),
+      el("button", { class: "btn btn-sm btn-danger", type: "button", text: "移除",
+        onclick: () => removeModel(authIndex, m.model) }),
       el("button", { class: "btn btn-sm", type: "button", text: "历史",
         onclick: () => showHistory(authIndex, m.model) }),
     ]);
@@ -760,7 +787,71 @@ async function loadModels(authIndex, container) {
   container.append(table(
     [{ label: "模型" }, { label: "探测" }, { label: "State" }, { label: "剩余" },
      { label: "长度" }, { label: "下次探测" }, { label: "" }],
-    rows, "该账号没有可用模型"));
+    rows, "该账号没有配置任何模型"));
+
+  // The list is seeded from the plugin and extended by hand: the plugin cannot
+  // read CPA's model registry, so an account's real model set only exists
+  // because an operator typed it.
+  const listId = `model-suggestions-${authIndex}`;
+  const input = el("input", {
+    type: "text", placeholder: "例如 gpt-5.6-luna", spellcheck: "false",
+    "aria-label": "添加模型", list: listId, autocomplete: "off",
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addModel(authIndex, container, input.value);
+    }
+  });
+
+  const actions = [
+    input,
+    el("datalist", { id: listId }, modelSuggestions.map((m) => el("option", { value: m }))),
+    el("button", {
+      class: "btn", type: "button", text: "添加",
+      onclick: () => addModel(authIndex, container, input.value),
+    }),
+  ];
+
+  // One click to reach a usable starting point, since the plugin cannot fill
+  // the list in itself and an empty list probes nothing.
+  const missing = modelSuggestions.filter((m) => !configured.has(m));
+  if (missing.length) {
+    actions.push(el("button", {
+      class: "btn", type: "button", text: "添加常用模型",
+      title: missing.join("、"),
+      onclick: async () => {
+        for (const name of missing) {
+          await api("PUT", `/accounts/models/probe?${qs({ authIndex, model: name })}`, { enabled: true })
+            .catch(() => {});
+        }
+        await loadModels(authIndex, container);
+        await loadAccounts();
+        toast(`已添加 ${missing.length} 个常用模型`);
+      },
+    }));
+  }
+
+  container.append(el("div", { class: "add-model" }, actions));
+  container.append(el("p", { class: "muted small",
+    text: "插件读不到 CPA 的模型清单，这里只列出你已配置的模型。" }));
+}
+
+// removeModel drops a model from the account and with it any binding, which is
+// what "this account does not serve this model" means in practice.
+async function removeModel(authIndex, model) {
+  if (!confirm(`从 ${authIndex} 移除模型 ${model}？\n\n同时会删除它的绑定 State。`)) return;
+  try {
+    await api("DELETE", `/accounts/models?${qs({ authIndex, model })}`);
+    toast(`已移除 ${model}`);
+    await refresh();
+    if (expanded.has(authIndex)) {
+      const body = document.querySelector(`[data-account-body="${CSS.escape(authIndex)}"]`);
+      if (body) await loadModels(authIndex, body);
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
 }
 
 async function deleteBinding(authIndex, model) {
@@ -980,6 +1071,7 @@ async function loadStatus() {
 
 async function loadAll() {
   await loadStatus();
+  await loadModelSuggestions();
   await loadSettings();
   // A failing subsystem must not block the panel; each section reports its own
   // error so the operator can still reach the settings that would fix it.

@@ -88,10 +88,12 @@ func Routes() []Route {
 		{http.MethodPut, "/time-windows", func(a *API) http.HandlerFunc { return a.updateWindow }},
 		{http.MethodDelete, "/time-windows", func(a *API) http.HandlerFunc { return a.deleteWindow }},
 
+		{http.MethodGet, "/models", func(a *API) http.HandlerFunc { return a.listModelSuggestions }},
 		{http.MethodGet, "/accounts", func(a *API) http.HandlerFunc { return a.listAccounts }},
 		{http.MethodPost, "/accounts/sync", func(a *API) http.HandlerFunc { return a.syncAccounts }},
 		{http.MethodGet, "/accounts/models", func(a *API) http.HandlerFunc { return a.listAccountModels }},
 		{http.MethodPut, "/accounts/models/probe", func(a *API) http.HandlerFunc { return a.setProbeEnabled }},
+		{http.MethodDelete, "/accounts/models", func(a *API) http.HandlerFunc { return a.forgetModel }},
 
 		{http.MethodGet, "/bindings", func(a *API) http.HandlerFunc { return a.listBindings }},
 		{http.MethodDelete, "/bindings", func(a *API) http.HandlerFunc { return a.deleteBinding }},
@@ -312,6 +314,26 @@ func (a *API) deleteWindow(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // accounts
 
+// listModelSuggestions returns the plugin's seed model list.
+//
+// These are names the add control can offer, not models the plugin claims any
+// account serves: the host exposes no callback for its model registry, so the
+// per-account list is whatever the operator configured.
+func (a *API) listModelSuggestions(w http.ResponseWriter, r *http.Request) {
+	entries := a.svc.Models().All()
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		if !e.Probeable {
+			continue
+		}
+		out = append(out, map[string]any{
+			"model":        e.Model,
+			"minReasoning": string(e.MinReasoning),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": out})
+}
+
 func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	list := a.svc.Accounts().All()
 	if list == nil {
@@ -412,6 +434,34 @@ func (a *API) setProbeEnabled(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authIndex": authIndex, "model": model, "probeEnabled": body.Enabled,
 	})
+}
+
+// forgetModel drops an operator-added model from an account.
+//
+// The seed model list is only a starting point and the plugin cannot read
+// CPA's model registry, so an operator has to be able to remove entries that
+// this account does not serve.
+func (a *API) forgetModel(w http.ResponseWriter, r *http.Request) {
+	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if authIndex == "" || model == "" {
+		writeError(w, http.StatusBadRequest,
+			errors.New("authIndex and model query parameters are required"))
+		return
+	}
+
+	// Drop the binding first: leaving a state value attached to a pair that no
+	// longer appears anywhere would be invisible and unremovable from the panel.
+	pair := states.Pair{AuthIndex: authIndex, Model: model}
+	if err := a.svc.States().Delete(r.Context(), pair, states.SourceManual); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.svc.Accounts().ForgetModel(r.Context(), authIndex, model); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"authIndex": authIndex, "model": model, "removed": true})
 }
 
 // ---------------------------------------------------------------------------

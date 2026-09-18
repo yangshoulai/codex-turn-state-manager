@@ -123,7 +123,7 @@ main {
 .card > .card-head,
 .card > .as-button { padding: 14px 18px; }
 .card > #accounts,
-.card > #probes { padding: 0 18px 16px; }
+.card > #probes { padding: 16px 18px; }
 
 /* The account matrix is the reason this page exists; give it more presence
    than the surrounding cards without resorting to a heavier border. */
@@ -335,6 +335,18 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 #probes .table td { padding: 6px 8px; }
 
 /* ---------- accounts ---------- */
+
+.add-model {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+.add-model input { max-width: 260px; font-family: var(--mono); }
+.add-model .btn { flex: none; white-space: nowrap; }
+.add-model .muted { font-size: 12px; }
 
 .account { border: 1px solid var(--line); border-radius: var(--radius-sm); margin-bottom: 10px; overflow: hidden; }
 .account-head {
