@@ -163,6 +163,10 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		Source: a,
 		Log:    logf,
 	})
+	// The upstream reports plan and rate-limit state on the same response the
+	// probe reads for the state token, so the account view refreshes itself
+	// without anyone asking CPA for data it does not expose.
+	a.scheduler.SetSignalFunc(a.accounts.RecordSignals)
 
 	a.corr = intercept.NewCorrelationManager(intercept.DefaultCorrelationTTL)
 	a.stats = &intercept.Stats{}
@@ -171,6 +175,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	})
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
 		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
+		Signals: a.accounts.RecordSignals,
 	})
 	a.router = routing.NewScheduler(routing.SchedulerConfig{
 		Settings: a.settings, States: a.states, Cursors: db.Cursors(),

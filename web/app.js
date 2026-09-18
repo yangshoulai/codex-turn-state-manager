@@ -293,10 +293,10 @@ function fmtAgo(value) {
   return `${Math.floor(secs / 86400)}d 前`;
 }
 
-// planBadge renders the subscription tier, or nothing when the credential does
-// not carry the claim. An absent plan is left blank rather than shown as
-// "unknown": the panel would otherwise fill with noise for accounts whose tokens
-// simply do not include it.
+// planBadge renders the subscription tier. It comes from the upstream's own
+// response headers when traffic has been seen, and falls back to the
+// credential's id_token claim -- which is frequently absent, and was the only
+// source before.
 function planBadge(plan) {
   if (!plan || !plan.type) return null;
   const label = plan.label || plan.type;
@@ -304,6 +304,28 @@ function planBadge(plan) {
     ? `套餐 ${label}，有效期至 ${fmtTime(plan.activeUntil)}`
     : `套餐 ${label}`;
   return el("span", { class: "pill pill-plan", text: label, title });
+}
+
+// quotaBadge renders the rate-limit windows the upstream reported, which is the
+// account state CPA does not expose to plugins.
+function quotaBadge(quota) {
+  if (!quota) return null;
+  const parts = [];
+  if (quota.primaryUsedPercent != null) {
+    const window = quota.primaryWindowMinutes ? `/${quota.primaryWindowMinutes}m` : "";
+    parts.push(`5h ${quota.primaryUsedPercent}%${window}`);
+  }
+  if (quota.secondaryUsedPercent != null) {
+    const window = quota.secondaryWindowMinutes ? `/${quota.secondaryWindowMinutes}m` : "";
+    parts.push(`周 ${quota.secondaryUsedPercent}%${window}`);
+  }
+  if (!parts.length) return null;
+
+  const worst = Math.max(quota.primaryUsedPercent ?? 0, quota.secondaryUsedPercent ?? 0);
+  const cls = worst >= 100 ? "pill-bad" : worst >= 80 ? "pill-warn" : "pill-idle";
+  const resets = [quota.primaryResetAt, quota.secondaryResetAt].filter(Boolean);
+  const title = resets.length ? `上游报告的额度使用率；最近重置 ${fmtTime(resets[0])}` : "上游报告的额度使用率";
+  return el("span", { class: "pill " + cls, text: parts.join(" · "), title });
 }
 
 const STATUS_PILL = {
@@ -721,6 +743,7 @@ function renderAccounts() {
       el("div", { class: "who" }, [
         el("strong", { text: account.label || account.authIndex }),
         planBadge(account.plan),
+        quotaBadge(account.quota),
         el("span", { class: "pill " + statusClass, text: account.status || "unknown" }),
         account.blockedReason
           ? el("span", { class: "pill pill-warn", title: account.blockedReason, text: "已暂停探测" })

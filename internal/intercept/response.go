@@ -27,7 +27,8 @@ type Collector struct {
 	// serverErrors counts consecutive 5xx per pair. The threshold is a per-pair
 	// run, not a per-request one, because a retry arrives with a fresh request
 	// id.
-	stats *Stats
+	stats   *Stats
+	signals func(authIndex string, signals headers.Signals)
 
 	failMu       sync.Mutex
 	serverErrors map[states.Pair]int
@@ -40,6 +41,10 @@ type CollectorConfig struct {
 	Corr     *CorrelationManager
 	Log      func(hostapi.LogLevel, string, map[string]any)
 	Stats    *Stats
+	// Signals receives the account state the upstream reports. The probe path
+	// reads the same headers, but its minimal request does not elicit them --
+	// only real turns do, which is where this runs.
+	Signals func(authIndex string, signals headers.Signals)
 }
 
 // NewCollector builds a collector.
@@ -53,6 +58,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		corr:         cfg.Corr,
 		logf:         cfg.Log,
 		stats:        cfg.Stats,
+		signals:      cfg.Signals,
 		serverErrors: map[states.Pair]int{},
 	}
 }
@@ -89,6 +95,15 @@ func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) Capt
 		return CaptureResult{Action: CaptureNotHeaderInit}
 	}
 	c.stats.streamHeaders.Add(1)
+	// The plan and rate-limit windows ride along on every real response. CPA
+	// exposes neither to plugins, so this is the only place the plugin can
+	// learn them, and it is free.
+	if c.signals != nil && chunk.AuthIndex != "" {
+		if parsed := headers.ParseSignals(chunk.ResponseHeaders); !parsed.Empty() {
+			c.signals(chunk.AuthIndex, parsed)
+		}
+	}
+
 	// Snapshot before capture, so the record reflects what arrived rather than
 	// what happened to it.
 	c.stats.recordHeaderInit(HeaderInitSnapshot{

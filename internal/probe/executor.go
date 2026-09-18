@@ -48,6 +48,11 @@ type Result struct {
 	ProxiesTried int
 	Latency      time.Duration
 	Err          error
+	// Signals carries what the upstream said about the account -- plan and
+	// rate-limit windows -- which arrives on the same response as the state
+	// token. Reading it here is free; the panel would otherwise have no source
+	// for the plan at all, since the credential's own claim is often absent.
+	Signals headers.Signals
 }
 
 // Succeeded reports whether a target-length state was harvested.
@@ -265,7 +270,12 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 	switch resp.StatusCode {
 	case http.StatusOK:
 		value := headers.Get(resp.Header, headers.TurnState)
-		out := Result{StateValue: value, StateLength: len(value), Latency: latency}
+		out := Result{
+			StateValue:  value,
+			StateLength: len(value),
+			Latency:     latency,
+			Signals:     headers.ParseSignals(resp.Header),
+		}
 		if value != "" && len(value) == policy.TargetStateLength {
 			out.Outcome = OutcomeSuccessTarget
 		} else {

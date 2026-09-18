@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/headers"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
@@ -79,6 +80,9 @@ type Scheduler struct {
 	probeFn func(ctx context.Context, authIndex, model string) Result
 	// bindFn is injectable for the same reason.
 	bindFn func(ctx context.Context, authIndex, model, value string, proxyID string) error
+	// signalFn receives the account state the upstream reported, when it
+	// reported any. Optional.
+	signalFn func(authIndex string, signals headers.Signals)
 }
 
 // SchedulerConfig configures a new Scheduler.
@@ -112,6 +116,11 @@ func (s *Scheduler) SetProbeFunc(f func(ctx context.Context, authIndex, model st
 // SetBindFunc overrides the binding write. Tests only.
 func (s *Scheduler) SetBindFunc(f func(ctx context.Context, authIndex, model, value, proxyID string) error) {
 	s.bindFn = f
+}
+
+// SetSignalFunc receives the account state reported by the upstream.
+func (s *Scheduler) SetSignalFunc(f func(authIndex string, signals headers.Signals)) {
+	s.signalFn = f
 }
 
 // Start launches the scan loop. It returns immediately.
@@ -277,6 +286,12 @@ func (s *Scheduler) runProbe(ctx context.Context, p states.Pair) {
 	now := s.now()
 	values := s.src.SettingsManager().Current()
 	s.recordStreak(p, result.Outcome)
+
+	// Report the account state before anything else: it is free, it arrives on
+	// every response, and it is the only source for the plan.
+	if s.signalFn != nil && !result.Signals.Empty() {
+		s.signalFn(p.AuthIndex, result.Signals)
+	}
 
 	if result.Succeeded() {
 		policy := values.Capabilities()

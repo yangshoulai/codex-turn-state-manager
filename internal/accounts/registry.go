@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/headers"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 )
 
@@ -46,10 +47,13 @@ type Account struct {
 	// NextRetryAfter is when CPA considers another attempt worthwhile.
 	NextRetryAfter *time.Time `json:"nextRetryAfter,omitempty"`
 
-	// Plan is the subscription tier, read from the credential's id_token.
-	// Empty when the credential does not carry the claim -- shown as unknown
-	// rather than assumed.
+	// Plan is the subscription tier. It comes from the upstream's response
+	// headers when traffic has been seen, falling back to the credential's
+	// id_token claim, which is frequently absent.
 	Plan Plan `json:"plan"`
+
+	// Quota is the rate-limit state the upstream last reported.
+	Quota *headers.Signals `json:"quota,omitempty"`
 
 	SyncedAt time.Time `json:"syncedAt"`
 }
@@ -282,6 +286,28 @@ func (r *Registry) CatalogHas(model string) bool {
 		}
 	}
 	return false
+}
+
+// RecordSignals stores the account state the upstream reported.
+//
+// Called from the probe path, so it runs on whatever goroutine finished a
+// probe; the write is guarded like every other registry mutation.
+func (r *Registry) RecordSignals(authIndex string, signals headers.Signals) {
+	if signals.Empty() {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	acc, ok := r.byIndex[authIndex]
+	if !ok {
+		return
+	}
+	stored := signals
+	acc.Quota = &stored
+	if signals.PlanType != "" {
+		acc.Plan = Plan{Type: signals.PlanType, ActiveUntil: acc.Plan.ActiveUntil}
+	}
+	r.byIndex[authIndex] = acc
 }
 
 // ModelConfigured reports whether a model has an explicit configuration row for
