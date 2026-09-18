@@ -795,6 +795,17 @@ async function loadModels(authIndex, container) {
       ? "—"
       : fmtDuration(Math.floor((new Date(m.expiresAt) - Date.now()) / 1000));
 
+    // A model that keeps answering with the wrong state length never becomes
+    // usable, but is retried every few minutes by design. Say so rather than
+    // letting the operator wonder why nothing ever binds.
+    const futile = m.nonTargetStreak >= 3
+      ? el("span", {
+          class: "pill pill-warn",
+          title: `连续 ${m.nonTargetStreak} 次返回非目标长度，该模型可能永远不会产出可用的 State`,
+          text: `连续 ${m.nonTargetStreak} 次非目标长度`,
+        })
+      : null;
+
     return el("tr", null, [
       el("td", { class: "mono", text: m.model }),
       el("td", null, probeToggle),
@@ -805,13 +816,14 @@ async function loadModels(authIndex, container) {
       el("td", { class: "num", text: ttl }),
       el("td", { class: "num mono", text: m.stateLength || "—" }),
       el("td", { class: "muted small", text: m.nextProbeAt ? fmtTime(m.nextProbeAt) : "—" }),
+      el("td", null, futile),
       el("td", null, actions),
     ]);
   });
 
   container.append(table(
     [{ label: "模型" }, { label: "探测" }, { label: "State" }, { label: "剩余" },
-     { label: "长度" }, { label: "下次探测" }, { label: "" }],
+     { label: "长度" }, { label: "下次探测" }, { label: "提示" }, { label: "" }],
     rows, "该账号的模型清单为空"));
 
   // The list is maintained by the plugin from the same manifest CPA syncs, so

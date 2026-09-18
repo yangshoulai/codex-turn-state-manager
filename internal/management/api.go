@@ -399,6 +399,11 @@ func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
 		NextProbeAt  *time.Time `json:"nextProbeAt,omitempty"`
 		InFlight     bool       `json:"inFlight"`
 		MinReasoning string     `json:"minReasoning"`
+		// NonTargetStreak counts consecutive probes that returned a state of the
+		// wrong length. Such a pair is re-probed every few minutes by design, so
+		// a long run is the only signal that a model will never yield a usable
+		// token -- visible here rather than polled at quota forever.
+		NonTargetStreak int `json:"nonTargetStreak,omitempty"`
 	}
 	out := make([]modelView, 0, len(modelStates))
 	for _, ms := range modelStates {
@@ -419,6 +424,7 @@ func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
 			view.NextProbeAt = &at
 		}
 		view.InFlight = a.svc.ProbeScheduler().InFlight(pair)
+		view.NonTargetStreak = a.svc.ProbeScheduler().NonTargetStreak(pair)
 		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": out})

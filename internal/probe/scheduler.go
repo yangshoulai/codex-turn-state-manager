@@ -39,6 +39,14 @@ type EnabledPairSource interface {
 type pairState struct {
 	nextProbeAt time.Time
 	inFlight    bool
+
+	// nonTargetStreak counts consecutive probes that returned a state of the
+	// wrong length. Such a pair is re-probed every few minutes by design, but a
+	// long streak means the model simply does not yield a usable token, and
+	// polling it forever spends quota to learn nothing. Surfaced so an operator
+	// can turn it off; never acted on automatically, because the design
+	// document only permits auto-disabling on MODEL_UNSUPPORTED.
+	nonTargetStreak int
 }
 
 // Scheduler runs the periodic scan and owns the probe concurrency limit.
@@ -268,6 +276,7 @@ func (s *Scheduler) runProbe(ctx context.Context, p states.Pair) {
 
 	now := s.now()
 	values := s.src.SettingsManager().Current()
+	s.recordStreak(p, result.Outcome)
 
 	if result.Succeeded() {
 		policy := values.Capabilities()
@@ -398,6 +407,35 @@ func (s *Scheduler) release() {
 	case <-sem:
 	default:
 	}
+}
+
+// recordStreak updates the consecutive non-target run for a pair.
+func (s *Scheduler) recordStreak(p states.Pair, outcome Outcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.pairs[p]
+	if !ok {
+		st = &pairState{}
+		s.pairs[p] = st
+	}
+	if outcome == OutcomeSuccessNonTarget {
+		st.nonTargetStreak++
+		return
+	}
+	// Anything else -- a hit, a model that cannot serve the request, a network
+	// fault -- breaks the run; only an unbroken stretch is evidence.
+	st.nonTargetStreak = 0
+}
+
+// NonTargetStreak reports how many consecutive probes returned a non-target
+// length for a pair.
+func (s *Scheduler) NonTargetStreak(p states.Pair) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.pairs[p]; ok {
+		return st.nonTargetStreak
+	}
+	return 0
 }
 
 // NextProbeAt reports the scheduled time for a pair, for the panel.
