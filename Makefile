@@ -37,7 +37,9 @@ build-dev: ## Build the standalone development harness
 build: build-dev build-shared ## Build both the harness and the shared library
 
 run: ## Run the development harness (mock host + local management API/UI)
-	go run ./cmd/plugin -data-dir ./.local -listen 127.0.0.1:8787 -management-key devkey
+	@# $(ARGS) goes last so it can override the defaults above; Go's flag
+	@# package lets the later occurrence win.
+	go run ./cmd/plugin -data-dir ./.local -listen 127.0.0.1:8787 -management-key devkey $(ARGS)
 
 # --- Real-CPA test loop -----------------------------------------------------
 #

@@ -32,7 +32,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | # | 阶段 | 内容 | 产出（验收标准） | 状态 |
 |:--:|---|---|---|:--:|
 | 0 | **P0 — CPA ABI 适配层** | `internal/pluginabi`：把 CPA 宿主 ABI 适配到 `hostapi.Host`，导出注册入口，打通 Scheduler → AfterAuth → 响应头 → request.complete 的回调链路 | 插件可被真实 CPA 实例加载，端到端闭环跑通 | 🔄 |
-| 1 | **P0 — 基础框架** | 插件项目骨架、CGO 构建、SQLite 初始化、PersistenceManager + Schema 迁移框架、Management API 基础路由 | 可编译加载的插件，启动后可恢复配置 | 🔄 |
+| 1 | **P0 — 基础框架** | 插件项目骨架、CGO 构建、SQLite 初始化、PersistenceManager + Schema 迁移框架、Management API 基础路由 | 可编译加载的插件，启动后可恢复配置 | ✅ |
 | 1b | **P0 — 与 CPA v7.3.7 对齐** | 读 CPA 源码核对接口，修正 correlation、候选身份、优先级分档、路由注册、资源路由等设计偏差 | 设计文档与真实 ABI 一致 | ✅ |
 | 2 | **P0 — 账号同步** | AccountRegistry：定时同步 CPA Codex 账号 | 面板可展示账号列表 | ✅ |
 | 3 | **P0 — 代理池** | ProxyPool：节点增删改、健康状态、冷却排序、`last_used_at` 持久化 | 代理池可管理，选择顺序按冷却时间 | ✅ |
@@ -41,7 +41,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 6 | **P0 — 全局开关** | 定时探测开关 + 反向绑定开关，独立控制，状态持久化 | 两个开关可独立启停 | ✅ |
 | 7 | **P0 — 绑定管理** | 绑定删除 + 历史记录 + Management API | 面板可删除绑定并查看历史 | ✅ |
 | 8 | **P1 — 调度干预** | CredentialScheduler + `state_priority_enabled` 开关 + `SchedulerAcrossPriorities` | CPA 调度结果可被插件干预 | 🔄 |
-| 9 | **P1 — 管理面板** | ResourceUI：简洁前端 + 时间窗口配置 + 历史弹窗 + 代理池展示 + 探测并发配置 | 可视化操作全部功能 | 🔄 |
+| 9 | **P1 — 管理面板** | ResourceUI：前端面板覆盖全部运行时行为——开关与参数、时间窗口、代理池、账号与模型（含套餐/额度徽章与探测开关）、绑定删除与历史弹窗、探测记录（账号过滤 + 分页） | 可视化操作全部功能 | 🔄 |
 | 10 | **P1 — 自愈与退避** | State 失败自动失效、探测退避策略、被动续期 | 系统具备自愈能力 | ✅ |
 | 11 | **P2 — 可观测性** | 探测历史查询、代理健康统计、State 状态可视化 | 运维面板完善 | 🔄 |
 
@@ -53,33 +53,49 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 2. **承载该产出验收标准的关键函数有单元测试，覆盖率不为 0**（`go test -coverpkg=./...` 实测，不看感觉）；
 3. 在开发 harness 中实跑验证过。
 
-另外：依赖 CPA 真实回调行为（#5、#8）或依赖浏览器渲染（#9、#11）的部分，不计入 ✅。
+另外：依赖 CPA 真实回调行为（#5、#8）或依赖浏览器渲染（#9、#11）的部分，在**真的被触发过之前**不计入 ✅。这条针对的是「只能靠真实环境才能证伪」这件事，不是永久豁免——一旦该行为已经被实测过（例如注入已在真实流量上跑通、面板交互已在浏览器中点过），就按上面三条正常判定。
 
 ### 各 ✅ 项的证据
 
+覆盖率口径：`go test -coverpkg=./... -coverprofile=...`（全仓 76.5%）。数字随代码变化，改完请重测，不要沿用旧值。
+
 | # | 证据 |
 |:--:|---|
-| 2 | `accounts.Sync` 81.5%、`Load` 88.9%、`ResolveAuthID` 100%、`ProbeEnabled` 100%、`SetProbeEnabled` 83.3%；`POST /accounts/sync`、`GET /accounts/{authIndex}/models`、`PUT /accounts/{authIndex}/models/{model}/probe` 三个端点均有测试；harness 实跑同步出 3 个账号。 |
-| 3 | `proxies` 包 86.5%；LRU 排序、冷却排除、同时间按 id 稳定排序、`ReplaceAll`、`Load` 恢复均有测试；`PUT /proxy-nodes` 端点有测试（含删除缺失节点与拒绝空 URL）；harness 中实测节点失败后进入 cooldown 且 `lastUsedAt` 持久化。 |
-| 4 | `probe` 包 77.9%。`buildProbeBody` 100%、`newProxyClient` 100%、`attempt` 90.6%、`isModelUnsupported` 90.0%、`Probe` 88.4%、`newProbeHTTPRequest` 81.8%。测试用一个 `httptest` 假上游当作代理节点，因此**探测请求体形状（§3.6）、认证头、遍历顺序、五种结果分类、冷却规则、每代理一条历史、凭据每轮实时读取（NF-06）、以及不等待 SSE 流**都被真实断言，而非目测。 |
-| 6 | `settings` 包 85.4%；五种开关组合的矩阵测试 + `app` 层「总开关关闭时四项能力全部旁路」的端到端测试。 |
-| 7 | `states.Delete` 80%、`Bind` 90%，`intercept` 侧失效路径 85.4%；三个 HTTP 端点 `deleteBinding` 66.7%、`bindingHistory` 80.0%、`clearBindingHistory` 60.0% 均有测试，覆盖删除留痕、历史前缀截断与 `expand=1` 展开、清历史不影响绑定、重复删除幂等。 |
-| 10 | `backoff.NextDelay` 82.4%、`ProxyCooldown` 100%、`Terminal`/`ProxyFault` 100%、`states.Invalidate` 100%；`intercept` 包 85.4%，含失效触发条件与被动续期。 |
+| 1 | `storage/migrate.go` 72.3%、`settings/settings.go` 89.8%、`management/api.go` 73.3%；`TestApp_StartsAndRestoresState` 覆盖「重启后恢复」（NF-04）；迁移链有「全新安装到达 CurrentSchemaVersion / 重跑是 no-op / 拒绝更新版本 / 校验和不符 / 中断迁移回滚备份」五条测试；已在 CPA v7.3.7 容器中真实加载（`make cpa-docker-up`）。 |
+| 2 | `accounts.Sync` 88.2%、`RecordSignals` 100%、`Load` 88.9%、`ResolveAuthID` 100%、`ProbeEnabled` 100%、`SetProbeEnabled` 83.3%；`POST /accounts/sync`、`GET /accounts/models`、`PUT /accounts/models/probe` 三个端点均有测试；harness 实跑同步出 3 个账号。 |
+| 3 | `proxies` 包 90.4%；LRU 排序、冷却排除、同时间按 id 稳定排序、`ReplaceAll`、`Load` 恢复均有测试；`PUT /proxy-nodes` 端点有测试（含删除缺失节点与拒绝空 URL）；harness 中实测节点失败后进入 cooldown 且 `lastUsedAt` 持久化。 |
+| 4 | `probe` 包 83.3%。`buildProbeBody` 100%、`newProxyClient` 100%、`attempt` 90.6%、`isModelUnsupported` 90.0%、`Probe` 88.4%、`newProbeHTTPRequest` 81.8%。测试用一个 `httptest` 假上游当作代理节点，因此**探测请求体形状（§3.6）、认证头、遍历顺序、五种结果分类、冷却规则、每代理一条历史、凭据每轮实时读取（NF-06）、以及不等待 SSE 流**都被真实断言，而非目测。 |
+| 6 | `settings` 包 89.8%；五种开关组合的矩阵测试 + `app` 层「总开关关闭时四项能力全部旁路」的端到端测试。 |
+| 7 | `states.Delete` 80%、`Bind` 90%；三个 HTTP 端点 `deleteBinding` 75.0%、`bindingHistory` 77.3%、`clearBindingHistory` 58.3% 均有测试，覆盖删除留痕、历史前缀截断与 `expand=1` 展开、清历史不影响绑定、重复删除幂等。 |
+| 10 | `backoff.NextDelay` 82.4%、`ProxyCooldown` 100%、`Terminal`/`ProxyFault` 100%、`states.Invalidate` 100%、`intercept` 包 88.3%（含 `ObserveCompletion` 88.9%，即 §3.12 的失效触发条件与被动续期）。 |
 
 ### 进行中项的具体缺口
 
 | # | 缺口 |
 |:--:|---|
-| 0 | **已在 CPA v7.3.7 容器中验证**：共享库加载成功、注册被接受、能力声明生效、Management API 可达（`make cpa-docker-up`）。**仍差真实流量驱动**——环境里没有 Codex 账号，拦截器/调度器/响应捕获从未被真实请求触发过。 |
-| 1 | 仅差「可被 CPA 加载」这一条，见 #0。 |
-| 5 | **请求注入已在真实流量上验证**：经 CPA 的请求确实带上了注入的头，`unresolvedAuth` 与 `noBinding` 均为 0。**反向绑定在这条路径上不生效**——实测响应到达插件时有 28 个响应头，其中没有 `X-Codex-Turn-State`；响应头 map 非空、插件读取无误，是上游不在这条链路返回它。已按运维决定接受为已知限制（它是降低探测频率的优化，非核心能力）。详见设计文档 §10.12。 |
-| 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行。 |
-| 9 | 路由已改为查询参数形式并全部注册，`internal/management` 内**已无 0% 覆盖率的端点**；Management API 与面板静态资源均已在真实 CPA v7.3.7 中验证可达。仍缺的是**在浏览器里实际点击验证交互**。 |
-| 11 | API 侧（探测历史查询、代理健康统计、请求管道计数、上游套餐与额度）已完成并在真实实例中验证；可视化部分随 #9 一并验证。 |
+| 0 | **已在 CPA v7.3.7 容器中验证**：共享库加载成功、注册被接受、能力声明生效、Management API 与面板资源可达（`make cpa-docker-up`），且**真实流量已经驱动过链路**——探测 → 绑定 → 注入跑通（见下）。**仍差 `request.complete` 这一环**：`pluginabi.handleCompletion` 与 `app.ObserveCompletion` 覆盖率为 0，既没有单测也在真实流量中未被观察到触发。自愈（§3.12）正是挂在这个回调上——它要等一次真实失败请求才会走到。非流式路径 `handleResponseIntercept` / `ObserveResponse` 同样是 0（至今所有真实流量都是 SSE 流式）。补齐这两个回调的单测即可转 ✅。 |
+| 5 | **请求注入已在真实流量上验证**：经 CPA 的请求确实带上了注入的头，`unresolvedAuth` 与 `noBinding` 均为 0。**反向绑定在这条路径上不生效**——实测响应到达插件时有 28 个响应头，其中没有 `X-Codex-Turn-State`；响应头 map 非空、插件读取无误，是上游不在这条链路返回它。已按运维决定接受为已知限制（它是降低探测频率的优化，非核心能力）。详见设计文档 §10.12。**注意**：接受该限制意味着本项的验收标准「请求头替换与响应头反向绑定全链路打通」中后一半永远不会满足，因此维持 🔄——除非把验收标准改成「注入闭环 + 反向绑定为可选优化」。 |
+| 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行；`state_first` 的「跨优先级档挑选持有 State 的账号」需要**至少两个账号**才能体现，当前环境只有一个。 |
+| 9 | 路由已改为查询参数形式并全部注册；Management API 与面板静态资源均已在真实 CPA v7.3.7 中验证可达；**面板交互已在浏览器中实测**（账号过滤、探测记录分页与账号过滤、绑定历史弹窗 ESC 关闭、模型列表自动加载、标题栏计数）。仍列 🔄 有两个原因：一是本表口径把依赖浏览器渲染的项排除在 ✅ 之外，二是 `GET /models` 端点（`listModels`）是全仓唯一 0% 覆盖率的端点，`app.Catalog`、`models.parseCatalog` 也随之未测。 |
+| 11 | API 侧（探测历史查询、代理健康统计、请求管道计数、上游套餐与额度）已完成并在真实实例中验证：实测一次真实请求后 `plan` 由 `X-Codex-Plan-Type` 填入 `free`，`lastHeaderInit` 里能看到 `X-Codex-Primary/Secondary-Used-Percent` 等额度头。注意这些值**只在进程处理过真实请求后才有**——重启后 `plan` 为空是正常现象，不是缺陷（§10.10）。可视化部分随 #9 一并验证。 |
 
 ### 关于第 0 项
 
-#0 不在设计文档 §6.1 的计划表内，是框架落地后暴露出来的前置项，也是当前唯一的阻塞点：它直接卡住 #1、#5、#8 的最终验收。设计文档 §8「关键技术验证清单」的 12 项验证应当在这一步内完成。
+#0 不在设计文档 §6.1 的计划表内，是框架落地后暴露出来的前置项：它直接卡住 #5、#8 的最终验收。设计文档 §8「关键技术验证清单」的 12 项验证应当在这一步内完成。
+
+### 覆盖率已知缺口
+
+`go tool cover -func` 实测的 0% 函数，按重要性排列：
+
+| 函数 | 说明 |
+|---|---|
+| `pluginabi.handleCompletion` / `app.ObserveCompletion` | `request.complete` 回调。自愈（§3.12）挂在这上面，是 #0 唯一未打通的链路。 |
+| `pluginabi.handleResponseIntercept` / `app.ObserveResponse` / `intercept.ObserveResponse` | 非流式响应路径。真实流量至今全为 SSE 流式，因此从未执行过。 |
+| `management.listModels` | `GET /models`，全仓唯一 0% 的端点；`app.Catalog`、`models.parseCatalog` 随之未测。 |
+| `accounts.ProbeBlocked` | 按账号健康状态跳过探测的判定（面板与调度器走的是 `BlockedReason` 85.7%，此函数另有一条路径）。 |
+| `probe.ReplaceAll`（时间窗口） | AGENTS.md §6 称时间窗口是全仓最易出错的一处，替换路径却没有测试。 |
+
+另有未被任何地方调用的导出方法，属清理项而非缺口：`app.TriggerProbe`、`app.ManagementAPI`、`app.DB`、`app.Correlation`、`intercept.RequestInjector.Correlation`、`intercept.CorrelationManager.Len`。
 
 ### 已验证的核心闭环
 
@@ -87,28 +103,34 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 探测   SUCCESS_TARGET  len=292  经代理直连上游        ✅ 真实实例
 绑定   写入 SQLite → 内存快照 → 排定 TTL×85% 退避     ✅
 注入   经 CPA 的请求带上注入头，账号识别无误           ✅ 真实流量
-观测   请求管道计数（注入/捕获/账号未知/自愈）          ✅
-账号   套餐与额度取自上游响应头                        ✅ 真实流量
+观测   请求管道计数（注入/捕获/账号未知/跳过/丢弃）     ✅ 真实流量
+账号   套餐与额度取自上游响应头                        ✅ 真实流量（实测填入 plan=free 与 5h/周 用量）
+自愈   失败请求 → 失效绑定 → 立即重探                  ⚠️ 有单测（ObserveCompletion 88.9%），未经真实失败触发
 ```
+
+「自愈」一行是**未被证伪**而非已证明：真实失败请求没有发生过，`request.complete` 回调也还没在真实环境被观察到。
 
 ### 建议的推进顺序
 
-1. **#9 面板浏览器实测**——功能与数据都已就位，剩下是交互层面的收尾。
-2. **#11 可观测性收尾**——随 #9 一并完成。
+1. **补 #0 的两个回调单测**（`handleCompletion` / `handleResponseIntercept`）——这是唯一还卡着 #0 的东西，补完即可转 ✅。
+2. **#9 面板收尾**——交互已实测通过，剩下 `GET /models` 端点的测试与「浏览器项不计入 ✅」这条口径的取舍。
 3. **#8 调度干预的真实验证**——需要多账号环境才能体现「优先选择持有 State 的账号」。
 
 ---
 
 ## Quick start
 
-Requires Go 1.24+ and, for the shared library, a C compiler with `CGO_ENABLED=1`.
+Requires Go 1.26+ (see `go.mod`) and, for the shared library, a C compiler with
+`CGO_ENABLED=1`. The Linux cross-build in `make build-linux` uses `golang:1.26-bookworm`.
 
 ```bash
 make run
 ```
 
 Then open <http://127.0.0.1:8787/v0/resource/plugins/codex-turn-state-manager/> and sign
-in with the harness key `devkey`.
+in with the harness key `devkey`. That bare base path is a harness convenience — it
+redirects to `/index.html`. On a real CPA the entry point is `/index.html` directly,
+because CPA rejects a resource route whose path trims to empty.
 
 The harness boots the real application against an in-memory mock of the CPA host and
 serves the real Management API and admin panel, so the plugin can be developed without a
@@ -117,6 +139,8 @@ CPA instance and without touching real accounts.
 ```bash
 make run ARGS="-accounts 8 -listen 127.0.0.1:9000"
 ```
+
+`ARGS` is appended after the defaults, so it can override any of them.
 
 ## Build
 
@@ -174,13 +198,19 @@ request path.
 | Path | Responsibility |
 |---|---|
 | `internal/hostapi` | The only place CPA is described. A Go interface port plus an in-memory mock. |
-| `internal/storage` | SQLite (WAL): schema migrations with checksums and backups, and the table stores. |
+| `internal/pluginabi` | Adapter from the real CPA C-ABI onto `hostapi.Host`. The only package allowed to reference CGO. |
+| `internal/version` | Build identity and the management / resource route prefixes. |
 | `internal/settings` | Configuration, bounds, and the atomic runtime snapshot the hot path reads. |
+| `internal/storage` | SQLite (WAL): schema migrations with checksums and backups, and the table stores. |
+| `internal/accounts` | CPA account sync, the `AuthIndex` ⇄ `AuthID` mapping, plan claims, and the probe-health gate. |
+| `internal/models` | The model catalog and each model's reasoning floor. |
 | `internal/states` | Bindings, their lifecycle, and the lock-free hot-path snapshot. |
 | `internal/proxies` | Proxy pool health, cooldown, and least-recently-used selection. |
 | `internal/probe` | Scan scheduling, time windows, backoff, proxy traversal, request shape. |
 | `internal/intercept` | Correlation across interceptor stages, injection, capture, self-healing. |
+| `internal/headers` | The header names this plugin reads and the upstream signal parsing. |
 | `internal/routing` | Interference in CPA's account selection. |
+| `internal/management` | Management API handlers. |
 | `internal/app` | Composition root; owns lifecycle and the request-path entry points. |
 | `web` | The embedded admin panel (static assets only). |
 
@@ -220,12 +250,15 @@ Set from the panel or the Management API. Defaults:
 | `global_enabled` | `true` | Master switch for all four capabilities |
 | `global_probe_enabled` | `true` | Active probing (needs the master switch) |
 | `global_reverse_bind_enabled` | `true` | Traffic capture (needs the master switch) |
+| `state_priority_enabled` | `true` | Whether the plugin may interfere in CPA's account choice. Off still injects state it already holds |
 | `scan_interval_sec` | `60` | How often the scheduler checks for due pairs |
-| `probe_concurrency` | `2` | Simultaneous pair probes; each walks the pool serially |
+| `probe_concurrency` | `2` | Simultaneous pair probes (1–32); each walks the pool serially |
 | `state_ttl_min` | `60` | Binding lifetime |
 | `refresh_threshold_pct` | `15` | Re-probe once this much of the TTL remains |
 | `target_state_length` | `292` | The only length that binds |
 | `max_probe_duration_sec` | `90` | Cap on one pair's traversal of the whole pool |
+| `account_sync_interval_sec` | `300` | How often the account list is re-read from CPA |
+| `probe_history_retention_hours` | `24` | Probe rows older than this are pruned |
 | `account_routing_strategy` | `respect_cpa_priority` | or `state_first` |
 
 Time windows restrict when probing runs. Several windows may be configured, each with an
@@ -241,26 +274,41 @@ management auth.
 
 ```
 GET    /status
-GET    /settings                          PUT /settings
-GET    /time-windows                      POST /time-windows
-PUT    /time-windows/{id}                 DELETE /time-windows/{id}
-GET    /accounts                          POST /accounts/sync
-GET    /accounts/{authIndex}/models
-PUT    /accounts/{authIndex}/models/{model}/probe
-GET    /bindings                          DELETE /bindings/{authIndex}/{model}
-GET    /bindings/{authIndex}/{model}/history
-DELETE /bindings/{authIndex}/{model}/history
-GET    /proxy-nodes                       PUT /proxy-nodes
-GET    /probe-history?limit=50
+GET    /settings
+PUT    /settings
+GET    /time-windows
+POST   /time-windows
+PUT    /time-windows?id=…
+DELETE /time-windows?id=…
+GET    /models
+GET    /accounts
+POST   /accounts/sync
+GET    /accounts/models?authIndex=…
+DELETE /accounts/models?authIndex=…&model=…
+PUT    /accounts/models/probe?authIndex=…&model=…
+GET    /bindings
+DELETE /bindings?authIndex=…&model=…
+GET    /bindings/history?authIndex=…&model=…&expand=1&limit=&offset=
+DELETE /bindings/history?authIndex=…&model=…
+GET    /proxy-nodes
+PUT    /proxy-nodes
+GET    /probe-history?authIndex=&model=&limit=50&offset=0
 ```
 
-`GET /status` also reports `pipeline`: counters for requests reaching the
-injection stage, injections performed, accounts that could not be resolved,
-bindings missing, state captured from traffic, and self-healing invalidations.
-A header rewrite leaves no other trace, so these are how "is the plugin actually
-doing anything?" gets answered without logging every request. The same payload
-carries `lastHeaderInit`, a snapshot of what the most recent response actually
-carried — which is how the reverse-bind limitation above was established.
+**Every dynamic segment is a query parameter, and that is a host constraint rather than a
+style choice.** CPA dispatches management routes by exact path — `:`, `*` and `..` are
+rejected at registration — so `/bindings/{authIndex}/{model}` is not registrable. The path
+must also carry the `plugins/<pluginID>` segment itself. `GET /probe-history` returns
+`total` alongside the page so the panel can paginate.
+
+`GET /status` reports `version`, `now`, `settings`, the resolved `capabilities`,
+proxy counts, and `pipeline`: counters for requests reaching the injection stage,
+injections performed, accounts that could not be resolved, bindings missing, state
+captured from traffic, and self-healing invalidations. A header rewrite leaves no other
+trace, so these are how "is the plugin actually doing anything?" gets answered without
+logging every request. `pipeline.lastHeaderInit` is a snapshot of what the most recent
+response actually carried — which is how the reverse-bind limitation above was
+established.
 
 The panel's own assets are served from `/v0/resource/plugins/codex-turn-state-manager/`,
 which bypasses management auth. Note the entry point is `/index.html`, not the bare

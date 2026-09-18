@@ -161,13 +161,18 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	}
 
 	r.mu.Lock()
-	// Preserve the first-seen time for accounts that are still present, so the
-	// panel can show a stable "known since", and carry over a plan already
-	// looked up so it is not re-read on every sync.
+	// Preserve what this build learned from upstream response headers rather
+	// than from the host's account list, which carries neither. The plan is
+	// looked up from a credential and read once per process; the quota is
+	// refreshed by traffic. Both would otherwise be blanked on every sync.
+	//
+	// SyncedAt is the first-seen time, kept stable so the panel can show a
+	// "known since" that does not move.
 	for idx, acc := range next {
 		if prev, ok := r.byIndex[idx]; ok {
 			acc.SyncedAt = prev.SyncedAt
 			acc.Plan = prev.Plan
+			acc.Quota = prev.Quota
 			next[idx] = acc
 		}
 	}
