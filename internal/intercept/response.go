@@ -2,6 +2,7 @@ package intercept
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -11,13 +12,12 @@ import (
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
 )
 
-// Collector harvests turn-state values from response headers and runs the
+// Collector harvests turn-state values from responses and runs the
 // self-healing rules.
 //
-// Normal traffic becomes a second, free source of state: every successful
-// response that carries a target-length value refreshes the binding for the
-// account that served it, which is what keeps active probing rare
-// (design doc 3.9).
+// Normal traffic is a second, free source of state: every successful response
+// carrying a target-length value refreshes the binding for the account that
+// served it, which is what keeps active probing rare.
 type Collector struct {
 	settings *settings.Manager
 	states   *states.Registry
@@ -25,8 +25,8 @@ type Collector struct {
 	logf     func(hostapi.LogLevel, string, map[string]any)
 
 	// serverErrors counts consecutive 5xx per pair. The threshold is a per-pair
-	// run, not a per-request one, because a retry arrives with a fresh
-	// request id (design doc 3.12).
+	// run, not a per-request one, because a retry arrives with a fresh request
+	// id.
 	failMu       sync.Mutex
 	serverErrors map[states.Pair]int
 }
@@ -61,46 +61,64 @@ type CaptureResult struct {
 
 // Capture actions.
 const (
-	CaptureSkipped     = "skipped"
-	CaptureIgnored     = "ignored"
-	CaptureNonTarget   = "non_target"
-	CaptureBound       = "bound"
-	CaptureRefreshed   = "refreshed"
-	CaptureNoAuth      = "no_auth"
-	CaptureCollectOnly = "collect_only"
+	CaptureSkipped       = "skipped"
+	CaptureIgnored       = "ignored"
+	CaptureNonTarget     = "non_target"
+	CaptureBound         = "bound"
+	CaptureRefreshed     = "refreshed"
+	CaptureNoAuth        = "no_auth"
+	CaptureNotHeaderInit = "not_header_init"
 )
 
-// Observe handles the streaming header-init callback
-// (StreamChunkHeaderInitIndex == -1).
+// Observe handles the stream header-init callback
+// (ChunkIndex == StreamChunkHeaderInitIndex).
 //
 // With the master switch off the response is ignored outright -- no capture, no
-// TTL refresh, no rebind (design doc 3.3).
-func (c *Collector) Observe(ctx context.Context, resp hostapi.ResponseHeaders) CaptureResult {
+// TTL refresh, no rebind.
+func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) CaptureResult {
+	if !chunk.IsHeaderInit() {
+		// Only the header-only call carries the initial upstream headers.
+		return CaptureResult{Action: CaptureNotHeaderInit}
+	}
+	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
+}
+
+// ObserveResponse handles the non-streaming response interceptor, which is the
+// simpler of the two paths for observing a state value.
+func (c *Collector) ObserveResponse(ctx context.Context, chunk hostapi.StreamChunk) CaptureResult {
+	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
+}
+
+func (c *Collector) capture(
+	ctx context.Context,
+	requestID, model, authIndex string,
+	header http.Header,
+) CaptureResult {
 	caps := c.settings.Current().Capabilities()
 
-	rec, hasRec := c.corr.Complete(resp.RequestID)
+	rec, hasRec := c.corr.Complete(requestID)
 
 	if !caps.Capture {
-		return CaptureResult{Action: CaptureSkipped, AuthIndex: rec.AuthIndex}
-	}
-	if !hasRec {
-		return CaptureResult{Action: CaptureNoAuth}
+		return CaptureResult{Action: CaptureSkipped, AuthIndex: authIndex}
 	}
 
-	authIndex := rec.AuthIndex
+	// Prefer the account the host published on this payload; fall back to what
+	// the injection stage recorded.
+	if authIndex == "" && hasRec {
+		authIndex = rec.AuthIndex
+	}
 	if authIndex == "" {
 		return CaptureResult{Action: CaptureNoAuth}
 	}
 
-	model := resp.Model
-	if model == "" {
+	if model == "" && hasRec {
 		model = rec.Model
 	}
 	if model == "" {
 		return CaptureResult{Action: CaptureNoAuth, AuthIndex: authIndex}
 	}
 
-	value := headers.Get(resp.Header, headers.TurnState)
+	value := headers.Get(header, headers.TurnState)
 	if value == "" {
 		return CaptureResult{Action: CaptureIgnored, AuthIndex: authIndex}
 	}
@@ -114,8 +132,9 @@ func (c *Collector) Observe(ctx context.Context, resp hostapi.ResponseHeaders) C
 	prev, status := c.states.Lookup(authIndex, model)
 	sameValue := status.Usable() && prev.StateValue == value
 
+	pair := states.Pair{AuthIndex: authIndex, Model: model}
 	if _, err := c.states.Bind(ctx, states.Binding{
-		Pair:       states.Pair{AuthIndex: authIndex, Model: model},
+		Pair:       pair,
 		StateValue: value,
 		Source:     states.SourceTraffic,
 	}); err != nil {
@@ -124,7 +143,7 @@ func (c *Collector) Observe(ctx context.Context, resp hostapi.ResponseHeaders) C
 		})
 		return CaptureResult{Action: CaptureIgnored, AuthIndex: authIndex, StateLen: len(value)}
 	}
-	c.resetServerErrors(states.Pair{AuthIndex: authIndex, Model: model})
+	c.resetServerErrors(pair)
 
 	if sameValue {
 		// Same value seen again: TTL extended, no history row.
@@ -156,50 +175,63 @@ const (
 	consecutive5xxLimit    = 3
 )
 
-// ObserveFailure applies the self-healing rules to a failed request.
+// ObserveCompletion applies the self-healing rules to a finished request.
 //
-// Preconditions are strict on purpose: we only invalidate state that *this*
-// request actually carried. Invalidating on unrelated failures would throw
-// away good state and trigger pointless re-probing.
-func (c *Collector) ObserveFailure(ctx context.Context, requestID string, status int, body []byte) FailureSignal {
+// The host reports the outcome and status directly, which is a firmer signal
+// than sniffing response bodies; body may be nil. Preconditions are strict on
+// purpose: the plugin only invalidates state that *this* request actually
+// carried, so an unrelated failure never throws away good state.
+func (c *Collector) ObserveCompletion(ctx context.Context, comp hostapi.Completion, body []byte) FailureSignal {
 	if !c.settings.Current().Capabilities().Enabled {
 		return FailureSignal{}
 	}
 
-	rec, ok := c.corr.Get(requestID)
+	rec, ok := c.corr.Get(comp.RequestID)
 	if !ok || !rec.Injected {
+		return FailureSignal{}
+	}
+
+	// Rejected means one of our own interceptors stopped the request, and
+	// canceled means the client went away. Neither implicates the state.
+	if comp.Outcome != hostapi.CompletionFailed {
+		c.corr.Forget(comp.RequestID)
 		return FailureSignal{}
 	}
 
 	reason := ""
 	switch {
-	case status == 400 && bodyMentions(body, reasonResponseNotFound):
+	case comp.StatusCode == 400 && bodyMentions(body, reasonResponseNotFound):
 		reason = "upstream reported previous_response_not_found"
-	case status == 400 && bodyMentions(body, reasonRoutingError):
+	case comp.StatusCode == 400 && bodyMentions(body, reasonRoutingError):
 		reason = "upstream reported a routing error"
-	case status >= 500:
+	case comp.StatusCode >= 500:
 		reason = "upstream returned a server error"
 	}
 	if reason == "" {
 		return FailureSignal{}
 	}
 
-	if status >= 500 && c.bumpServerErrors(states.Pair{AuthIndex: rec.AuthIndex, Model: rec.Model}) < consecutive5xxLimit {
-		// One 5xx is noise; a run of them suggests the injected state is the
-		// common factor.
-		return FailureSignal{}
+	pair := states.Pair{AuthIndex: rec.AuthIndex, Model: rec.Model}
+
+	if comp.StatusCode >= 500 {
+		if c.bumpServerErrors(pair) < consecutive5xxLimit {
+			// One 5xx is noise; a run of them suggests the injected state is
+			// the common factor.
+			return FailureSignal{}
+		}
 	}
 
-	if err := c.states.Invalidate(ctx, states.Pair{AuthIndex: rec.AuthIndex, Model: rec.Model}); err != nil {
+	if err := c.states.Invalidate(ctx, pair); err != nil {
 		c.log(hostapi.LogError, "could not invalidate binding after failure", map[string]any{
 			"authIndex": rec.AuthIndex, "model": rec.Model, "error": err.Error(),
 		})
 		return FailureSignal{}
 	}
-	c.resetServerErrors(states.Pair{AuthIndex: rec.AuthIndex, Model: rec.Model})
-	c.corr.Forget(requestID)
+	c.resetServerErrors(pair)
+	c.corr.Forget(comp.RequestID)
 	c.log(hostapi.LogWarn, "binding invalidated after request failure; will re-probe", map[string]any{
-		"authIndex": rec.AuthIndex, "model": rec.Model, "status": status, "reason": reason,
+		"authIndex": rec.AuthIndex, "model": rec.Model,
+		"status": comp.StatusCode, "reason": reason,
 	})
 	return FailureSignal{Invalidated: true, AuthIndex: rec.AuthIndex, Reason: reason}
 }

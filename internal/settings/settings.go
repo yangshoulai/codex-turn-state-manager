@@ -21,6 +21,7 @@ const (
 	KeyGlobalEnabled          = "global_enabled"
 	KeyGlobalProbeEnabled     = "global_probe_enabled"
 	KeyGlobalReverseBind      = "global_reverse_bind_enabled"
+	KeyStatePriorityEnabled   = "state_priority_enabled"
 	KeyScanIntervalSec        = "scan_interval_sec"
 	KeyProbeConcurrency       = "probe_concurrency"
 	KeyStateTTLMin            = "state_ttl_min"
@@ -38,8 +39,11 @@ const (
 	// StrategyRespectCPAPriority takes the highest CPA priority bucket first,
 	// then round-robins inside it. This is the default.
 	StrategyRespectCPAPriority RoutingStrategy = "respect_cpa_priority"
-	// StrategyStateFirst always prefers accounts that hold a valid state,
-	// regardless of CPA priority.
+	// StrategyStateFirst prefers accounts that hold a valid state over the
+	// host's priority ordering. It only has an effect while
+	// state_priority_enabled is on, and it requires the plugin to have
+	// declared SchedulerAcrossPriorities at registration -- otherwise the host
+	// only offers the top priority tier and there is nothing to reach across.
 	StrategyStateFirst RoutingStrategy = "state_first"
 )
 
@@ -60,14 +64,19 @@ type Values struct {
 	GlobalEnabled            bool
 	GlobalProbeEnabled       bool
 	GlobalReverseBindEnabled bool
-	ScanInterval             time.Duration
-	ProbeConcurrency         int
-	StateTTL                 time.Duration
-	RefreshThresholdPct      int
-	TargetStateLength        int
-	MaxProbeDuration         time.Duration
-	RoutingStrategy          RoutingStrategy
-	AccountSyncInterval      time.Duration
+	// StatePriorityEnabled gates account-selection interference. Steering the
+	// routing decision is the most invasive thing the plugin does -- it
+	// overrides the host's own load balancing -- so it carries its own switch
+	// in addition to the master switch. Off means always defer to the host.
+	StatePriorityEnabled bool
+	ScanInterval         time.Duration
+	ProbeConcurrency     int
+	StateTTL             time.Duration
+	RefreshThresholdPct  int
+	TargetStateLength    int
+	MaxProbeDuration     time.Duration
+	RoutingStrategy      RoutingStrategy
+	AccountSyncInterval  time.Duration
 }
 
 // Defaults returns the documented default configuration (design doc 3.3/3.5).
@@ -76,6 +85,7 @@ func Defaults() Values {
 		GlobalEnabled:            true,
 		GlobalProbeEnabled:       true,
 		GlobalReverseBindEnabled: true,
+		StatePriorityEnabled:     true,
 		ScanInterval:             60 * time.Second,
 		ProbeConcurrency:         2,
 		StateTTL:                 60 * time.Minute,
@@ -155,7 +165,8 @@ type Capabilities struct {
 	Inject bool
 	// Capture: response headers may be harvested for new state values.
 	Capture bool
-	// Route: the scheduler may override CPA's account choice.
+	// Route: the scheduler may override CPA's account choice. This requires the
+	// state-priority switch on top of the master switch.
 	Route bool
 }
 
@@ -169,13 +180,13 @@ func (v *Values) Capabilities() Capabilities {
 	}
 	return Capabilities{
 		Enabled: true,
-		// Probe and Capture additionally honour their own sub-switch.
+		// Probe, Capture and Route each additionally honour their own switch.
 		Probe:   v.GlobalProbeEnabled,
 		Capture: v.GlobalReverseBindEnabled,
-		// Injection and routing are master-switch-only: with both sub-switches
-		// off the plugin still serves state it already holds.
+		Route:   v.StatePriorityEnabled,
+		// Injection is master-switch-only: with every sub-switch off the plugin
+		// still serves state it already holds. Only the master switch stops it.
 		Inject: true,
-		Route:  true,
 	}
 }
 
@@ -184,6 +195,7 @@ type Patch struct {
 	GlobalEnabled            *bool
 	GlobalProbeEnabled       *bool
 	GlobalReverseBindEnabled *bool
+	StatePriorityEnabled     *bool
 	ScanInterval             *time.Duration
 	ProbeConcurrency         *int
 	StateTTL                 *time.Duration
@@ -210,6 +222,9 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	}
 	if p.GlobalReverseBindEnabled != nil {
 		next.GlobalReverseBindEnabled = *p.GlobalReverseBindEnabled
+	}
+	if p.StatePriorityEnabled != nil {
+		next.StatePriorityEnabled = *p.StatePriorityEnabled
 	}
 	if p.ScanInterval != nil {
 		next.ScanInterval = *p.ScanInterval
@@ -291,6 +306,7 @@ func encode(v Values) (map[string]string, error) {
 		KeyGlobalEnabled:          strconv.FormatBool(v.GlobalEnabled),
 		KeyGlobalProbeEnabled:     strconv.FormatBool(v.GlobalProbeEnabled),
 		KeyGlobalReverseBind:      strconv.FormatBool(v.GlobalReverseBindEnabled),
+		KeyStatePriorityEnabled:   strconv.FormatBool(v.StatePriorityEnabled),
 		KeyScanIntervalSec:        strconv.Itoa(int(v.ScanInterval / time.Second)),
 		KeyProbeConcurrency:       strconv.Itoa(v.ProbeConcurrency),
 		KeyStateTTLMin:            strconv.Itoa(int(v.StateTTL / time.Minute)),
@@ -361,6 +377,7 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	boolAt(KeyGlobalEnabled, &v.GlobalEnabled)
 	boolAt(KeyGlobalProbeEnabled, &v.GlobalProbeEnabled)
 	boolAt(KeyGlobalReverseBind, &v.GlobalReverseBindEnabled)
+	boolAt(KeyStatePriorityEnabled, &v.StatePriorityEnabled)
 	secsAt(KeyScanIntervalSec, &v.ScanInterval)
 	intAt(KeyProbeConcurrency, &v.ProbeConcurrency)
 	minsAt(KeyStateTTLMin, &v.StateTTL)

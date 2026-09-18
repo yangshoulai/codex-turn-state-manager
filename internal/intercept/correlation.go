@@ -1,6 +1,16 @@
-// Package intercept implements the outbound request pipeline: correlating a
-// request across interceptor stages, injecting bound state, and harvesting
-// state from responses.
+// Package intercept implements the outbound request pipeline: injecting bound
+// state into a request and harvesting state from responses.
+//
+// Reconciled against CLIProxyAPI v7.3.7. The design document originally
+// specified a correlation-header mechanism: inject a marker in BeforeAuth, read
+// it in the Scheduler, recover it in AfterAuth. That mechanism is gone. The
+// host populates Metadata["selected_auth_index"] before invoking the after-auth
+// hook, so the account identity is simply read from there -- no header is
+// injected, and nothing has to be stripped before the request leaves.
+//
+// The remaining CorrelationManager is not about header plumbing: it records, per
+// request id, which pair was injected and whether injection happened at all,
+// which is what the response stage and the self-healing rules need.
 package intercept
 
 import (
@@ -8,35 +18,26 @@ import (
 	"time"
 )
 
-// Correlation links the three interceptor stages for one request.
-//
-// The plugin needs this because the AfterAuth request struct does not expose
-// AuthID, so the account identity has to be carried from the Scheduler stage
-// forward. A random per-request marker is injected as a temporary header in
-// BeforeAuth, resolved in the Scheduler, and read back in AfterAuth
-// (design doc 3.8).
-//
-// It also records whether this specific request actually carried
-// plugin-injected state, which is the precondition for self-healing (3.12).
+// Correlation records what the plugin did to one request.
 type Correlation struct {
 	RequestID string
 	Model     string
-	Provider  string
 	AuthID    string
 	AuthIndex string
 	CreatedAt time.Time
 
 	// Injected is true only when the injector wrote a state value into this
-	// request's headers.
+	// request's headers. Self-healing keys off this flag rather than inferring
+	// it, so a request the plugin left alone is never blamed for a failure.
 	Injected   bool
 	StateValue string
 }
 
 // CorrelationManager holds the in-flight request map.
 //
-// Entries are short-lived by construction, but a request that never reaches
-// the response stage would leak one, so entries also expire on a TTL and are
-// swept opportunistically.
+// Entries are short-lived by construction, but a request that never reaches a
+// terminal state would leak one, so entries also expire on a TTL and are swept
+// opportunistically.
 type CorrelationManager struct {
 	ttl time.Duration
 	now func() time.Time
@@ -63,29 +64,19 @@ func NewCorrelationManager(ttl time.Duration) *CorrelationManager {
 // SetClock overrides the time source. Tests only.
 func (c *CorrelationManager) SetClock(now func() time.Time) { c.now = now }
 
-// Begin records the start of a request. A repeated RequestID is treated as a
-// new request, overwriting the stale entry.
-func (c *CorrelationManager) Begin(requestID, model, provider string) *Correlation {
+// Record notes the account a request was served by.
+func (c *CorrelationManager) Record(requestID, model, authID, authIndex string) *Correlation {
 	rec := &Correlation{
 		RequestID: requestID,
 		Model:     model,
-		Provider:  provider,
+		AuthID:    authID,
+		AuthIndex: authIndex,
 		CreatedAt: c.now(),
 	}
 	c.mu.Lock()
 	c.m[requestID] = rec
 	c.mu.Unlock()
 	return rec
-}
-
-// AttachAuth records which account the scheduler chose.
-func (c *CorrelationManager) AttachAuth(requestID, authID, authIndex string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if rec, ok := c.m[requestID]; ok {
-		rec.AuthID = authID
-		rec.AuthIndex = authIndex
-	}
 }
 
 // MarkInjected records that state was written into the request.
@@ -135,8 +126,8 @@ func (c *CorrelationManager) Len() int {
 	return len(c.m)
 }
 
-// Sweep drops expired entries. It is called opportunistically from Begin so no
-// background goroutine is needed.
+// Sweep drops expired entries. It is called opportunistically so no background
+// goroutine is needed.
 func (c *CorrelationManager) Sweep() int {
 	cutoff := c.now().Add(-c.ttl)
 	c.mu.Lock()

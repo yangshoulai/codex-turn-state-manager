@@ -132,51 +132,43 @@ func TestApp_SwitchOffBypassesEverything(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	// Sanity: with the switch on, all four are live.
+	// Sanity: with the switches on, all four capabilities are live.
 	req := &hostapi.InterceptedRequest{
-		RequestID: "req-1", Model: "gpt-5-codex", Headers: http.Header{},
+		Stage: hostapi.StageAfterAuth, RequestID: "req-1", Model: "gpt-5-codex",
+		AuthID: "auth-id-1", AuthIndex: "codex-auth-1", Headers: http.Header{},
 	}
-	if got := a.BeforeAuth(req); got.Action != "correlated" {
-		t.Fatalf("BeforeAuth action = %s, want correlated", got.Action)
-	}
-	a.Correlation().AttachAuth("req-1", "auth-id-1", "codex-auth-1")
-	if got := a.AfterAuth(req); got.Action != "injected" {
-		t.Fatalf("AfterAuth action = %s, want injected", got.Action)
+	if got := a.InjectState(req); got.Action != "injected" {
+		t.Fatalf("InjectState action = %s, want injected", got.Action)
 	}
 	pick := a.PickCredential(ctx, hostapi.SchedulerPickRequest{
 		RequestID: "req-1", Provider: hostapi.ProviderCodex, Model: "gpt-5-codex",
-		Candidates: []hostapi.Candidate{{AuthID: "auth-id-1", AuthIndex: "codex-auth-1", Priority: 1}},
+		Candidates: []hostapi.Candidate{{ID: "auth-id-1", Priority: 1}},
 	})
-	if pick.Delegate {
-		t.Error("expected the plugin to steer routing while the master switch is on")
+	if pick.Delegated() {
+		t.Error("expected the plugin to steer routing while the switches are on")
 	}
 
-	// Now turn it off.
+	// Now turn the master switch off.
 	off := false
 	if _, err := a.Settings().Update(ctx, settings.Patch{GlobalEnabled: &off}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
 	req2 := &hostapi.InterceptedRequest{
-		RequestID: "req-2", Model: "gpt-5-codex", Headers: http.Header{},
+		Stage: hostapi.StageAfterAuth, RequestID: "req-2", Model: "gpt-5-codex",
+		AuthID: "auth-id-1", AuthIndex: "codex-auth-1", Headers: http.Header{},
 	}
-	if got := a.BeforeAuth(req2); got.Action != "passthrough" {
-		t.Errorf("BeforeAuth action = %s, want passthrough", got.Action)
-	}
-	if req2.Headers.Get("X-CPA-Turn-State-Correlation") != "" {
-		t.Error("no correlation header may be set while the master switch is off")
-	}
-	if got := a.AfterAuth(req2); got.Action != "passthrough" {
-		t.Errorf("AfterAuth action = %s, want passthrough", got.Action)
+	if got := a.InjectState(req2); got.Action != "passthrough" {
+		t.Errorf("InjectState action = %s, want passthrough", got.Action)
 	}
 	if req2.Headers.Get("X-Codex-Turn-State") != "" {
 		t.Error("state must not be injected while the master switch is off")
 	}
 
-	a.Correlation().AttachAuth("req-2", "auth-id-1", "codex-auth-1")
-	captured := a.ObserveResponse(ctx, hostapi.ResponseHeaders{
-		RequestID: "req-2", Model: "gpt-5-codex", Status: 200,
-		Header: http.Header{"X-Codex-Turn-State": []string{stateOf(targetLength)}},
+	captured := a.ObserveStreamChunk(ctx, hostapi.StreamChunk{
+		RequestID: "req-2", Model: "gpt-5-codex", AuthIndex: "codex-auth-1",
+		ChunkIndex:      hostapi.StreamChunkHeaderInitIndex,
+		ResponseHeaders: http.Header{"X-Codex-Turn-State": []string{stateOf(targetLength)}},
 	})
 	if captured.Action != "skipped" {
 		t.Errorf("capture action = %s, want skipped", captured.Action)
@@ -184,10 +176,51 @@ func TestApp_SwitchOffBypassesEverything(t *testing.T) {
 
 	pick2 := a.PickCredential(ctx, hostapi.SchedulerPickRequest{
 		RequestID: "req-2", Provider: hostapi.ProviderCodex, Model: "gpt-5-codex",
-		Candidates: []hostapi.Candidate{{AuthID: "auth-id-1", AuthIndex: "codex-auth-1", Priority: 1}},
+		Candidates: []hostapi.Candidate{{ID: "auth-id-1", Priority: 1}},
 	})
-	if !pick2.Delegate {
-		t.Error("routing must defer to CPA while the master switch is off")
+	if !pick2.Delegated() {
+		t.Error("routing must defer to the host while the master switch is off")
+	}
+}
+
+// TestApp_StatePrioritySwitchStopsOnlyRouting isolates the new switch: turning
+// it off must take the plugin out of the scheduling path while leaving
+// injection alone.
+func TestApp_StatePrioritySwitchStopsOnlyRouting(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair:       states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"},
+		StateValue: stateOf(targetLength),
+		Source:     states.SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	off := false
+	if _, err := a.Settings().Update(ctx, settings.Patch{StatePriorityEnabled: &off}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// Routing stands down.
+	pick := a.PickCredential(ctx, hostapi.SchedulerPickRequest{
+		RequestID: "req-1", Provider: hostapi.ProviderCodex, Model: "gpt-5-codex",
+		Candidates: []hostapi.Candidate{{ID: "auth-id-1", Priority: 1}},
+	})
+	if !pick.Delegated() {
+		t.Error("routing must not interfere while state_priority_enabled is off")
+	}
+
+	// Injection carries on.
+	req := &hostapi.InterceptedRequest{
+		Stage: hostapi.StageAfterAuth, RequestID: "req-1", Model: "gpt-5-codex",
+		AuthID: "auth-id-1", AuthIndex: "codex-auth-1", Headers: http.Header{},
+	}
+	if got := a.InjectState(req); got.Action != "injected" {
+		t.Errorf("InjectState action = %s, want injected; only routing should be off", got.Action)
 	}
 }
 

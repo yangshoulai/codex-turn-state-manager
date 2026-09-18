@@ -108,7 +108,19 @@ type fixedModels struct{ enabled map[string]bool }
 
 func (m fixedModels) ModelTurnStateEnabled(model string) bool { return m.enabled[model] }
 
-// harness bundles a scheduler with the pieces a test needs to steer it.
+// authMap mimics AccountRegistry: the host hands the plugin a runtime auth id,
+// and the plugin resolves it to its own persistence key. They are deliberately
+// different strings here so the resolution is actually exercised.
+type authMap map[string]string
+
+func (m authMap) ResolveAuthID(authID string) (string, bool) {
+	idx, ok := m[authID]
+	return idx, ok
+}
+
+// ---------------------------------------------------------------------------
+// harness
+
 type harness struct {
 	scheduler *Scheduler
 	settings  *settings.Manager
@@ -143,12 +155,15 @@ func newHarness(t *testing.T, strategy settings.RoutingStrategy) *harness {
 		States:   registry,
 		Cursors:  cursors,
 		Models:   fixedModels{enabled: map[string]bool{"gpt-5-codex": true}},
+		// "auth-id-a" resolves to persistence key "a", and so on.
+		Auth: authMap{"auth-id-a": "a", "auth-id-b": "b", "auth-id-c": "c"},
 	})
 	s.SetClock(func() time.Time { return *clock })
 
 	return &harness{scheduler: s, settings: manager, states: registry, cursors: cursors, clock: clock}
 }
 
+// bind attaches a usable binding to a persistence key.
 func (h *harness) bind(t *testing.T, authIndex, model string) {
 	t.Helper()
 	if _, err := h.states.Bind(context.Background(), states.Binding{
@@ -158,11 +173,18 @@ func (h *harness) bind(t *testing.T, authIndex, model string) {
 	}
 }
 
-func codexRequest(model string, candidates ...hostapi.Candidate) hostapi.SchedulerPickRequest {
-	for i := range candidates {
-		candidates[i].Provider = hostapi.ProviderCodex
-		candidates[i].Model = model
+// candidate builds a host candidate. The id is the host runtime identifier,
+// not the plugin's persistence key.
+func candidate(letter string, priority int) hostapi.Candidate {
+	return hostapi.Candidate{
+		ID:       "auth-id-" + letter,
+		Provider: hostapi.ProviderCodex,
+		Priority: priority,
+		Status:   hostapi.AccountStatusAvailable,
 	}
+}
+
+func codexRequest(model string, candidates ...hostapi.Candidate) hostapi.SchedulerPickRequest {
 	return hostapi.SchedulerPickRequest{
 		RequestID:  "req-1",
 		Provider:   hostapi.ProviderCodex,
@@ -171,16 +193,10 @@ func codexRequest(model string, candidates ...hostapi.Candidate) hostapi.Schedul
 	}
 }
 
-func candidate(authIndex string, priority int) hostapi.Candidate {
-	return hostapi.Candidate{
-		AuthID: "auth-id-" + authIndex, AuthIndex: authIndex, Priority: priority,
-	}
-}
-
 // ---------------------------------------------------------------------------
-// delegation
+// declining to interfere
 
-func TestDecide_DelegatesWhenNothingToGain(t *testing.T) {
+func TestDecide_DeclinesWhenNothingToGain(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("master switch off", func(t *testing.T) {
@@ -190,10 +206,44 @@ func TestDecide_DelegatesWhenNothingToGain(t *testing.T) {
 		if _, err := h.settings.Update(ctx, settings.Patch{GlobalEnabled: &off}); err != nil {
 			t.Fatalf("Update: %v", err)
 		}
+		if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5))); !got.Delegated() {
+			t.Errorf("expected a decline, got authID %q", got.AuthID)
+		}
+	})
+
+	t.Run("state priority switch off", func(t *testing.T) {
+		h := newHarness(t, settings.StrategyRespectCPAPriority)
+		h.bind(t, "a", "gpt-5-codex")
+
+		// Everything else is on: only the routing switch is off.
+		off := false
+		if _, err := h.settings.Update(ctx, settings.Patch{StatePriorityEnabled: &off}); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
 
 		got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5)))
-		if !got.Delegate {
-			t.Errorf("Delegate = false (authID %q), want true when the master switch is off", got.AuthID)
+		if !got.Delegated() {
+			t.Errorf("routing must not interfere while state_priority_enabled is off, got %q", got.AuthID)
+		}
+		if got.Handled {
+			t.Error("Handled must be false when the plugin declines")
+		}
+	})
+
+	t.Run("state priority off still allows injection", func(t *testing.T) {
+		h := newHarness(t, settings.StrategyRespectCPAPriority)
+		h.bind(t, "a", "gpt-5-codex")
+
+		off := false
+		if _, err := h.settings.Update(ctx, settings.Patch{StatePriorityEnabled: &off}); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		caps := h.settings.Current().Capabilities()
+		if !caps.Inject {
+			t.Error("turning off routing must not stop state injection")
+		}
+		if caps.Route {
+			t.Error("Route should be false with the switch off")
 		}
 	})
 
@@ -203,8 +253,33 @@ func TestDecide_DelegatesWhenNothingToGain(t *testing.T) {
 
 		req := codexRequest("gpt-5-codex", candidate("a", 5))
 		req.Provider = "anthropic"
-		if got := h.scheduler.Decide(ctx, req); !got.Delegate {
-			t.Error("expected delegation for a non-codex provider")
+		req.Providers = []string{"anthropic"}
+		if got := h.scheduler.Decide(ctx, req); !got.Delegated() {
+			t.Error("expected a decline for a non-codex provider")
+		}
+	})
+
+	t.Run("mixed route containing a non-codex provider", func(t *testing.T) {
+		h := newHarness(t, settings.StrategyRespectCPAPriority)
+		h.bind(t, "a", "gpt-5-codex")
+
+		req := codexRequest("gpt-5-codex", candidate("a", 5))
+		req.Provider = ""
+		req.Providers = []string{"codex", "anthropic"}
+		if got := h.scheduler.Decide(ctx, req); !got.Delegated() {
+			t.Error("a mixed route must not be steered")
+		}
+	})
+
+	t.Run("codex-only mixed route is fine", func(t *testing.T) {
+		h := newHarness(t, settings.StrategyRespectCPAPriority)
+		h.bind(t, "a", "gpt-5-codex")
+
+		req := codexRequest("gpt-5-codex", candidate("a", 5))
+		req.Provider = ""
+		req.Providers = []string{"codex"}
+		if got := h.scheduler.Decide(ctx, req); got.Delegated() {
+			t.Error("a codex-only route should still be steerable")
 		}
 	})
 
@@ -212,24 +287,23 @@ func TestDecide_DelegatesWhenNothingToGain(t *testing.T) {
 		h := newHarness(t, settings.StrategyRespectCPAPriority)
 		h.bind(t, "a", "some-other-model")
 
-		if got := h.scheduler.Decide(ctx, codexRequest("some-other-model", candidate("a", 5))); !got.Delegate {
-			t.Error("expected delegation for a model outside turn-state handling")
+		if got := h.scheduler.Decide(ctx, codexRequest("some-other-model", candidate("a", 5))); !got.Delegated() {
+			t.Error("expected a decline for a model outside turn-state handling")
 		}
 	})
 
 	t.Run("no candidates", func(t *testing.T) {
 		h := newHarness(t, settings.StrategyRespectCPAPriority)
-		if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex")); !got.Delegate {
-			t.Error("expected delegation with no candidates")
+		if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex")); !got.Delegated() {
+			t.Error("expected a decline with no candidates")
 		}
 	})
 
 	t.Run("no candidate holds state", func(t *testing.T) {
 		h := newHarness(t, settings.StrategyRespectCPAPriority)
-		got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex",
-			candidate("a", 5), candidate("b", 5)))
-		if !got.Delegate {
-			t.Errorf("Delegate = false (authID %q), want true when no candidate has state", got.AuthID)
+		got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5), candidate("b", 5)))
+		if !got.Delegated() {
+			t.Errorf("expected a decline, got authID %q", got.AuthID)
 		}
 	})
 
@@ -238,8 +312,20 @@ func TestDecide_DelegatesWhenNothingToGain(t *testing.T) {
 		h.bind(t, "a", "gpt-5-codex")
 		*h.clock = h.clock.Add(2 * time.Hour)
 
-		if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5))); !got.Delegate {
-			t.Error("expected delegation once the only binding has expired")
+		if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5))); !got.Delegated() {
+			t.Error("expected a decline once the only binding has expired")
+		}
+	})
+
+	t.Run("unresolvable candidate id is not preferred", func(t *testing.T) {
+		h := newHarness(t, settings.StrategyRespectCPAPriority)
+		h.bind(t, "a", "gpt-5-codex")
+
+		// The host offers an account the plugin cannot map to a persistence
+		// key, so it has no binding it can trust.
+		stranger := hostapi.Candidate{ID: "auth-id-unknown", Priority: 9}
+		if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", stranger)); !got.Delegated() {
+			t.Error("expected a decline when no candidate resolves to a known account")
 		}
 	})
 }
@@ -247,39 +333,45 @@ func TestDecide_DelegatesWhenNothingToGain(t *testing.T) {
 // ---------------------------------------------------------------------------
 // respect_cpa_priority
 
-// TestDecide_RespectPriorityStaysInTheTopBucket pins the interpretation that a
-// state-holding account outside CPA's top priority bucket is not reached for:
-// honouring CPA's ordering is worth more than steering the request.
-func TestDecide_RespectPriorityStaysInTheTopBucket(t *testing.T) {
+// TestDecide_RespectPriorityRestrictsToTopTier pins that the plugin applies the
+// tier policy itself. It declares SchedulerAcrossPriorities at registration, so
+// the host no longer pre-filters the candidate list -- if the plugin did not do
+// this, "respect CPA priority" would silently stop respecting anything.
+func TestDecide_RespectPriorityRestrictsToTopTier(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, settings.StrategyRespectCPAPriority)
 
-	// Only the low-priority account holds state.
+	// Only the low-priority account holds state, but the candidates now span
+	// every tier.
 	h.bind(t, "low", "gpt-5-codex")
+	h.scheduler = newSchedulerWithAuth(t, h, authMap{"auth-id-high": "high", "auth-id-low": "low"})
 
-	req := codexRequest("gpt-5-codex", candidate("high", 10), candidate("low", 1))
-	if got := h.scheduler.Decide(ctx, req); !got.Delegate {
-		t.Errorf("Delegate = false (authID %q); want delegation rather than reaching past the top bucket", got.AuthID)
+	req := codexRequest("gpt-5-codex",
+		hostapi.Candidate{ID: "auth-id-high", Priority: 10},
+		hostapi.Candidate{ID: "auth-id-low", Priority: 1},
+	)
+	if got := h.scheduler.Decide(ctx, req); !got.Delegated() {
+		t.Errorf("expected a decline rather than reaching past the top tier, got %q", got.AuthID)
 	}
 }
 
-func TestDecide_RespectPriorityPicksWithinTopBucket(t *testing.T) {
+func TestDecide_RespectPriorityPicksWithinTopTier(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, settings.StrategyRespectCPAPriority)
 
-	h.bind(t, "high-a", "gpt-5-codex")
-	h.bind(t, "high-b", "gpt-5-codex")
-	h.bind(t, "low", "gpt-5-codex")
+	h.bind(t, "a", "gpt-5-codex")
+	h.bind(t, "b", "gpt-5-codex")
+	h.bind(t, "c", "gpt-5-codex")
 
 	req := codexRequest("gpt-5-codex",
-		candidate("high-a", 10), candidate("high-b", 10), candidate("low", 1))
+		candidate("a", 10), candidate("b", 10), candidate("c", 1))
 
 	got := h.scheduler.Decide(ctx, req)
-	if got.Delegate {
+	if got.Delegated() {
 		t.Fatal("expected the plugin to choose an account")
 	}
-	if got.AuthID != "auth-id-high-a" && got.AuthID != "auth-id-high-b" {
-		t.Errorf("chose %q, want a state-holding account from the top bucket", got.AuthID)
+	if got.AuthID != "auth-id-a" && got.AuthID != "auth-id-b" {
+		t.Errorf("chose %q, want a state-holding account from the top tier", got.AuthID)
 	}
 }
 
@@ -295,8 +387,8 @@ func TestDecide_RoundRobinsAcrossEligibleAccounts(t *testing.T) {
 	seen := map[string]int{}
 	for i := 0; i < 4; i++ {
 		got := h.scheduler.Decide(ctx, req)
-		if got.Delegate {
-			t.Fatalf("iteration %d: unexpected delegation", i)
+		if got.Delegated() {
+			t.Fatalf("iteration %d: unexpected decline", i)
 		}
 		seen[got.AuthID]++
 		*h.clock = h.clock.Add(time.Second)
@@ -311,18 +403,21 @@ func TestDecide_RoundRobinsAcrossEligibleAccounts(t *testing.T) {
 // ---------------------------------------------------------------------------
 // state_first
 
-func TestDecide_StateFirstReachesAcrossBuckets(t *testing.T) {
+func TestDecide_StateFirstReachesAcrossTiers(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, settings.StrategyStateFirst)
 
-	// Only the low-priority account holds state, but under state_first it is
-	// still preferred.
+	// Only the low-priority account holds state, but under state_first it wins.
 	h.bind(t, "low", "gpt-5-codex")
+	h.scheduler = newSchedulerWithAuth(t, h, authMap{"auth-id-high": "high", "auth-id-low": "low"})
 
-	req := codexRequest("gpt-5-codex", candidate("high", 10), candidate("low", 1))
+	req := codexRequest("gpt-5-codex",
+		hostapi.Candidate{ID: "auth-id-high", Priority: 10},
+		hostapi.Candidate{ID: "auth-id-low", Priority: 1},
+	)
 	got := h.scheduler.Decide(ctx, req)
-	if got.Delegate {
-		t.Fatal("state_first should choose the state-holding account across buckets")
+	if got.Delegated() {
+		t.Fatal("state_first should choose the state-holding account across tiers")
 	}
 	if got.AuthID != "auth-id-low" {
 		t.Errorf("chose %q, want auth-id-low", got.AuthID)
@@ -338,13 +433,12 @@ func TestDecide_StateFirstStillPrefersHigherPriority(t *testing.T) {
 
 	req := codexRequest("gpt-5-codex", candidate("b", 9), candidate("a", 2))
 
-	// Both hold state, so priority decides which bucket is eligible; with a
-	// single account in the top bucket, it should be chosen every time -- the
+	// Both hold state, so priority decides which tier is eligible; the
 	// lower-priority account must not jump in just because it is unused.
 	for i := 0; i < 3; i++ {
 		got := h.scheduler.Decide(ctx, req)
-		if got.Delegate {
-			t.Fatalf("iteration %d: unexpected delegation", i)
+		if got.Delegated() {
+			t.Fatalf("iteration %d: unexpected decline", i)
 		}
 		if got.AuthID != "auth-id-b" {
 			t.Errorf("chose %q, want auth-id-b (higher priority)", got.AuthID)
@@ -353,7 +447,7 @@ func TestDecide_StateFirstStillPrefersHigherPriority(t *testing.T) {
 	}
 }
 
-func TestDecide_StateFirstRoundRobinsWithinTopBucket(t *testing.T) {
+func TestDecide_StateFirstRoundRobinsWithinTopTier(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, settings.StrategyStateFirst)
 
@@ -361,15 +455,14 @@ func TestDecide_StateFirstRoundRobinsWithinTopBucket(t *testing.T) {
 	h.bind(t, "b", "gpt-5-codex")
 	h.bind(t, "c", "gpt-5-codex")
 
-	// a and b share the top bucket; c is lower and must be excluded.
 	req := codexRequest("gpt-5-codex",
 		candidate("a", 7), candidate("b", 7), candidate("c", 1))
 
 	seen := map[string]int{}
 	for i := 0; i < 4; i++ {
 		got := h.scheduler.Decide(ctx, req)
-		if got.Delegate {
-			t.Fatalf("iteration %d: unexpected delegation", i)
+		if got.Delegated() {
+			t.Fatalf("iteration %d: unexpected decline", i)
 		}
 		seen[got.AuthID]++
 		*h.clock = h.clock.Add(time.Second)
@@ -379,7 +472,7 @@ func TestDecide_StateFirstRoundRobinsWithinTopBucket(t *testing.T) {
 		t.Errorf("distribution = %v, want the lower-priority account left out", seen)
 	}
 	if seen["auth-id-a"] != 2 || seen["auth-id-b"] != 2 {
-		t.Errorf("distribution = %v, want an even split across the top bucket", seen)
+		t.Errorf("distribution = %v, want an even split across the top tier", seen)
 	}
 }
 
@@ -388,11 +481,10 @@ func TestDecide_RefreshDueStateIsStillUsable(t *testing.T) {
 	h := newHarness(t, settings.StrategyRespectCPAPriority)
 	h.bind(t, "a", "gpt-5-codex")
 
-	// Move into the refresh window: still valid, so still worth steering to.
+	// Into the refresh window: still valid, so still worth steering to.
 	*h.clock = h.clock.Add(55 * time.Minute)
 
-	got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5)))
-	if got.Delegate {
+	if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5))); got.Delegated() {
 		t.Error("a refresh_due binding is still usable and should be preferred")
 	}
 }
@@ -402,10 +494,25 @@ func TestDecide_PersistsCursorForRestartStability(t *testing.T) {
 	h := newHarness(t, settings.StrategyRespectCPAPriority)
 	h.bind(t, "a", "gpt-5-codex")
 
-	if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5))); got.Delegate {
-		t.Fatal("unexpected delegation")
+	if got := h.scheduler.Decide(ctx, codexRequest("gpt-5-codex", candidate("a", 5))); got.Delegated() {
+		t.Fatal("unexpected decline")
 	}
 	if _, ok, _ := h.cursors.LastUsed(ctx, "a"); !ok {
 		t.Error("the chosen account's cursor was not persisted")
 	}
+}
+
+// newSchedulerWithAuth rebuilds a harness scheduler with a different auth map,
+// so a test can control which host ids resolve.
+func newSchedulerWithAuth(t *testing.T, h *harness, auth AuthResolver) *Scheduler {
+	t.Helper()
+	s := NewScheduler(SchedulerConfig{
+		Settings: h.settings,
+		States:   h.states,
+		Cursors:  h.cursors,
+		Models:   fixedModels{enabled: map[string]bool{"gpt-5-codex": true}},
+		Auth:     auth,
+	})
+	s.SetClock(func() time.Time { return *h.clock })
+	return s
 }

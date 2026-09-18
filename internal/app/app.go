@@ -168,13 +168,14 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 
 	a.corr = intercept.NewCorrelationManager(intercept.DefaultCorrelationTTL)
 	a.injector = intercept.NewInjector(intercept.InjectorConfig{
-		Settings: a.settings, States: a.states, Auth: a.accounts, Corr: a.corr, Log: logf,
+		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf,
 	})
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
 		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf,
 	})
 	a.router = routing.NewScheduler(routing.SchedulerConfig{
-		Settings: a.settings, States: a.states, Cursors: db.Cursors(), Models: a, Log: logf,
+		Settings: a.settings, States: a.states, Cursors: db.Cursors(),
+		Models: a, Auth: a.accounts, Log: logf,
 	})
 
 	a.api = management.New(a)

@@ -52,15 +52,20 @@ func newManager(t *testing.T) (*Manager, *fakeStore) {
 	return m, store
 }
 
-// TestCapabilities_SwitchMatrix pins the five combinations in design doc 3.3.
-// This is the single definition of the switch semantics; every runtime call
-// site derives its behaviour from here.
+// TestCapabilities_SwitchMatrix pins the switch semantics. This is the single
+// definition of which runtime behaviours are active; every call site derives
+// its behaviour from here.
+//
+// Route is the odd one out: injection is gated by the master switch alone,
+// while routing additionally requires state_priority_enabled, because steering
+// the host's account choice is more invasive than rewriting a header.
 func TestCapabilities_SwitchMatrix(t *testing.T) {
 	cases := []struct {
 		name    string
 		master  bool
 		probe   bool
 		reverse bool
+		routing bool
 
 		wantProbe   bool
 		wantInject  bool
@@ -68,33 +73,38 @@ func TestCapabilities_SwitchMatrix(t *testing.T) {
 		wantRoute   bool
 	}{
 		{
-			name:   "all on (default): both channels active",
-			master: true, probe: true, reverse: true,
+			name:   "everything on",
+			master: true, probe: true, reverse: true, routing: true,
 			wantProbe: true, wantInject: true, wantCapture: true, wantRoute: true,
 		},
 		{
 			name:   "probe only: traffic capture forbidden",
-			master: true, probe: true, reverse: false,
+			master: true, probe: true, reverse: false, routing: true,
 			wantProbe: true, wantInject: true, wantCapture: false, wantRoute: true,
 		},
 		{
 			name:   "reverse bind only: state accumulates from traffic",
-			master: true, probe: false, reverse: true,
+			master: true, probe: false, reverse: true, routing: true,
 			wantProbe: false, wantInject: true, wantCapture: true, wantRoute: true,
 		},
 		{
-			name:   "both sub-switches off: held state is still served",
-			master: true, probe: false, reverse: false,
-			wantProbe: false, wantInject: true, wantCapture: false, wantRoute: true,
+			name:   "all sub-switches off: held state is still served",
+			master: true, probe: false, reverse: false, routing: false,
+			wantProbe: false, wantInject: true, wantCapture: false, wantRoute: false,
 		},
 		{
-			name:   "master off: all four capabilities bypassed",
-			master: false, probe: true, reverse: true,
+			name:   "routing off alone: injection is untouched",
+			master: true, probe: true, reverse: true, routing: false,
+			wantProbe: true, wantInject: true, wantCapture: true, wantRoute: false,
+		},
+		{
+			name:   "master off bypasses everything",
+			master: false, probe: true, reverse: true, routing: true,
 			wantProbe: false, wantInject: false, wantCapture: false, wantRoute: false,
 		},
 		{
-			name:   "master off wins over every combination",
-			master: false, probe: false, reverse: false,
+			name:   "master off wins over every sub-switch",
+			master: false, probe: false, reverse: false, routing: false,
 			wantProbe: false, wantInject: false, wantCapture: false, wantRoute: false,
 		},
 	}
@@ -105,6 +115,7 @@ func TestCapabilities_SwitchMatrix(t *testing.T) {
 				GlobalEnabled:            tc.master,
 				GlobalProbeEnabled:       tc.probe,
 				GlobalReverseBindEnabled: tc.reverse,
+				StatePriorityEnabled:     tc.routing,
 			}
 			got := v.Capabilities()
 
@@ -138,6 +149,7 @@ func TestDefaults_MatchDocumentedValues(t *testing.T) {
 		{"global_enabled", d.GlobalEnabled, true},
 		{"global_probe_enabled", d.GlobalProbeEnabled, true},
 		{"global_reverse_bind_enabled", d.GlobalReverseBindEnabled, true},
+		{"state_priority_enabled", d.StatePriorityEnabled, true},
 		{"scan_interval", d.ScanInterval, 60 * time.Second},
 		{"probe_concurrency", d.ProbeConcurrency, 2},
 		{"state_ttl", d.StateTTL, 60 * time.Minute},
