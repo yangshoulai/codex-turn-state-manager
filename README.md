@@ -72,20 +72,30 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 |:--:|---|
 | 0 | **已在 CPA v7.3.7 容器中验证**：共享库加载成功、注册被接受、能力声明生效、Management API 可达（`make cpa-docker-up`）。**仍差真实流量驱动**——环境里没有 Codex 账号，拦截器/调度器/响应捕获从未被真实请求触发过。 |
 | 1 | 仅差「可被 CPA 加载」这一条，见 #0。 |
-| 5 | correlation 机制已整体移除（CPA 在 `Metadata` 里直接给出选中账号），单测完整。剩余缺口是真实环境中的回调时序确认，随 #0 一并验证。 |
+| 5 | **请求注入已在真实流量上验证**：经 CPA 的请求确实带上了注入的头，`unresolvedAuth` 与 `noBinding` 均为 0。**反向绑定在这条路径上不生效**——实测响应到达插件时有 28 个响应头，其中没有 `X-Codex-Turn-State`；响应头 map 非空、插件读取无误，是上游不在这条链路返回它。已按运维决定接受为已知限制（它是降低探测频率的优化，非核心能力）。详见设计文档 §10.12。 |
 | 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行。 |
 | 9 | 路由已改为查询参数形式并全部注册，`internal/management` 内**已无 0% 覆盖率的端点**；Management API 与面板静态资源均已在真实 CPA v7.3.7 中验证可达。仍缺的是**在浏览器里实际点击验证交互**。 |
-| 11 | API 侧（探测历史查询、代理健康统计）已完成并有测试；可视化部分随 #9 一并验证。 |
+| 11 | API 侧（探测历史查询、代理健康统计、请求管道计数、上游套餐与额度）已完成并在真实实例中验证；可视化部分随 #9 一并验证。 |
 
 ### 关于第 0 项
 
 #0 不在设计文档 §6.1 的计划表内，是框架落地后暴露出来的前置项，也是当前唯一的阻塞点：它直接卡住 #1、#5、#8 的最终验收。设计文档 §8「关键技术验证清单」的 12 项验证应当在这一步内完成。
 
+### 已验证的核心闭环
+
+```
+探测   SUCCESS_TARGET  len=292  经代理直连上游        ✅ 真实实例
+绑定   写入 SQLite → 内存快照 → 排定 TTL×85% 退避     ✅
+注入   经 CPA 的请求带上注入头，账号识别无误           ✅ 真实流量
+观测   请求管道计数（注入/捕获/账号未知/自愈）          ✅
+账号   套餐与额度取自上游响应头                        ✅ 真实流量
+```
+
 ### 建议的推进顺序
 
-1. **#0 真实流量驱动**——加载、注册、管理 API、面板资源都已在真实 CPA v7.3.7 中验证；剩下的是让拦截器与调度器被真实请求触发（需要环境里有一个 Codex 账号）。
-2. **#9、#11 收口**——面板在浏览器里点一遍。
-3. **#5、#8 收口**——随 #0 的真实流量验证一并完成。
+1. **#9 面板浏览器实测**——功能与数据都已就位，剩下是交互层面的收尾。
+2. **#11 可观测性收尾**——随 #9 一并完成。
+3. **#8 调度干预的真实验证**——需要多账号环境才能体现「优先选择持有 State 的账号」。
 
 ---
 
@@ -243,6 +253,14 @@ DELETE /bindings/{authIndex}/{model}/history
 GET    /proxy-nodes                       PUT /proxy-nodes
 GET    /probe-history?limit=50
 ```
+
+`GET /status` also reports `pipeline`: counters for requests reaching the
+injection stage, injections performed, accounts that could not be resolved,
+bindings missing, state captured from traffic, and self-healing invalidations.
+A header rewrite leaves no other trace, so these are how "is the plugin actually
+doing anything?" gets answered without logging every request. The same payload
+carries `lastHeaderInit`, a snapshot of what the most recent response actually
+carried — which is how the reverse-bind limitation above was established.
 
 The panel's own assets are served from `/v0/resource/plugins/codex-turn-state-manager/`,
 which bypasses management auth. Note the entry point is `/index.html`, not the bare

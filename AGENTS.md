@@ -348,13 +348,27 @@ records each one with its evidence. Only one item is still genuinely unverified.
   the 292-length value, published it to the in-memory snapshot, and scheduled
   the next attempt at TTL x 85%.
 
+- **Request injection**, on live traffic: requests routed through CPA carried the
+  injected header, with no account-unresolved or missing-binding cases.
+
+**Known limitation — reverse bind does nothing on this path.** The response
+reaches the plugin with 28 headers and `X-Codex-Turn-State` is not among them, so
+ordinary traffic cannot renew a binding. This was established by measurement, not
+inference: the header map is not empty and the plugin's reading is not at fault.
+Active probing does receive the token, so the difference lies in request shape --
+a probe is a minimal direct request, while business traffic is a translated turn.
+Accepted as a limitation: reverse bind is an optimisation that lowers probe
+frequency, not a core capability. Do not treat `captured: 0` in the panel as a
+bug without re-reading this.
+
+The same responses do carry `X-Codex-Plan-Type` and the `X-Codex-Primary-*` /
+`X-Codex-Secondary-*` rate-limit windows, which CPA never exposes to plugins.
+They are read on the traffic path only -- a probe's request does not elicit them.
+
 **Still unverified — do not present as working:**
 
-- **Request interception and traffic capture.** No request has yet been routed
-  through CPA's `/v1/responses` with a binding in place, so `request.intercept_after`
-  injecting the header, and the response stage harvesting state from ordinary
-  traffic, remain unexercised. Those are the paths that affect live user
-  traffic, so they matter more than anything already proven here.
+- **Self-healing under real failure.** `ObserveCompletion` is exercised by tests,
+  but no live request has failed in a way that triggers invalidation.
 Three host behaviours that cost debugging time, all of which fail silently from
 the plugin's side and none of which are visible without a real instance:
 
