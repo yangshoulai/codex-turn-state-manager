@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codex-turn-state-manager",
+      "name": "Codex Turn State",
+      "description": "Probes, binds and injects X-Codex-Turn-State per (Codex account, model) for more stable upstream routing, with a probe scheduler, proxy pool, account health gating and an embedded management panel. Experimental: it relies on upstream behaviour that is not documented as supported.",
+      "author": "yangshoulai",
+      "version": "0.1.0",
+      "repository": "https://github.com/yangshoulai/codex-turn-state-manager",
+      "homepage": "https://github.com/yangshoulai/codex-turn-state-manager",
+      "tags": [
+        "Codex",
+        "Routing",
+        "Scheduler",
+        "Management"
+      ]
+    }
+  ]
+}

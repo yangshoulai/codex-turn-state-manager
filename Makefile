@@ -10,10 +10,19 @@ PLUGIN_NAME := codex-turn-state-manager
 export CGO_ENABLED := 1
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# The host rejects a plugin version beginning with "v"
+# (pluginhost.validPluginVersion), and the store builds the artifact name from
+# the bare version, so a release tag's prefix is stripped for the build. Without
+# this, tagging v0.1.0 would register the plugin as "v0.1.0" and be refused.
+#
+# override, not a plain assignment: a command-line VERSION wins over the
+# makefile, which would let `make ... VERSION=v0.1.0` through with the prefix
+# intact and name the archive differently from the registered version.
+override VERSION := $(patsubst v%,%,$(VERSION))
 LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-shared build-dev build-linux test test-race vet fmt lint tidy clean run db-shell cpa-docker-up cpa-docker-down cpa-docker-logs
+.PHONY: help build build-shared build-dev build-linux release-archive test test-race vet fmt lint tidy clean run db-shell cpa-docker-up cpa-docker-down cpa-docker-logs
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -36,6 +45,31 @@ build-dev: ## Build the standalone development harness
 
 build: build-dev build-shared ## Build both the harness and the shared library
 
+# --- Plugin store release ---------------------------------------------------
+#
+# Produces the archive the plugin store installs, for the machine running make.
+# The matrix in .github/workflows/release.yml calls this on each target runner:
+# c-shared cannot be cross-compiled, so there is one native build per platform.
+
+RELEASE_DIR := dist/release
+
+release-archive: ## Build and package the store archive for the host platform
+	@mkdir -p $(BIN_DIR)
+	@case "$$(go env GOOS)" in \
+		darwin) ext=dylib ;; \
+		windows) ext=dll ;; \
+		*) ext=so ;; \
+	esac; \
+	lib=$(BIN_DIR)/$(PLUGIN_NAME)-v$(VERSION).$$ext; \
+	go build -buildmode=c-shared -tags cshared -trimpath -ldflags "$(LDFLAGS)" \
+		-o $$lib ./cmd/plugin && \
+	go run ./cmd/release-archive \
+		-lib $$lib \
+		-version "$(VERSION)" \
+		-goos "$$(go env GOOS)" \
+		-goarch "$$(go env GOARCH)" \
+		-out $(RELEASE_DIR)
+
 run: ## Run the development harness (mock host + local management API/UI)
 	@# $(ARGS) goes last so it can override the defaults above; Go's flag
 	@# package lets the later occurrence win.
@@ -56,8 +90,9 @@ build-linux: ## Build the C-ABI plugin for linux ($(DOCKER_PLATFORM))
 		-v "$$HOME/go/pkg/mod":/go/pkg/mod \
 		-e GOFLAGS=-mod=mod -e CGO_ENABLED=1 \
 		golang:1.26-bookworm \
-		go build -buildmode=c-shared -tags cshared -o $(PLUGIN_SO) ./cmd/plugin
-	@echo "built $(PLUGIN_SO)"
+		go build -buildmode=c-shared -tags cshared -trimpath -ldflags "$(LDFLAGS)" \
+			-o $(PLUGIN_SO) ./cmd/plugin
+	@echo "built $(PLUGIN_SO) ($(VERSION))"
 
 cpa-docker-up: build-linux ## Build for linux and start a throwaway CPA with the plugin loaded
 	docker rm -f cpa-plugin-test >/dev/null 2>&1 || true

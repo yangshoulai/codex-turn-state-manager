@@ -165,6 +165,73 @@ make fmt
 
 ---
 
+## Install from the plugin store
+
+CPA's plugin store reads a `registry.json` and installs from the releases it
+points at. Add this repository's registry as an extra source in CPA's config:
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/yangshoulai/codex-turn-state-manager/main/registry.json"
+```
+
+The plugin then appears in the store and installs in one step, landing at
+`plugins/<goos>/<goarch>/codex-turn-state-manager-v<version>.so`. The store
+writes the manifest back into `plugins.configs.codex-turn-state-manager.store`
+so it can offer updates later.
+
+The official registry is always included; `store-sources` only adds to it.
+
+## Release
+
+Publishing a release is what makes the plugin installable — nothing is uploaded
+by hand. Push a version tag and the workflow does the rest:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then builds one archive per platform, generates
+`checksums.txt`, and creates the GitHub release. `workflow_dispatch` reruns a
+release for an existing tag and replaces its assets.
+
+**The artifact naming is a contract, not a convention.** CLIProxyAPI looks up one
+exact asset name and rejects an archive that does not match, so all of this is
+enforced by `make release-archive` before anything is published:
+
+| Rule | Value |
+|---|---|
+| Archive name | `codex-turn-state-manager_<version>_<goos>_<goarch>.zip` |
+| Version | the tag without its `v` — `v0.1.0` publishes `0.1.0` |
+| Contents | exactly one dynamic library, at the archive root, named `codex-turn-state-manager<ext>` or `codex-turn-state-manager-v<version><ext>` |
+| Checksums | `checksums.txt` in the same release, sha256 of the **archive** |
+| Installed to | `plugins/<goos>/<goarch>/codex-turn-state-manager-v<version>.so` |
+
+Platforms built: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64,
+windows/amd64. `c-shared` cannot be cross-compiled by setting `GOOS` alone, so
+each entry in the workflow matrix builds natively — both macOS architectures come
+from one runner because Apple's toolchain is a cross-compiler. Adding a platform
+is one entry in `matrix.include`; the archive name follows automatically.
+
+`make release-archive` builds for the machine running it, so it needs a real
+version: pass `VERSION=` when the working tree is not on a tag.
+
+### The registry entry
+
+[`registry.json`](./registry.json) describes the plugin. It omits `install`,
+which means `github-release`: the store reads this repository's latest release
+and derives the version from its tag. Keeping a `version` in the file too is a
+display fallback — the release tag is authoritative.
+
+A `direct` install type is also supported if you would rather host artifacts
+somewhere other than GitHub Releases; it pins an explicit URL and sha256 per
+platform instead.
+
+---
+
 ## How it works
 
 ```

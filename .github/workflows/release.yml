@@ -1,0 +1,131 @@
+name: Release
+
+# Publishing a release is what makes the plugin installable: the store resolves
+# this repository's latest release, then downloads the asset named
+# <id>_<version>_<goos>_<goarch>.zip together with checksums.txt. Nothing is
+# uploaded by hand.
+#
+# The platform list is data, not logic: to support another target, add an entry
+# to matrix.include and the archive name follows. The runner must be able to
+# build natively -- c-shared cannot be cross-compiled by setting GOOS alone.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release for, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A platform that cannot build must not stop the others from shipping:
+      # every archive is independent, and a missing one fails only the users of
+      # that platform (with a clear "release asset not found").
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          # Apple's toolchain is a cross-compiler, so one runner covers both
+          # macOS architectures -- verified, not assumed.
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git describe reads the tag, and checkout is shallow by default.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # make owns the build so the release cannot drift from what a developer
+      # gets locally. The tag is passed through explicitly because VERSION's
+      # default comes from git describe, which a workflow_dispatch run on a
+      # branch would resolve to a commit hash rather than a version.
+      - name: Package archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: make release-archive VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/release/*.zip
+          # A leg that built nothing is a failure, not an empty success.
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Runs even when some platform failed, so a partial matrix still publishes.
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Assemble checksums.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "no archives were built; refusing to publish an empty release" >&2
+            exit 1
+          fi
+          # sha256sum output is what the installer's ParseChecksums reads. The
+          # digest covers the archive, not the library inside it, and the
+          # filenames must match the assets exactly -- run from this directory
+          # so no path prefix is recorded.
+          ls -1 *.zip | sort | xargs sha256sum > checksums.txt
+          echo "publishing:"
+          cat checksums.txt
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-running a release must replace assets, not fail on them.
+            gh release upload "$TAG" artifacts/*.zip artifacts/checksums.txt --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              artifacts/*.zip artifacts/checksums.txt
+          fi
