@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -350,23 +349,4 @@ func (e *Executor) log(level hostapi.LogLevel, msg string, fields map[string]any
 	if e.host != nil {
 		e.host.Log(level, msg, fields)
 	}
-}
-
-// IsProxyFaultError reports whether a transport error looks like a genuine
-// proxy fault. Exposed for tests and diagnostics.
-func IsProxyFaultError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{"proxyconnect", "connection refused", "no such host", "tls", "certificate"} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
 }

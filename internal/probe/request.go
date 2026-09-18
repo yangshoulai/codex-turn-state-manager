@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -116,12 +115,16 @@ func newProxyClient(proxyURL string, timeout time.Duration) (*http.Client, error
 	}, nil
 }
 
-// closeBody drains and closes a response body. Draining lets the transport
-// reuse the connection, which matters when a probe abandons a live SSE stream.
+// closeBody abandons a response body without waiting for it.
+//
+// Deliberately no drain: the response is usually a live SSE stream, and
+// reading even a bounded prefix would block until upstream sent those bytes or
+// closed the stream -- holding a probe concurrency slot for the whole turn.
+// Design doc 3.6 requires reading the headers and then closing immediately, so
+// the connection is sacrificed rather than reused.
 func closeBody(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
 }

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -331,3 +332,464 @@ func proxiesFixture(id string) proxies.Node {
 }
 
 func intPtr(v int) *int { return &v }
+
+// ---------------------------------------------------------------------------
+// binding management endpoints (design doc 5.4 / 5.5)
+
+// bindingAPI drives the binding endpoints against a running app.
+type bindingAPI struct {
+	t    *testing.T
+	base string
+}
+
+func (b *bindingAPI) do(method, path string) (int, []byte) {
+	b.t.Helper()
+	req, err := http.NewRequest(method, b.base+path, nil)
+	if err != nil {
+		b.t.Fatalf("build %s %s: %v", method, path, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		b.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		b.t.Fatalf("read %s %s: %v", method, path, err)
+	}
+	return resp.StatusCode, body
+}
+
+func (b *bindingAPI) history() []map[string]any {
+	b.t.Helper()
+	code, body := b.do(http.MethodGet, "/bindings/codex-auth-1/gpt-5-codex/history")
+	if code != http.StatusOK {
+		b.t.Fatalf("GET history = %d (%s)", code, body)
+	}
+	var payload struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		b.t.Fatalf("decode history: %v", err)
+	}
+	return payload.History
+}
+
+func (b *bindingAPI) bindingCount() int {
+	b.t.Helper()
+	code, body := b.do(http.MethodGet, "/bindings")
+	if code != http.StatusOK {
+		b.t.Fatalf("GET bindings = %d (%s)", code, body)
+	}
+	var payload struct {
+		Bindings []map[string]any `json:"bindings"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		b.t.Fatalf("decode bindings: %v", err)
+	}
+	return len(payload.Bindings)
+}
+
+// TestApp_DeleteBindingEndpoint covers the manual delete: it must remove the
+// binding, leave a 'deleted' trail in history, and bring the next probe forward
+// rather than leaving the pair waiting out its old backoff.
+func TestApp_DeleteBindingEndpoint(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	first := strings.Repeat("a", targetLength)
+	second := strings.Repeat("b", targetLength)
+
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: pair, StateValue: first, Source: states.SourceProbe, ProxyID: "p1",
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: pair, StateValue: second, Source: states.SourceTraffic,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	if got := api.bindingCount(); got != 1 {
+		t.Fatalf("bindings = %d, want 1", got)
+	}
+
+	// Deleting a binding is an operator saying "this value is wrong", so the
+	// pair must become due immediately. ProbeNow is what the handler calls; the
+	// zero time is how "due now" is represented.
+	a.ProbeScheduler().ProbeNow(pair)
+	if at, ok := a.ProbeScheduler().NextProbeAt(pair); !ok || !at.IsZero() {
+		t.Fatalf("ProbeNow did not clear the backoff: %v (ok=%v)", at, ok)
+	}
+
+	code, body := api.do(http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex")
+	if code != http.StatusOK {
+		t.Fatalf("DELETE binding = %d (%s)", code, body)
+	}
+
+	if got := api.bindingCount(); got != 0 {
+		t.Errorf("bindings after delete = %d, want 0", got)
+	}
+	if _, status := a.States().Lookup(pair.AuthIndex, pair.Model); status != states.StatusMissing {
+		t.Errorf("status after delete = %s, want missing", status)
+	}
+
+	// The deleted value is retained in history so the panel can show what was
+	// removed, together with the two binds that preceded it.
+	history := api.history()
+	if len(history) != 3 {
+		t.Fatalf("history rows = %d, want 3 (bound, replaced, deleted)", len(history))
+	}
+	if history[0]["action"] != "deleted" {
+		t.Errorf("newest action = %v, want deleted", history[0]["action"])
+	}
+	if history[0]["source"] != "manual" {
+		t.Errorf("delete source = %v, want manual", history[0]["source"])
+	}
+	if history[1]["action"] != "replaced" {
+		t.Errorf("second action = %v, want replaced", history[1]["action"])
+	}
+	if history[2]["action"] != "bound" {
+		t.Errorf("oldest action = %v, want bound", history[2]["action"])
+	}
+}
+
+// TestApp_BindingHistoryEndpoint covers the history read, including that the
+// full state value is only returned when it is asked for explicitly.
+func TestApp_BindingHistoryEndpoint(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	secret := strings.Repeat("z", targetLength)
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: pair, StateValue: secret, Source: states.SourceProbe, ProxyID: "p1",
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	history := api.history()
+	if len(history) != 1 {
+		t.Fatalf("history rows = %d, want 1", len(history))
+	}
+	entry := history[0]
+
+	if entry["statePrefix"] != secret[:8] {
+		t.Errorf("statePrefix = %v, want %q", entry["statePrefix"], secret[:8])
+	}
+	if _, present := entry["stateValue"]; present {
+		t.Error("the history endpoint returned a full state value without expand=1")
+	}
+	if entry["stateLength"] != float64(targetLength) {
+		t.Errorf("stateLength = %v, want %d", entry["stateLength"], targetLength)
+	}
+	if entry["proxyId"] != "p1" {
+		t.Errorf("proxyId = %v, want p1", entry["proxyId"])
+	}
+	if entry["source"] != "probe" {
+		t.Errorf("source = %v, want probe", entry["source"])
+	}
+
+	// expand=1 is the documented way to reveal the whole value (design doc 5.3).
+	code, body := api.do(http.MethodGet,
+		"/bindings/codex-auth-1/gpt-5-codex/history?expand=1")
+	if code != http.StatusOK {
+		t.Fatalf("GET history?expand=1 = %d (%s)", code, body)
+	}
+	if !strings.Contains(string(body), secret) {
+		t.Error("expand=1 should reveal the full state value")
+	}
+}
+
+func TestApp_ClearBindingHistoryEndpoint(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: pair, StateValue: stateOf(targetLength), Source: states.SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	if got := len(api.history()); got != 1 {
+		t.Fatalf("history rows = %d, want 1", got)
+	}
+
+	code, body := api.do(http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex/history")
+	if code != http.StatusOK {
+		t.Fatalf("DELETE history = %d (%s)", code, body)
+	}
+
+	if got := len(api.history()); got != 0 {
+		t.Errorf("history rows after clear = %d, want 0", got)
+	}
+	// Clearing history must not touch the binding itself.
+	if _, status := a.States().Lookup(pair.AuthIndex, pair.Model); !status.Usable() {
+		t.Errorf("clearing history removed the binding (status %s)", status)
+	}
+}
+
+// TestApp_DeleteMissingBindingIsIdempotent covers a panel double-click: the
+// delete must succeed without an error when there is nothing to remove.
+func TestApp_DeleteMissingBindingIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &bindingAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	for i := 0; i < 2; i++ {
+		code, body := api.do(http.MethodDelete, "/bindings/codex-auth-1/gpt-5-codex")
+		if code != http.StatusOK {
+			t.Fatalf("delete attempt %d = %d (%s)", i+1, code, body)
+		}
+	}
+	// A pair that was never bound must not accumulate phantom history rows.
+	if got := len(api.history()); got != 0 {
+		t.Errorf("history rows = %d, want 0 for a pair that was never bound", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// account and proxy management endpoints (F-02, design doc 5.5)
+
+type panelAPI struct {
+	t    *testing.T
+	base string
+}
+
+func (p *panelAPI) do(method, path string, payload string) (int, []byte) {
+	p.t.Helper()
+	var body io.Reader
+	if payload != "" {
+		body = strings.NewReader(payload)
+	}
+	req, err := http.NewRequest(method, p.base+path, body)
+	if err != nil {
+		p.t.Fatalf("build %s %s: %v", method, path, err)
+	}
+	if payload != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		p.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		p.t.Fatalf("read %s %s: %v", method, path, err)
+	}
+	return resp.StatusCode, out
+}
+
+// TestApp_ProbeToggleEndpoint covers F-02: probing is enabled per
+// (account, model) pair, and the toggle round-trips.
+func TestApp_ProbeToggleEndpoint(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	const path = "/accounts/codex-auth-1/models/gpt-5-codex/probe"
+
+	for _, want := range []bool{true, false, true} {
+		code, body := api.do(http.MethodPut, path,
+			fmt.Sprintf(`{"enabled":%t}`, want))
+		if code != http.StatusOK {
+			t.Fatalf("PUT probe=%t = %d (%s)", want, code, body)
+		}
+		if got := a.Accounts().ProbeEnabled("codex-auth-1", "gpt-5-codex"); got != want {
+			t.Errorf("ProbeEnabled = %v, want %v", got, want)
+		}
+	}
+
+	// The pair list the scheduler works from must follow the toggle.
+	if got := len(a.Accounts().EnabledPairs()); got != 1 {
+		t.Errorf("EnabledPairs = %d, want 1", got)
+	}
+	code, body := api.do(http.MethodPut, path, `{"enabled":false}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT = %d (%s)", code, body)
+	}
+	if got := len(a.Accounts().EnabledPairs()); got != 0 {
+		t.Errorf("EnabledPairs = %d, want 0 after disabling", got)
+	}
+}
+
+// TestApp_AccountModelsEndpoint covers the per-account model table the panel
+// renders, including that a bound pair reports its state status.
+func TestApp_AccountModelsEndpoint(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: pair, StateValue: stateOf(targetLength), Source: states.SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	code, body := api.do(http.MethodGet, "/accounts/codex-auth-1/models", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET models = %d (%s)", code, body)
+	}
+	var payload struct {
+		Models []struct {
+			Model        string `json:"model"`
+			ProbeEnabled bool   `json:"probeEnabled"`
+			Status       string `json:"status"`
+			StateLength  int    `json:"stateLength"`
+			MinReasoning string `json:"minReasoning"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if len(payload.Models) == 0 {
+		t.Fatal("no models returned")
+	}
+
+	var found bool
+	for _, m := range payload.Models {
+		if m.Model != "gpt-5-codex" {
+			continue
+		}
+		found = true
+		if m.Status != "fresh" {
+			t.Errorf("status = %q, want fresh", m.Status)
+		}
+		if m.StateLength != targetLength {
+			t.Errorf("stateLength = %d, want %d", m.StateLength, targetLength)
+		}
+		if m.MinReasoning == "" {
+			t.Error("minReasoning should be reported so the panel can show the probe cost")
+		}
+	}
+	if !found {
+		t.Error("the bound model is missing from the table")
+	}
+
+	// An unknown account is a 404, not an empty table.
+	if code, _ := api.do(http.MethodGet, "/accounts/nope/models", ""); code != http.StatusNotFound {
+		t.Errorf("GET models for an unknown account = %d, want 404", code)
+	}
+}
+
+func TestApp_AccountSyncEndpoint(t *testing.T) {
+	host := mockHost(2)
+	a := newTestApp(t, host)
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	if got := len(a.Accounts().All()); got != 0 {
+		t.Fatalf("accounts before sync = %d, want 0", got)
+	}
+
+	code, body := api.do(http.MethodPost, "/accounts/sync", "")
+	if code != http.StatusOK {
+		t.Fatalf("POST sync = %d (%s)", code, body)
+	}
+	if got := len(a.Accounts().All()); got != 2 {
+		t.Errorf("accounts after sync = %d, want 2", got)
+	}
+
+	// An account CPA no longer reports must disappear on the next sync.
+	host.SetAccounts([]hostapi.Account{{
+		AuthIndex: "codex-auth-1", AuthID: "auth-id-1",
+		Provider: hostapi.ProviderCodex, Label: "user1",
+		Status: hostapi.AccountStatusAvailable, Priority: 10,
+	}})
+	if code, body := api.do(http.MethodPost, "/accounts/sync", ""); code != http.StatusOK {
+		t.Fatalf("POST sync = %d (%s)", code, body)
+	}
+	if got := len(a.Accounts().All()); got != 1 {
+		t.Errorf("accounts after the pool shrank = %d, want 1", got)
+	}
+}
+
+// TestApp_ReplaceProxiesEndpoint covers "代理池可管理": the panel saves the
+// whole pool at once, and omitted nodes are removed.
+func TestApp_ReplaceProxiesEndpoint(t *testing.T) {
+	a := newTestApp(t, mockHost(1))
+
+	srv := httptest.NewServer(a.Handler(nil))
+	defer srv.Close()
+	api := &panelAPI{t: t, base: srv.URL + "/v0/management/plugins/codex-turn-state-manager"}
+
+	payload := `{"proxies":[` +
+		`{"id":"p1","url":"http://proxy1:8080","enabled":true},` +
+		`{"id":"p2","url":"http://proxy2:8080","enabled":false}]}`
+	code, body := api.do(http.MethodPut, "/proxy-nodes", payload)
+	if code != http.StatusOK {
+		t.Fatalf("PUT proxy-nodes = %d (%s)", code, body)
+	}
+
+	all := a.Proxies().All()
+	if len(all) != 2 {
+		t.Fatalf("pool size = %d, want 2", len(all))
+	}
+
+	// A disabled node is stored but never selected.
+	if got := len(a.Proxies().Available(time.Now())); got != 1 {
+		t.Errorf("available nodes = %d, want 1", got)
+	}
+
+	// Saving a shorter list removes what is gone.
+	code, body = api.do(http.MethodPut, "/proxy-nodes",
+		`{"proxies":[{"id":"p2","url":"http://proxy2:8080","enabled":true}]}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT proxy-nodes = %d (%s)", code, body)
+	}
+	if got := len(a.Proxies().All()); got != 1 {
+		t.Errorf("pool size after removing p1 = %d, want 1", got)
+	}
+
+	// A node without a URL is rejected rather than stored broken.
+	if code, _ := api.do(http.MethodPut, "/proxy-nodes",
+		`{"proxies":[{"id":"bad","url":""}]}`); code != http.StatusBadRequest {
+		t.Errorf("PUT with an empty url = %d, want 400", code)
+	}
+}

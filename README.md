@@ -35,10 +35,10 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 1 | **P0 — 基础框架** | 插件项目骨架、CGO 构建、SQLite 初始化、PersistenceManager + Schema 迁移框架、Management API 基础路由 | 可编译加载的插件，启动后可恢复配置 | 🔄 |
 | 2 | **P0 — 账号同步** | AccountRegistry：定时同步 CPA Codex 账号 | 面板可展示账号列表 | ✅ |
 | 3 | **P0 — 代理池** | ProxyPool：节点增删改、健康状态、冷却排序、`last_used_at` 持久化 | 代理池可管理，选择顺序按冷却时间 | ✅ |
-| 4 | **P0 — 探测引擎** | ProbeScheduler + TimeWindowManager + ProbeExecutor（含遍历所有代理直到命中目标），探测并发数默认 2 且可配置 | 可对指定 `(账号, 模型)` 发起定时探测 | 🔄 |
+| 4 | **P0 — 探测引擎** | ProbeScheduler + TimeWindowManager + ProbeExecutor（含遍历所有代理直到命中目标），探测并发数默认 2 且可配置 | 可对指定 `(账号, 模型)` 发起定时探测 | ✅ |
 | 5 | **P0 — 请求拦截** | CorrelationManager + RequestStateInjector + ResponseStateCollector | 请求头替换与响应头反向绑定全链路打通 | 🔄 |
 | 6 | **P0 — 全局开关** | 定时探测开关 + 反向绑定开关，独立控制，状态持久化 | 两个开关可独立启停 | ✅ |
-| 7 | **P0 — 绑定管理** | 绑定删除 + 历史记录 + Management API | 面板可删除绑定并查看历史 | 🔄 |
+| 7 | **P0 — 绑定管理** | 绑定删除 + 历史记录 + Management API | 面板可删除绑定并查看历史 | ✅ |
 | 8 | **P1 — 调度干预** | CredentialScheduler | CPA 调度结果可被插件干预 | 🔄 |
 | 9 | **P1 — 管理面板** | ResourceUI：简洁前端 + 时间窗口配置 + 历史弹窗 + 代理池展示 + 探测并发配置 | 可视化操作全部功能 | 🔄 |
 | 10 | **P1 — 自愈与退避** | State 失败自动失效、探测退避策略、被动续期 | 系统具备自愈能力 | ✅ |
@@ -58,9 +58,11 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 | # | 证据 |
 |:--:|---|
-| 2 | `accounts.Sync` 81.5%、`Load` 88.9%、`ResolveAuthID` 100%、`ProbeEnabled` 100%、`SetProbeEnabled` 83.3%；harness 实跑同步出 3 个账号。 |
-| 3 | `proxies` 包 86.5%；LRU 排序、冷却排除、同时间按 id 稳定排序、`ReplaceAll`、`Load` 恢复均有测试；harness 中实测节点失败后进入 cooldown 且 `lastUsedAt` 持久化。 |
+| 2 | `accounts.Sync` 81.5%、`Load` 88.9%、`ResolveAuthID` 100%、`ProbeEnabled` 100%、`SetProbeEnabled` 83.3%；`POST /accounts/sync`、`GET /accounts/{authIndex}/models`、`PUT /accounts/{authIndex}/models/{model}/probe` 三个端点均有测试；harness 实跑同步出 3 个账号。 |
+| 3 | `proxies` 包 86.5%；LRU 排序、冷却排除、同时间按 id 稳定排序、`ReplaceAll`、`Load` 恢复均有测试；`PUT /proxy-nodes` 端点有测试（含删除缺失节点与拒绝空 URL）；harness 中实测节点失败后进入 cooldown 且 `lastUsedAt` 持久化。 |
+| 4 | `probe` 包 77.9%。`buildProbeBody` 100%、`newProxyClient` 100%、`attempt` 90.6%、`isModelUnsupported` 90.0%、`Probe` 88.4%、`newProbeHTTPRequest` 81.8%。测试用一个 `httptest` 假上游当作代理节点，因此**探测请求体形状（§3.6）、认证头、遍历顺序、五种结果分类、冷却规则、每代理一条历史、凭据每轮实时读取（NF-06）、以及不等待 SSE 流**都被真实断言，而非目测。 |
 | 6 | `settings` 包 85.4%；五种开关组合的矩阵测试 + `app` 层「总开关关闭时四项能力全部旁路」的端到端测试。 |
+| 7 | `states.Delete` 80%、`Bind` 90%，`intercept` 侧失效路径 85.4%；三个 HTTP 端点 `deleteBinding` 66.7%、`bindingHistory` 80.0%、`clearBindingHistory` 60.0% 均有测试，覆盖删除留痕、历史前缀截断与 `expand=1` 展开、清历史不影响绑定、重复删除幂等。 |
 | 10 | `backoff.NextDelay` 82.4%、`ProxyCooldown` 100%、`Terminal`/`ProxyFault` 100%、`states.Invalidate` 100%；`intercept` 包 85.4%，含失效触发条件与被动续期。 |
 
 ### 进行中项的具体缺口
@@ -68,11 +70,9 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | # | 缺口 |
 |:--:|---|
 | 1 | 仅差「可被 CPA 加载」这一条：`c-shared` 产物已能构建通过（`nm` 可见导出符号），但 `internal/pluginabi` 尚不存在，见 #0。 |
-| 4 | **探测引擎最核心的代码零测试。** `probe/executor.go` 的 `Probe` 与 `attempt`、`probe/request.go` 的 `buildProbeBody` / `newProbeHTTPRequest` / `newProxyClient` 覆盖率均为 **0.0%**。harness 里只打过不通的代理，因此只跑到了 `NETWORK_ERROR` 分支；`SUCCESS_TARGET` / `SUCCESS_NON_TARGET` / `RATE_LIMIT` / `AUTH_ERROR` / `MODEL_UNSUPPORTED` 的分类判定，以及 §3.6 规定的探测请求体形状，全都未经验证。调度器与时间窗口部分（`scheduler.go`、`window.go`、`backoff.go`）是完整覆盖的。 |
 | 5 | 代码与单测完整，但 correlation 链路依赖设计文档 §9.2 第 1 条未决问题：BeforeAuth 阶段写入的自定义 header 能否被 Scheduler 与 AfterAuth 读到。未经真实环境验证。 |
-| 7 | `states.Delete` 80%、`Bind` 90%，注册表层没问题；但承载该产出的三个 HTTP 端点 `deleteBinding`、`bindingHistory`、`clearBindingHistory` 覆盖率均为 **0.0%**，从未被执行过。 |
 | 8 | 依赖 §9.2 第 2 条未决问题：`SchedulerPickResponse` 是否确实支持返回指定 `AuthID`，以及候选列表标识与 `host.auth.list` 的对应关系。 |
-| 9 | 功能齐全、静态资源可正常返回、JS 通过语法检查，但**未在浏览器中实际点击验证过**。 |
+| 9 | 前端功能齐全、静态资源可正常返回、JS 通过语法检查，但**未在浏览器中实际点击验证过**。另外承载「时间窗口配置」的三个端点 `createWindow`、`updateWindow`、`deleteWindow` 覆盖率仍为 **0.0%**（`probe.TimeWindowManager` 本身测试完整，缺的是 HTTP 层）。 |
 | 11 | API 侧（探测历史查询、代理健康统计）已完成并有测试；可视化部分随 #9 一并验证。 |
 
 ### 关于第 0 项
@@ -81,9 +81,9 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 ### 建议的推进顺序
 
-1. **#4、#7 补测试**——这两项不需要 CPA 实例就能做到 ✅，用 `httptest` 起一个假上游即可覆盖探测器全部分支，是目前性价比最高的一步。
-2. **#0 ABI 适配层**——解除 #1、#5、#8 的阻塞，同时完成 §8 的 12 项验证。
-3. **#9、#11 浏览器实测**——面板与可视化的收尾。
+1. **#0 ABI 适配层**——当前唯一阻塞点，直接决定 #1、#5、#8 能否收口；设计文档 §8 的 12 项验证在这一步一并完成。
+2. **#9 管理面板浏览器实测**——补上时间窗口三个端点的 HTTP 层测试，并在浏览器里把面板点一遍，#11 随之收口。
+3. **#5、#8 最终验收**——在 #0 打通后，用真实 CPA 实例验证 correlation 链路与调度干预。
 
 ---
 
