@@ -346,8 +346,14 @@ Set from the panel or the Management API. Defaults:
 | `account_routing_strategy` | `respect_cpa_priority` | or `state_first` |
 
 Time windows restrict when probing runs. Several windows may be configured, each with an
-optional day-of-week set; a window may cross midnight (`22:00–06:00`). With no enabled
-window, probing is unrestricted.
+optional day-of-week set; a window may cross midnight (`22:00–06:00`). With no *enabled*
+window, probing is unrestricted — a window that is disabled, entered wrong, or absent all
+mean 24/7 probing, so the panel's config line reports the scheduler's live decision
+(`窗口 08:00–02:00（当前禁止探测）`) rather than just counting rows.
+
+The manual probe button on a model row **ignores the window deliberately**: it is an
+explicit request for one probe now, and a pair whose scheduled probing is off is exactly
+the one someone would want to test by hand. Its tooltip says so.
 
 Proxy nodes are ordinary HTTP/HTTPS/SOCKS5 URLs.
 
@@ -364,7 +370,7 @@ treat `plugins` as a reserved segment would demand their own credentials before 
 it. Resource routes are the opposite: the host inserts `/plugins/<id>` there itself.
 
 ```
-GET    /status
+GET    /status                            # includes the live time-window decision
 GET    /settings
 PUT    /settings
 GET    /time-windows

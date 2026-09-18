@@ -155,6 +155,8 @@ let expanded = new Set();
 const modelCache = new Map();
 let modelsLoaded = false;
 let modelsError = "";
+// windowState is the scheduler's live view of the time window, from /status.
+let windowState = null;
 // Seed model names for the add control. Suggestions only: the plugin cannot
 // read an account's real model list from CPA, so nothing here is probed until
 // an operator adds it.
@@ -458,8 +460,21 @@ function refreshConfigSummary() {
     parts.push(settingsState.globalReverseBindEnabled ? "反向绑定 开" : "反向绑定 关");
     parts.push(settingsState.statePriorityEnabled ? "调度干预 开" : "调度干预 关");
   }
-  const windows = windowsState.filter((w) => w.enabled).length;
-  parts.push(windows ? `${windows} 个时间窗口` : "全天可探测");
+  // The window state, as the scheduler sees it right now rather than as the
+  // table was last rendered: a window that is disabled, mis-entered, or missing
+  // all mean unrestricted probing, and they look identical otherwise.
+  const enabledWindows = windowsState.filter((w) => w.enabled);
+  if (!enabledWindows.length) {
+    parts.push("全天可探测");
+  } else {
+    const ranges = enabledWindows
+      .map((w) => `${w.startTime}–${w.endTime}`)
+      .join("、");
+    const allowed = windowState ? windowState.allowsProbe : null;
+    parts.push(allowed === false
+      ? `窗口 ${ranges}（当前禁止探测）`
+      : `窗口 ${ranges}`);
+  }
   const proxies = proxiesState.length;
   parts.push(proxies ? `${proxies} 个代理节点` : "无代理节点");
   node.textContent = parts.join(" · ");
@@ -999,7 +1014,7 @@ function renderModels(authIndex, container, blockedReason) {
 
     const actions = el("div", { class: "row-actions" }, [
       el("button", { class: "btn btn-sm", type: "button", text: "立即探测",
-        title: "用一个代理探测一次，无论结果如何都结束",
+        title: "用一个代理探测一次，无论结果如何都结束。手动探测不受时间窗口限制",
         onclick: (ev) => probeNow(authIndex, m.model, ev.target) }),
       el("button", { class: "btn btn-sm", type: "button", text: "删除绑定",
         onclick: () => deleteBinding(authIndex, m.model) }),
@@ -1551,6 +1566,7 @@ function renderProbeFilter() {
 
 async function loadStatus() {
   const status = await api("GET", "/status");
+  windowState = status.window || null;
   $("version").textContent = status.version ? `v${status.version}` : "";
 
   // The pipeline counters are the only evidence that injection and capture are

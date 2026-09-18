@@ -157,6 +157,28 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 			"route":   caps.Route,
 		},
 		"proxies": map[string]int{"total": len(proxies), "healthy": healthy},
+		// Whether the time window admits probing right now, and which windows
+		// are enabled. Without it "why did it probe at 03:00" is unanswerable
+		// from the panel: a window that is disabled, mis-entered, or absent all
+		// look the same, and all three mean unrestricted probing.
+		"window": func() map[string]any {
+			enabled := make([]map[string]any, 0)
+			for _, w := range a.svc.Windows().All() {
+				if !w.Enabled {
+					continue
+				}
+				enabled = append(enabled, map[string]any{
+					"label":      w.Label,
+					"startTime":  w.StartTime,
+					"endTime":    w.EndTime,
+					"daysOfWeek": w.DaysOfWeek,
+				})
+			}
+			return map[string]any{
+				"allowsProbe": a.svc.Windows().ShouldProbeNow(now),
+				"enabled":     enabled,
+			}
+		}(),
 		// Whether the scan loop is running at all. Without it a stalled loop
 		// and an idle one are indistinguishable: both show every pair overdue
 		// and no new probe rows.
