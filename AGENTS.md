@@ -332,16 +332,32 @@ records each one with its evidence. Only one item is still genuinely unverified.
 6. Cross-midnight windows against DST — covered by
    `internal/probe/window_dst_test.go`.
 
+6. Does the `c-shared` build actually load into a real CPA instance? — **verified**
+   against CPA v7.3.7 in Docker (`make cpa-docker-up`). The library loads,
+   registers, its declared capabilities are accepted, and its Management API is
+   reachable.
+
 **Still unverified — do not present as working:**
 
-- **Does the `c-shared` build actually load into a real CPA instance?** The
-  library exports the four symbols the loader expects and mirrors the official
-  example's struct layout, but it has never been loaded. Until it has, the
-  plugin is not production-ready, and behaviours that depend on the host calling
-  back correctly (interception, scheduling, capture) are unproven end to end.
+- **The request path under real traffic.** Loading, registration and the
+  Management API are proven, but no Codex account has been present, so the
+  interceptors, the scheduler and response capture have never been driven by an
+  actual request. That is the remaining gap before this can be called
+  production-ready.
+- **Resource route serving.** On v7.3.7 the panel's asset routes register but
+  answer 404, for this plugin and for CPA's own `examples/plugin/management-api`
+  alike, so it is host-side rather than a defect here. The panel is not reachable
+  until that is understood.
 
-Do not remove this section until item 5 above has actually been exercised
-against a running CPA.
+Two host behaviours that cost debugging time and are easy to trip over again,
+both of which fail silently from the plugin's side:
+
+- CPA's `validPlugin` rejects a registration whose Name, Version, **Author** or
+  GitHubRepository is blank, and it rejects it by discarding *every* declared
+  capability. The plugin loads and is then never called.
+- Management route paths must include the `plugins/<pluginID>` segment, because
+  the host resolves them as `<BasePath> + <Path>`. Resource routes are the
+  opposite: the host inserts that segment itself.
 
 ---
 

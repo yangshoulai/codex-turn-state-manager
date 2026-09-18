@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/management"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
 	"github.com/yangshoulai/codex-turn-state-manager/web"
@@ -54,14 +55,25 @@ func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 		}
 	}
 
-	// Paths are relative; the host resolves them under the base paths it
-	// supplied, which match version.ManagementBasePath / ResourceBasePath.
+	// Management route paths are NOT given the plugin prefix automatically:
+	// the host resolves them as <BasePath> + <Path>, so the plugin segment has
+	// to be part of what we send. Resource routes are the opposite -- the host
+	// inserts /plugins/<id> for those itself. Returning "/status" here would
+	// therefore register /v0/management/status, which is unreachable and is
+	// dropped without any warning on the host side.
+	prefix := strings.TrimSuffix(version.ManagementBasePath, req.BasePath)
+	if prefix == version.ManagementBasePath {
+		// BasePath did not match what this build expects; fall back to the
+		// documented layout rather than registering unreachable routes.
+		prefix = "/plugins/" + version.PluginName
+	}
+
 	declared := management.Routes()
 	routes := make([]pluginapi.ManagementRoute, 0, len(declared))
 	for _, r := range declared {
 		routes = append(routes, pluginapi.ManagementRoute{
 			Method: r.Method,
-			Path:   r.Path,
+			Path:   prefix + r.Path,
 		})
 	}
 
@@ -75,6 +87,11 @@ func (p *Plugin) handleManagementRegister(request []byte) ([]byte, error) {
 			Menu: resourceMenuLabel(path),
 		})
 	}
+
+	p.logf(hostapi.LogInfo, "management routes registered", map[string]any{
+		"basePath": req.BasePath, "prefix": prefix,
+		"routes": len(routes), "resources": len(resources),
+	})
 
 	return okEnvelope(pluginapi.ManagementRegistrationResponse{
 		Routes:    routes,

@@ -1,0 +1,33 @@
+# Minimal CPA configuration for loading this plugin in a container.
+#
+# Every value here is chosen for a throwaway local instance: it binds loopback,
+# uses a known management key, and trusts a plugin directory that contains only
+# locally built artefacts. Do not reuse it as-is anywhere real.
+
+host: "0.0.0.0"
+port: 8317
+
+remote-management:
+  # A key is mandatory: with an empty secret-key the Management API is disabled
+  # entirely and every /v0/management route 404s, which would make the plugin's
+  # own routes unreachable too.
+  allow-remote: true
+  secret-key: "local-dev-key"
+
+auth-dir: "/root/.cli-proxy-api"
+
+api-keys:
+  - "local-dev-api-key"
+
+debug: true
+
+plugins:
+  # Dynamic libraries are trusted in-process code and are off by default.
+  enabled: true
+  dir: "plugins"
+  configs:
+    codex-turn-state-manager:
+      enabled: true
+      priority: 1
+      # Plugin-owned configuration, passed to register as YAML.
+      data_dir: "/CLIProxyAPI/plugin-data"

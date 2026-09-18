@@ -225,6 +225,63 @@ func TestRegister_DeclaresTheCapabilitiesThePluginActuallyImplements(t *testing.
 	}
 }
 
+// TestRegistrationSatisfiesHostValidity pins the host's acceptance rules.
+//
+// CPA's validPlugin rejects a registration whose Name, Version, Author or
+// GitHubRepository is blank, and it rejects it by discarding every declared
+// capability -- the plugin loads, logs nothing wrong from its own side, and is
+// simply never called. That failure mode is invisible without a real instance,
+// so it is asserted here instead.
+func TestRegistrationSatisfiesHostValidity(t *testing.T) {
+	p := newTestPlugin(t, authListCaller())
+
+	raw, err := p.Handle(pluginabi.MethodPluginRegister, []byte(`{"schema_version":6}`))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var reg struct {
+		Metadata struct {
+			Name             string `json:"Name"`
+			Version          string `json:"Version"`
+			Author           string `json:"Author"`
+			GitHubRepository string `json:"GitHubRepository"`
+		} `json:"metadata"`
+		Capabilities map[string]any `json:"capabilities"`
+	}
+	if err := json.Unmarshal(resultOf(t, raw), &reg); err != nil {
+		t.Fatalf("decode registration: %v", err)
+	}
+
+	for name, value := range map[string]string{
+		"Name":             reg.Metadata.Name,
+		"Version":          reg.Metadata.Version,
+		"Author":           reg.Metadata.Author,
+		"GitHubRepository": reg.Metadata.GitHubRepository,
+	} {
+		if strings.TrimSpace(value) == "" {
+			t.Errorf("metadata %s is blank; the host will discard every capability", name)
+		}
+	}
+
+	if reg.Metadata.Name != version.PluginName {
+		t.Errorf("Name = %q, want %q -- it must match the library name and the plugins.configs key",
+			reg.Metadata.Name, version.PluginName)
+	}
+
+	// At least one capability must be declared or the host rejects the plugin
+	// outright, regardless of metadata.
+	var declared int
+	for _, v := range reg.Capabilities {
+		if v == true {
+			declared++
+		}
+	}
+	if declared == 0 {
+		t.Error("no capability declared; the host will reject the registration")
+	}
+}
+
 func TestShutdown_IsIdempotent(t *testing.T) {
 	p := newTestPlugin(t, authListCaller())
 	if _, err := p.Handle(pluginabi.MethodPluginShutdown, nil); err != nil {
@@ -439,20 +496,27 @@ func TestManagementRegister_ReturnsRoutesAndResources(t *testing.T) {
 		t.Fatalf("decode management registration: %v", err)
 	}
 
-	// The registration must declare exactly the routes the plugin serves: a
-	// route missing here is unreachable, and an extra one hands the host a
-	// path that would 404.
+	// The registration must declare exactly the routes the plugin serves, each
+	// carrying the plugin path segment. The host resolves a management route as
+	// <BasePath> + <Path>, so a route without the segment lands somewhere
+	// unreachable and is dropped without a warning.
 	declared := management.Routes()
 	if len(resp.Routes) != len(declared) {
 		t.Fatalf("routes declared = %d, want %d", len(resp.Routes), len(declared))
 	}
+
+	const wantPrefix = "/plugins/" + version.PluginName
 	byKey := map[string]bool{}
 	for _, r := range declared {
-		byKey[r.Method+" "+r.Path] = true
+		byKey[r.Method+" "+wantPrefix+r.Path] = true
 	}
 	for _, r := range resp.Routes {
 		if !byKey[r.Method+" "+r.Path] {
 			t.Errorf("registered route %s %s has no handler", r.Method, r.Path)
+		}
+		if !strings.HasPrefix(r.Path, wantPrefix+"/") {
+			t.Errorf("route %s %s is missing the %s prefix and would be unreachable",
+				r.Method, r.Path, wantPrefix)
 		}
 	}
 	if len(resp.Resources) != len(web.Assets) {

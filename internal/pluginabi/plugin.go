@@ -178,9 +178,16 @@ func (p *Plugin) registration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             version.PluginName,
-			Version:          version.Version,
-			GitHubRepository: "https://github.com/yangshoulai/codex-turn-state-manager",
+			Name:    version.PluginName,
+			Version: version.Version,
+			// Author and GitHubRepository are not decorative: the host's
+			// validPlugin rejects a registration whose Name, Version, Author or
+			// GitHubRepository is empty, and then silently ignores every
+			// declared capability. A blank Author cost one debugging round
+			// against a real instance, so it is covered by a test now.
+			Author:           version.Author,
+			GitHubRepository: version.Repository,
+			Logo:             version.Logo,
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "data_dir",

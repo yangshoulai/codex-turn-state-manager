@@ -16,6 +16,13 @@ plugin-data/
 /tmp/
 .local/
 
+# Docker CPA test loop: the .so is built, not committed; auths and logs are
+# per-machine.
+dev/cpa-docker/plugins/*.so
+dev/cpa-docker/auths/
+dev/cpa-docker/logs/
+dev/cpa-docker/plugin-data/
+
 # Editors / OS
 .DS_Store
 .idea/

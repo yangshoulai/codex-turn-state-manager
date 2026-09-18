@@ -70,11 +70,11 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 
 | # | 缺口 |
 |:--:|---|
-| 0 | 代码已就位：`cliproxy_plugin_init` / `cliproxyPluginCall` / `cliproxyPluginFree` / `cliproxyPluginShutdown` 四个符号均已导出，注册、拦截、调度、响应观察、自愈、Management 桥接都有测试。**差的是真实加载验证**——从未在 CPA 实例中加载过。 |
+| 0 | **已在 CPA v7.3.7 容器中验证**：共享库加载成功、注册被接受、能力声明生效、Management API 可达（`make cpa-docker-up`）。**仍差真实流量驱动**——环境里没有 Codex 账号，拦截器/调度器/响应捕获从未被真实请求触发过。 |
 | 1 | 仅差「可被 CPA 加载」这一条，见 #0。 |
 | 5 | correlation 机制已整体移除（CPA 在 `Metadata` 里直接给出选中账号），单测完整。剩余缺口是真实环境中的回调时序确认，随 #0 一并验证。 |
 | 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行。 |
-| 9 | 路由已改为查询参数形式并全部注册（CPA 只接受精确路径），`internal/management` 内**已无 0% 覆盖率的端点**。仍缺的是**在浏览器里实际点击验证**。 |
+| 9 | 路由已改为查询参数形式并全部注册，`internal/management` 内**已无 0% 覆盖率的端点**，且 Management API 已在真实 CPA 中验证可达。**阻塞在宿主侧**：Resource 路由（面板静态资源）在 v7.3.7 上返回 404，CPA 自带示例插件表现相同（见设计文档 §10.6），面板因此暂不可达。 |
 | 11 | API 侧（探测历史查询、代理健康统计）已完成并有测试；可视化部分随 #9 一并验证。 |
 
 ### 关于第 0 项

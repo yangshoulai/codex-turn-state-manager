@@ -8,6 +8,15 @@ var Version = "dev"
 // base name and the CPA `plugins.configs` key must both match this value.
 const PluginName = "codex-turn-state-manager"
 
+// Registration metadata. CPA rejects a registration that leaves Name, Version,
+// Author or Repository empty -- and it rejects it by ignoring every declared
+// capability, so the plugin loads and then never gets called.
+const (
+	Author     = "codex-turn-state-manager contributors"
+	Repository = "https://github.com/yangshoulai/codex-turn-state-manager"
+	Logo       = ""
+)
+
 // ManagementBasePath is the prefix for every Management API route.
 const ManagementBasePath = "/v0/management/plugins/" + PluginName
 

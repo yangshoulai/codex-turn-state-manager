@@ -13,7 +13,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-shared build-dev test test-race vet fmt lint tidy clean run db-shell
+.PHONY: help build build-shared build-dev build-linux test test-race vet fmt lint tidy clean run db-shell cpa-docker-up cpa-docker-down cpa-docker-logs
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -38,6 +38,42 @@ build: build-dev build-shared ## Build both the harness and the shared library
 
 run: ## Run the development harness (mock host + local management API/UI)
 	go run ./cmd/plugin -data-dir ./.local -listen 127.0.0.1:8787 -management-key devkey
+
+# --- Real-CPA test loop -----------------------------------------------------
+#
+# c-shared output cannot be cross-compiled, so the library is built inside a
+# Linux container matching the deployment target. See dev/cpa-docker/README.md.
+
+PLUGIN_SO := dev/cpa-docker/plugins/$(PLUGIN_NAME).so
+DOCKER_PLATFORM ?= linux/arm64
+
+build-linux: ## Build the C-ABI plugin for linux ($(DOCKER_PLATFORM))
+	@mkdir -p dev/cpa-docker/plugins
+	docker run --rm --platform $(DOCKER_PLATFORM) \
+		-v "$(CURDIR)":/src -w /src \
+		-v "$$HOME/go/pkg/mod":/go/pkg/mod \
+		-e GOFLAGS=-mod=mod -e CGO_ENABLED=1 \
+		golang:1.26-bookworm \
+		go build -buildmode=c-shared -tags cshared -o $(PLUGIN_SO) ./cmd/plugin
+	@echo "built $(PLUGIN_SO)"
+
+cpa-docker-up: build-linux ## Build for linux and start a throwaway CPA with the plugin loaded
+	docker rm -f cpa-plugin-test >/dev/null 2>&1 || true
+	cd dev/cpa-docker && docker run -d --name cpa-plugin-test --platform $(DOCKER_PLATFORM) \
+		-p 18317:8317 \
+		-v "$$PWD/config.yaml":/CLIProxyAPI/config.yaml:ro \
+		-v "$$PWD/auths":/root/.cli-proxy-api \
+		-v "$$PWD/logs":/CLIProxyAPI/logs \
+		-v "$$PWD/plugins":/CLIProxyAPI/plugins \
+		eceasy/cli-proxy-api:latest
+	@sleep 6
+	@echo "CPA on http://127.0.0.1:18317 (management key: local-dev-key)"
+
+cpa-docker-logs: ## Follow the throwaway CPA log
+	docker logs -f cpa-plugin-test
+
+cpa-docker-down: ## Stop and remove the throwaway CPA
+	docker rm -f cpa-plugin-test
 
 test: ## Run unit tests
 	go test ./...
