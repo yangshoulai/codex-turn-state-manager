@@ -1130,3 +1130,64 @@ func TestApp_ForgetModelRemovesBindingAndConfig(t *testing.T) {
 		t.Errorf("DELETE without a model = %d, want 400", code)
 	}
 }
+
+// TestApp_BackgroundWorkSurvivesStartup is the regression test for a defect that
+// only a real instance could reveal.
+//
+// The adapter used to hand App.Start the registration timeout context, and its
+// `defer cancel()` fired the moment registration returned -- so the scan loop
+// exited immediately and nothing background ever ran. Every check still passed,
+// because the management API is request-driven and kept answering; the plugin
+// simply never probed anything.
+//
+// A scan is observable as an account sync, which the loop performs on its own
+// cadence, so counting Host.ListAccounts calls distinguishes "running" from
+// "started and immediately dead".
+func TestApp_BackgroundWorkSurvivesStartup(t *testing.T) {
+	ctx := context.Background()
+	host := mockHost(1)
+
+	a, err := New(ctx, Config{DataDir: t.TempDir(), Host: host})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Stop()
+
+	const intervalSec = 5
+	if _, err := a.Settings().Update(ctx, settings.Patch{
+		ScanInterval: durPtrSeconds(intervalSec),
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	a.Start()
+
+	// Start() kicks off an initial account sync of its own. Waiting for it
+	// first is the whole point: counting from before it would let the initial
+	// sync satisfy the assertion, which is how the first version of this test
+	// passed in 0.1s while proving nothing.
+	settleDeadline := time.Now().Add(2 * time.Second)
+	for host.ListAccountsCalls() == 0 && time.Now().Before(settleDeadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if host.ListAccountsCalls() == 0 {
+		t.Fatal("the initial account sync never ran")
+	}
+	before := host.ListAccountsCalls()
+
+	// Anything after this point can only come from a scan tick.
+	deadline := time.Now().Add(time.Duration(intervalSec*3) * time.Second)
+	for time.Now().Before(deadline) {
+		if host.ListAccountsCalls() > before {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no scan ran within %s (ListAccounts calls stuck at %d): "+
+		"the background loop died at startup", time.Duration(intervalSec*3)*time.Second, before)
+}
+
+func durPtrSeconds(n int) *time.Duration {
+	d := time.Duration(n) * time.Second
+	return &d
+}

@@ -75,7 +75,7 @@ func main() {
 	}
 	defer application.Stop()
 
-	application.Start(ctx)
+	application.Start()
 	if _, err := application.SyncAccounts(ctx); err != nil {
 		logf(hostapi.LogWarn, "initial sync failed", map[string]any{"error": err.Error()})
 	}

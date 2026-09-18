@@ -197,9 +197,17 @@ func (a *App) fail(err error) error {
 }
 
 // Start launches the background subsystems.
-func (a *App) Start(ctx context.Context) {
+//
+// The lifetime is deliberately the plugin's own, not the caller's. An earlier
+// version accepted a context, and the adapter passed the registration timeout
+// into it -- so `defer cancel()` in the registration handler killed the scan
+// loop the instant registration returned. Everything looked healthy because the
+// management API is request-driven and kept answering; nothing background ever
+// ran. Taking no context makes that mistake impossible. Use Stop to end it.
+func (a *App) Start() {
 	a.startOnce.Do(func() {
-		ctx, a.cancel = context.WithCancel(ctx)
+		ctx, cancel := context.WithCancel(context.Background())
+		a.cancel = cancel
 
 		// A first sync populates the account list the panel renders, without
 		// waiting for the first scan tick.

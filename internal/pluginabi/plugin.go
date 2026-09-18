@@ -159,10 +159,12 @@ func (p *Plugin) handleRegister(request []byte) ([]byte, error) {
 		p.app = nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Bounds construction only (database open and migration). The plugin's
+	// lifetime is not tied to this call -- see App.Start.
+	bootCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	application, err := app.New(ctx, app.Config{
+	application, err := app.New(bootCtx, app.Config{
 		DataDir:         cfg.DataDir,
 		UpstreamBaseURL: cfg.UpstreamBaseURL,
 		Host:            p.host,
@@ -173,7 +175,7 @@ func (p *Plugin) handleRegister(request []byte) ([]byte, error) {
 	}
 	p.cfg = cfg
 	p.app = application
-	application.Start(ctx)
+	application.Start()
 
 	p.logf(hostapi.LogInfo, "plugin registered", map[string]any{
 		"dataDir": cfg.DataDir, "schemaVersion": req.SchemaVersion,

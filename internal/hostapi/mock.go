@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,14 @@ type MockHost struct {
 	credentialErr map[string]error
 	// ListErr, when non-nil, is returned by ListAccounts.
 	ListErr error
+
+	// listCalls counts ListAccounts invocations. The scan loop is otherwise
+	// invisible to a test, and "did the background work survive startup?" is
+	// exactly the question that needs answering.
+	//
+	// Atomic rather than guarded by mu: ListAccounts holds mu.RLock while it
+	// copies the pool, and a write under a read lock is still a write.
+	listCalls atomic.Int64
 }
 
 // LogEntry is a captured log line.
@@ -93,8 +102,12 @@ func (h *MockHost) Logs() []LogEntry {
 	return out
 }
 
+// ListAccountsCalls reports how many times ListAccounts has been called.
+func (h *MockHost) ListAccountsCalls() int64 { return h.listCalls.Load() }
+
 // ListAccounts implements Host.
 func (h *MockHost) ListAccounts(ctx context.Context) ([]Account, error) {
+	h.listCalls.Add(1)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if h.ListErr != nil {

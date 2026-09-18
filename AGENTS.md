@@ -342,13 +342,19 @@ records each one with its evidence. Only one item is still genuinely unverified.
    registers, its declared capabilities are accepted, and its Management API is
    reachable.
 
+- **The probe path end to end**, against a real Codex account through a real
+  proxy: the scheduler fired, walked the pool, fetched a live credential, built
+  the probe request, read `X-Codex-Turn-State` from the response headers, bound
+  the 292-length value, published it to the in-memory snapshot, and scheduled
+  the next attempt at TTL x 85%.
+
 **Still unverified — do not present as working:**
 
-- **The request path under real traffic.** Loading, registration and the
-  Management API are proven, but no Codex account has been present, so the
-  interceptors, the scheduler and response capture have never been driven by an
-  actual request. That is the remaining gap before this can be called
-  production-ready.
+- **Request interception and traffic capture.** No request has yet been routed
+  through CPA's `/v1/responses` with a binding in place, so `request.intercept_after`
+  injecting the header, and the response stage harvesting state from ordinary
+  traffic, remain unexercised. Those are the paths that affect live user
+  traffic, so they matter more than anything already proven here.
 Three host behaviours that cost debugging time, all of which fail silently from
 the plugin's side and none of which are visible without a real instance:
 
