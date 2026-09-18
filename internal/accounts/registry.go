@@ -39,6 +39,11 @@ type Account struct {
 	Priority  int    `json:"priority"`
 	Disabled  bool   `json:"disabled"`
 
+	// Plan is the subscription tier, read from the credential's id_token.
+	// Empty when the credential does not carry the claim -- shown as unknown
+	// rather than assumed.
+	Plan Plan `json:"plan"`
+
 	SyncedAt time.Time `json:"syncedAt"`
 }
 
@@ -50,6 +55,9 @@ type Registry struct {
 	// manifest CPA syncs. The plugin cannot read CPA's own registry, so this is
 	// the nearest authoritative source it can obtain by itself.
 	catalogModels func() []string
+	// plans reads an account's subscription tier. Optional: without it the
+	// panel simply shows no plan.
+	plans PlanReader
 
 	mu sync.RWMutex
 	// byIndex is keyed by AuthIndex; byAuthID is the reverse mapping the
@@ -64,8 +72,13 @@ type modelKey struct {
 	model     string
 }
 
+// PlanReader reads an account's subscription tier from its credential.
+type PlanReader interface {
+	ReadPlan(ctx context.Context, authIndex string) (Plan, error)
+}
+
 // NewRegistry builds an empty registry. Call Load then Sync.
-func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []string) *Registry {
+func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []string, plans PlanReader) *Registry {
 	if catalogModels == nil {
 		catalogModels = func() []string { return nil }
 	}
@@ -73,6 +86,7 @@ func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []st
 		host:          host,
 		store:         store,
 		catalogModels: catalogModels,
+		plans:         plans,
 		byIndex:       map[string]Account{},
 		byAuthID:      map[string]string{},
 		configs:       map[modelKey]bool{},
@@ -130,18 +144,56 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	// Preserve the first-seen time for accounts that are still present, so the
-	// panel can show a stable "known since".
+	// panel can show a stable "known since", and carry over a plan already
+	// looked up so it is not re-read on every sync.
 	for idx, acc := range next {
 		if prev, ok := r.byIndex[idx]; ok {
 			acc.SyncedAt = prev.SyncedAt
+			acc.Plan = prev.Plan
 			next[idx] = acc
 		}
 	}
 	r.byIndex = next
 	r.byAuthID = nextAuthID
+
+	missing := make([]string, 0, len(next))
+	for idx, acc := range next {
+		if !acc.Plan.Known() {
+			missing = append(missing, idx)
+		}
+	}
+	r.mu.Unlock()
+
+	r.resolvePlans(ctx, missing)
 	return count, nil
+}
+
+// resolvePlans fills in plans for accounts that do not have one yet.
+//
+// The lookup reads a credential, so it runs once per account per process rather
+// than on every sync: a plan changes rarely, and a restart re-reads it. Only the
+// derived tier is kept -- the credential document is discarded immediately and
+// is never cached, logged, or persisted (NF-06).
+func (r *Registry) resolvePlans(ctx context.Context, authIndexes []string) {
+	if r.plans == nil || len(authIndexes) == 0 {
+		return
+	}
+	for _, authIndex := range authIndexes {
+		if ctx.Err() != nil {
+			return
+		}
+		plan, err := r.plans.ReadPlan(ctx, authIndex)
+		if err != nil || !plan.Known() {
+			continue
+		}
+		r.mu.Lock()
+		if acc, ok := r.byIndex[authIndex]; ok {
+			acc.Plan = plan
+			r.byIndex[authIndex] = acc
+		}
+		r.mu.Unlock()
+	}
 }
 
 // All returns tracked accounts sorted by label then authIndex.

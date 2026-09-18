@@ -293,6 +293,19 @@ function fmtAgo(value) {
   return `${Math.floor(secs / 86400)}d 前`;
 }
 
+// planBadge renders the subscription tier, or nothing when the credential does
+// not carry the claim. An absent plan is left blank rather than shown as
+// "unknown": the panel would otherwise fill with noise for accounts whose tokens
+// simply do not include it.
+function planBadge(plan) {
+  if (!plan || !plan.type) return null;
+  const label = plan.label || plan.type;
+  const title = plan.activeUntil
+    ? `套餐 ${label}，有效期至 ${fmtTime(plan.activeUntil)}`
+    : `套餐 ${label}`;
+  return el("span", { class: "pill pill-plan", text: label, title });
+}
+
 const STATUS_PILL = {
   fresh: ["pill-ok", "有效"],
   refresh_due: ["pill-warn", "待刷新"],
@@ -706,6 +719,7 @@ function renderAccounts() {
     }, [
       el("div", { class: "who" }, [
         el("strong", { text: account.label || account.authIndex }),
+        planBadge(account.plan),
         el("span", { class: "pill " + statusClass, text: account.status || "unknown" }),
       ]),
       el("div", { class: "meta" }, [

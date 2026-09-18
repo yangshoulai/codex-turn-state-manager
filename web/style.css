@@ -501,3 +501,12 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 }
 .btn-icon:hover { color: var(--ink); background: var(--accent-soft); border-color: transparent; }
 .btn-icon svg { display: block; }
+
+/* Plan badge: informational, so deliberately quieter than the status pills --
+   colour on this page means binding health. */
+.pill-plan {
+  background: #eef0ec;
+  color: var(--ink-soft);
+  border-color: var(--line);
+  font-variant-numeric: tabular-nums;
+}

@@ -122,7 +122,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		logf(hostapi.LogInfo, fmt.Sprintf(format, args...), nil)
 	})
 
-	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), a.catalog.Models)
+	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), a.catalog.Models, a)
 	if err := a.accounts.Load(ctx); err != nil {
 		return nil, a.fail(err)
 	}
@@ -281,6 +281,19 @@ func (a *App) Models() *models.Registry { return a.models }
 
 // Catalog returns the account model list source.
 func (a *App) Catalog() *models.Catalog { return a.catalog }
+
+// ReadPlan implements accounts.PlanReader.
+//
+// It reads the credential to reach the id_token's plan claim, which is the same
+// source CLIProxyAPI uses. The document is used and discarded: only the derived
+// tier is kept, never the token (NF-06).
+func (a *App) ReadPlan(ctx context.Context, authIndex string) (accounts.Plan, error) {
+	cred, err := a.cfg.Host.GetCredential(ctx, authIndex)
+	if err != nil {
+		return accounts.Plan{}, err
+	}
+	return accounts.ParsePlanFromCredential(cred.Raw), nil
+}
 
 // States returns the binding registry.
 func (a *App) States() *states.Registry { return a.states }

@@ -63,6 +63,28 @@ thing that makes a "did persistence work?" question unanswerable.
 
 Delete `dev/cpa-docker/plugin-data/` to start from scratch.
 
+## auths/ holds real credentials
+
+`auths/` is where CPA keeps account credentials — real OAuth refresh tokens, not
+fixtures. Two rules follow, and a mistake during development is why they are
+written down:
+
+* **Never copy a file out of `auths/`.** A duplicate of a credential is a second
+  thing to leak, and if it is used as a test fixture it will eventually be
+  deleted alongside the fixture.
+* **Never delete anything in `auths/` that you did not create.** During the model
+  work a synthetic fixture was built from a copy of a real auth file, and the
+  cleanup removed both files. The real one was not recoverable: CPA reads these
+  from disk, its download endpoint reads from disk, and the plugin never stores
+  credentials anywhere.
+
+If a test needs a credential-shaped input, construct one from scratch. Nothing
+in this path verifies a JWT signature — the plan claim is read for display only —
+so a fabricated token is sufficient and carries nothing worth leaking.
+
+The directory is gitignored, but that only protects against commits, not against
+`rm`.
+
 ## Adding a Codex account
 
 The plugin lists accounts from CPA's auth pool, so with an empty `auths/`
