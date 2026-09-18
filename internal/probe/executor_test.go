@@ -978,3 +978,55 @@ func TestExecutor_NonTargetCoolsTheProxy(t *testing.T) {
 
 // memCooldownKey stands in for the ledger's own key type, which is unexported.
 func memCooldownKey(authIndex, proxyID string) string { return authIndex + "\x00" + proxyID }
+
+// TestExecutor_CooldownLadderEscalates walks the real sequence rather than the
+// pure function: repeated failures of one account against one node, with the
+// clock advanced past each cooldown so the node comes back and fails again.
+//
+// The ladder position comes from the pair's stored count, and the count is
+// incremented while recording the failure -- so the caller has to ask for the
+// rung of the failure it is about to record, not the one already on file.
+// Testing ProxyCooldown in isolation cannot see that; only the sequence can.
+func TestExecutor_CooldownLadderEscalates(t *testing.T) {
+	h := newExecHarness(t)
+	h.addDeadProxy(t, "dead")
+
+	// Seven rungs to the cap, then the counter resets and the ladder starts
+	// over -- which is what keeps an outage longer than the cap from removing
+	// the pair permanently.
+	want := []time.Duration{
+		1 * time.Minute,
+		2 * time.Minute,
+		4 * time.Minute,
+		8 * time.Minute,
+		16 * time.Minute,
+		32 * time.Minute,
+		64 * time.Minute,
+		1 * time.Minute,
+		2 * time.Minute,
+	}
+
+	base := time.Now()
+	now := base
+	h.executor.SetClock(func() time.Time { return now })
+
+	for i := range want {
+		h.executor.Probe(context.Background(), "codex-auth-1", "gpt-5-codex")
+
+		rows := h.pool.CooldownsForProxy("dead")
+		if len(rows) != 1 {
+			t.Fatalf("failure %d: %d ledger rows, want 1", i+1, len(rows))
+		}
+		row := rows[0]
+		if row.CooldownUntil == nil {
+			t.Fatalf("failure %d: no cooldown recorded", i+1)
+		}
+		got := row.CooldownUntil.Sub(now)
+		if got != want[i] {
+			t.Errorf("failure %d: cooldown %s, want %s", i+1, got, want[i])
+		}
+
+		// Past the cooldown so the node is selectable again for this account.
+		now = now.Add(got + time.Second)
+	}
+}

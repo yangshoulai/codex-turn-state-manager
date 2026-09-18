@@ -1325,7 +1325,7 @@ on("add-proxy", "click", () => {
   const id = "proxy-" + Math.random().toString(36).slice(2, 8);
   proxiesState.push({
     id, url: "", enabled: true, successCount: 0, failureCount: 0,
-    consecutiveFailures: 0, status: "healthy",
+    coolingForAccounts: 0, status: "healthy",
   });
   renderProxies();
 });
@@ -1349,8 +1349,6 @@ async function saveProxies() {
       enabled: n.enabled,
       successCount: n.successCount || 0,
       failureCount: n.failureCount || 0,
-      consecutiveFailures: n.consecutiveFailures || 0,
-      cooldownUntil: n.cooldownUntil || null,
       lastLatencyMs: n.lastLatencyMs || null,
       lastUsedAt: n.lastUsedAt || null,
       lastSuccess: n.lastSuccess || null,
@@ -1374,8 +1372,6 @@ on("save-proxies", "click", async () => {
       id: n.id, url: n.url, enabled: n.enabled,
       successCount: n.successCount || 0,
       failureCount: n.failureCount || 0,
-      consecutiveFailures: n.consecutiveFailures || 0,
-      cooldownUntil: n.cooldownUntil || null,
       lastLatencyMs: n.lastLatencyMs || null,
       lastUsedAt: n.lastUsedAt || null,
       lastSuccess: n.lastSuccess || null,

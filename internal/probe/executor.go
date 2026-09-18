@@ -262,9 +262,10 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 // delay, and it is cleared when the ladder reaches its cap so the next failure
 // starts over rather than holding the node out indefinitely.
 func (e *Executor) coolDown(ctx context.Context, authIndex, id string) {
-	failures := e.consecutiveFailures(authIndex, id)
-	cooldown := ProxyCooldown(failures)
-	if _, err := e.pool.MarkFailure(ctx, authIndex, id, cooldown, e.now(), ProxyCooldownReachedCap(failures)); err != nil {
+	// The rung of the failure being recorded, not the one already on file.
+	rung := e.recordedFailures(authIndex, id) + 1
+	cooldown := ProxyCooldown(rung)
+	if _, err := e.pool.MarkFailure(ctx, authIndex, id, cooldown, e.now(), ProxyCooldownReachedCap(rung)); err != nil {
 		e.log(hostapi.LogWarn, "could not cool down proxy", map[string]any{
 			"proxyId": id, "error": err.Error(),
 		})
@@ -420,16 +421,20 @@ func isModelUnsupported(resp *http.Response) bool {
 	return false
 }
 
-// consecutiveFailures is how many times this account has failed against this
-// node in a row, which is the ladder position the next cooldown comes from.
-func (e *Executor) consecutiveFailures(authIndex, id string) int {
+// recordedFailures is how many consecutive failures this account already has on
+// file against this node; zero when there are none.
+//
+// It is deliberately the count *before* the failure being handled. The ladder
+// position is that number plus one, and conflating the two is what put every
+// rung one step behind: the second failure was charged the first failure's
+// delay, and the cap arrived one failure late.
+func (e *Executor) recordedFailures(authIndex, id string) int {
 	for _, row := range e.pool.CooldownsForProxy(id) {
 		if row.AuthIndex == authIndex {
 			return row.ConsecutiveFailures
 		}
 	}
-	// No record: this is the first failure, and the base delay is what follows.
-	return 1
+	return 0
 }
 
 func (e *Executor) log(level hostapi.LogLevel, msg string, fields map[string]any) {
