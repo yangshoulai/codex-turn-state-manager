@@ -95,3 +95,41 @@ process.exit(0);
 		t.Logf("node output: %s", out)
 	}
 }
+
+// TestPanelKeepsTheInheritedKeyOutOfTheLoginForm pins the deliberate choice not
+// to pre-fill the management key input.
+//
+// The input only appears when authentication failed, where the useful value is
+// a different key -- pre-filling a rejected one is misleading. The key is shown
+// in the session banner instead, masked until the operator asks for it.
+func TestPanelKeepsTheInheritedKeyOutOfTheLoginForm(t *testing.T) {
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+
+	if !strings.Contains(string(html), `id="session"`) {
+		t.Error("index.html has no session banner to report an inherited key")
+	}
+	if !strings.Contains(string(html), `id="session-switch"`) {
+		t.Error("the banner offers no way to switch to another key")
+	}
+
+	// enterPanel must take the inherited key so the banner can report it.
+	if !strings.Contains(string(js), "function enterPanel(inheritedKey)") {
+		t.Error("enterPanel does not receive the inherited key")
+	}
+	// The form field is only ever cleared, never seeded with a key.
+	if !strings.Contains(string(js), `$("key").value = ""`) {
+		t.Error("switching keys should clear the field rather than pre-fill it")
+	}
+	// The top-level `key` JSON field and the form field share a name in some
+	// refactors; make sure the form is not being written from the session.
+	if strings.Contains(string(js), `$("key").value = inherited`) {
+		t.Error("the inherited key is being pre-filled into the login form")
+	}
+}

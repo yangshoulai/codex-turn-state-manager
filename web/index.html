@@ -14,6 +14,12 @@
     <h1>Codex Turn State Manager</h1>
   </div>
   <div class="topbar-right">
+    <span id="session" class="session" hidden>
+      <span class="dot dot-ok"></span>
+      <span>已沿用管理面板会话密钥</span>
+      <button id="session-reveal" class="btn btn-sm" type="button" title="显示或隐藏密钥">显示</button>
+      <button id="session-switch" class="btn btn-sm" type="button">改用其他密钥</button>
+    </span>
     <span id="conn" class="pill pill-idle">未连接</span>
     <span id="version" class="muted"></span>
   </div>

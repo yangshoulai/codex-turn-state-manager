@@ -249,15 +249,43 @@ function table(headers, rows, emptyText) {
 
 /* ------------------------------------------------------------------ gate */
 
-function enterPanel() {
+// showSessionNotice reports where the working key came from.
+//
+// It is deliberately not pre-filled into the login input: that field only
+// appears when authentication failed, where the useful value is a *different*
+// key. The banner is where "which key am I using" belongs, and it stays masked
+// until asked so the key is not sitting in the DOM by default.
+function showSessionNotice(inheritedKey) {
+  const node = $("session");
+  const reveal = $("session-reveal");
+  if (!inheritedKey) {
+    node.hidden = true;
+    return;
+  }
+  let shown = false;
+  const paint = () => {
+    reveal.textContent = shown ? inheritedKey : "显示";
+    reveal.title = shown ? "隐藏密钥" : "显示或隐藏密钥";
+  };
+  paint();
+  reveal.onclick = () => {
+    shown = !shown;
+    paint();
+  };
+  node.hidden = false;
+}
+
+function enterPanel(inheritedKey) {
   $("gate").hidden = true;
   $("panel").hidden = false;
+  showSessionNotice(inheritedKey);
   setConn("已连接", "pill-ok");
 }
 
 function showGate(message) {
   $("gate").hidden = false;
   $("panel").hidden = true;
+  $("session").hidden = true;
   setConn("未连接", "pill-idle");
   if (message) {
     $("gate-error").textContent = message;
@@ -265,11 +293,18 @@ function showGate(message) {
   }
 }
 
-async function connectWith(key) {
+async function connectWith(key, inheritedKey) {
   managementKey = key;
   await loadAll();
-  enterPanel();
+  enterPanel(inheritedKey);
 }
+
+$("session-switch").addEventListener("click", () => {
+  managementKey = "";
+  $("key").value = "";
+  showGate();
+  $("key").focus();
+});
 
 $("gate-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -289,7 +324,7 @@ $("gate-form").addEventListener("submit", async (event) => {
   const inherited = readInheritedKey();
   if (inherited.key) {
     try {
-      await connectWith(inherited.key);
+      await connectWith(inherited.key, inherited.key);
       return;
     } catch {
       // The inherited key was rejected, or the API is unreachable. Fall through
