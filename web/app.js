@@ -252,13 +252,28 @@ async function api(method, path, body) {
   }
   const resp = await fetch(BASE + path, options);
   const text = await resp.text();
+  let parsed = false;
   let payload = null;
   if (text) {
-    try { payload = JSON.parse(text); } catch { payload = { error: text }; }
+    try { payload = JSON.parse(text); parsed = true; } catch { payload = { error: text }; }
   }
   if (!resp.ok) {
-    const message = (payload && payload.error) || `HTTP ${resp.status}`;
-    throw new Error(message);
+    // A 404 with no JSON body is the router answering, not this plugin: the
+    // management route the page asked for does not exist. In practice that
+    // means the plugin was updated underneath an open tab -- the route set is
+    // rebuilt on reload, so old paths stop answering immediately -- while this
+    // page is still running the previous version's code. Saying "404 page not
+    // found" leaves the operator with nothing to do; naming the fix does not.
+    if (resp.status === 404 && !parsed) {
+      const stale = new Error(
+        "管理接口返回 404：页面可能来自旧版本的插件，而插件已经更新。请刷新页面（Ctrl/Cmd+Shift+R 可绕过缓存）。");
+      stale.status = 404;
+      stale.stalePage = true;
+      throw stale;
+    }
+    const err = new Error((payload && payload.error) || `HTTP ${resp.status}`);
+    err.status = resp.status;
+    throw err;
   }
   return payload;
 }
@@ -540,6 +555,16 @@ on("gate-form", "submit", async (event) => {
       await connectWith(inherited.key, inherited.key);
       return;
     } catch (err) {
+      // The plugin was updated while this page was open, so the routes this
+      // copy of the panel knows about no longer exist. Reload once to pick up
+      // the panel that ships with the running plugin -- this is the case that
+      // actually happened in production, where the symptom was a login form
+      // and a 404 that named nothing the operator could act on.
+      if (err && err.stalePage && !staleReloadAttempted()) {
+        markStaleReloadAttempted();
+        window.location.reload();
+        return;
+      }
       // Report *why*, not just that it failed. "Rejected key" and "the panel
       // threw while rendering" look identical otherwise, and they need
       // completely different responses.
@@ -1386,12 +1411,30 @@ async function refresh() {
   // loadStatus belongs here: without it the pipeline counters freeze at
   // whatever they were when the panel connected, which is the one moment they
   // are guaranteed to read zero.
-  await Promise.allSettled([
+  const results = await Promise.allSettled([
     loadStatus(), loadAccounts(), loadProxies(), loadProbes(),
     // Every account's models arrive in this one request, so the cost of the
     // cycle no longer grows with how many accounts are expanded.
     loadAllModels(),
   ]);
+
+  // The page outlived the plugin it was served by: the management routes were
+  // rebuilt underneath it and the ones it knows about are gone. Everything it
+  // can do is already broken, so reload once to pick up the plugin's own panel.
+  //
+  // Once, not every cycle: a reload that does not fix it must not become a
+  // refresh loop. sessionStorage is per-tab, so a second tab still gets its own
+  // attempt.
+  if (results.some((r) => r.status === "rejected" && r.reason && r.reason.stalePage)) {
+    clearInterval(refreshTimer);
+    if (!staleReloadAttempted()) {
+      markStaleReloadAttempted();
+      window.location.reload();
+      return;
+    }
+    toast("插件已更新，但当前页面仍是旧版本。请手动刷新（Ctrl/Cmd+Shift+R 绕过缓存）。", true);
+    return;
+  }
 
   // Redraw from the cache that just landed. Expanded model tables were once the
   // one thing left out, so a binding that turned fresh stayed stale on screen
@@ -1416,6 +1459,25 @@ on("sync-accounts", "click", async () => {
 
 // Refresh the volatile sections periodically so probe activity is visible
 // without a manual reload.
-setInterval(() => {
+// staleReloadKey guards the single automatic reload described in refresh().
+const staleReloadKey = "turn-state:stale-reload";
+
+function staleReloadAttempted() {
+  try {
+    return sessionStorage.getItem(staleReloadKey) === "1";
+  } catch {
+    // Storage unavailable: skip the automatic reload rather than risk a loop
+    // we cannot count.
+    return true;
+  }
+}
+
+function markStaleReloadAttempted() {
+  try {
+    sessionStorage.setItem(staleReloadKey, "1");
+  } catch { /* the reload still happens; only the guard is lost */ }
+}
+
+const refreshTimer = setInterval(() => {
   if (managementKey && !$("panel").hidden) refresh();
 }, 15000);
