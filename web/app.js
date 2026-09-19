@@ -1279,8 +1279,35 @@ on("modal-clear", "click", async () => {
 
 /* --------------------------------------------------------------- proxies */
 
+// mergeProxies keeps rows the operator has added but the server has not
+// confirmed.
+//
+// The pool is one list kept in two places, and the server's copy won on every
+// round trip. A row that had been added but not yet saved was therefore dropped
+// -- taking whatever had been typed into it -- the moment a periodic refresh
+// landed, which is what made an entry box disappear mid-edit and the address
+// never get recorded.
+//
+// The match is by address rather than by id, because the id is derived from the
+// address (its host): it changes the instant the operator finishes typing one,
+// so a draft that HAS just been saved would look unknown and be kept twice.
+// Matching the address also means a row that was saved and then removed
+// elsewhere is not resurrected.
+function mergeProxies(server) {
+  const addresses = new Set(server.map((n) => n.url));
+  const drafts = proxiesState.filter((n) => n.draft && (n.url === "" || !addresses.has(n.url)));
+  if (!drafts.length) return server;
+  return server.concat(drafts);
+}
+
 function renderProxies() {
   const host = $("proxies");
+  // Rebuilding the table while an input in it has focus replaces the element
+  // under the cursor: the caret goes, and a keystroke in flight is lost. A
+  // pending edit outranks a background refresh -- the next render after the
+  // operator leaves the field picks up whatever changed.
+  const focused = document.activeElement;
+  if (focused && focused.tagName === "INPUT" && host.contains(focused)) return;
   if (!changed("proxies", proxiesState)) return;
   clear(host);
 
@@ -1358,6 +1385,9 @@ on("add-proxy", "click", () => {
   proxiesState.push({
     id, url: "", enabled: true, successCount: 0, failureCount: 0,
     coolingForAccounts: 0, status: "healthy",
+    // Marks a row this page added. Once the server lists its address the row
+    // comes back from the response instead, and the flag goes with it.
+    draft: true,
   });
   renderProxies();
 });
@@ -1389,38 +1419,13 @@ async function saveProxies() {
   if (!payload.length) return;
   try {
     const resp = await api("PUT", "/proxy-nodes", { proxies: payload });
-    proxiesState = resp.proxies || [];
+    proxiesState = mergeProxies(resp.proxies || []);
     invalidate("proxies");
     renderProxies();
   } catch (err) {
     toast(err.message, true);
   }
 }
-
-on("save-proxies", "click", async () => {
-  const payload = proxiesState
-    .filter((n) => n.url)
-    .map((n) => ({
-      id: n.id, url: n.url, enabled: n.enabled,
-      successCount: n.successCount || 0,
-      failureCount: n.failureCount || 0,
-      lastLatencyMs: n.lastLatencyMs || null,
-      lastUsedAt: n.lastUsedAt || null,
-      lastSuccess: n.lastSuccess || null,
-      lastFailure: n.lastFailure || null,
-    }));
-  if (payload.length !== proxiesState.length) {
-    toast("已忽略地址为空的节点", true);
-  }
-  try {
-    const resp = await api("PUT", "/proxy-nodes", { proxies: payload });
-    proxiesState = resp.proxies || [];
-    renderProxies();
-    toast("代理池已保存");
-  } catch (err) {
-    toast(err.message, true);
-  }
-});
 
 /* ---------------------------------------------------------- probe history */
 
@@ -1563,7 +1568,7 @@ async function loadAccounts() {
 
 async function loadProxies() {
   const payload = await api("GET", "/proxy-nodes");
-  proxiesState = payload.proxies || [];
+  proxiesState = mergeProxies(payload.proxies || []);
   renderProxies();
   refreshConfigSummary();
 }

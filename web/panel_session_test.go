@@ -384,7 +384,7 @@ func TestPanelCallsOnlyDefinedFunctions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read app.js: %v", err)
 	}
-	src := string(js)
+	src := stripWholeLineComments(string(js))
 
 	declared := map[string]bool{}
 	patterns := []string{
@@ -666,4 +666,125 @@ func TestPanelTargetLengthIsDescribedAsAFallback(t *testing.T) {
 			t.Errorf("the setting's hint does not mention %q", want)
 		}
 	}
+}
+
+// TestPanelProxyMergeKeepsUnsavedRows is the regression guard for a row that
+// vanished mid-edit.
+//
+// The proxy pool is one list kept in two places, and the server's copy replaced
+// the local one on every round trip. A row that had been added but not yet
+// saved was therefore dropped when a periodic refresh landed, taking whatever
+// had been typed into it -- reported as the entry box disappearing at the fifth
+// node and the address never being recorded.
+//
+// mergeProxies is pure, so the rules can be asserted directly rather than
+// through a browser: a draft survives, a draft the server has confirmed is
+// handed over to the server's copy, and a row the server no longer lists is not
+// resurrected.
+func TestPanelProxyMergeKeepsUnsavedRows(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping panel proxy merge check")
+	}
+
+	script := `
+const fs = require('fs');
+const src = fs.readFileSync('app.js', 'utf8');
+const start = src.indexOf('function mergeProxies');
+const end = src.indexOf('function renderProxies');
+if (start < 0 || end < 0) { console.error('mergeProxies not found'); process.exit(2); }
+
+// proxiesState is a module-level binding in the panel; injecting it as a
+// parameter of the same name is what lets the function resolve it here.
+function withState(state) {
+  return new Function('proxiesState', src.slice(start, end) + '\nreturn mergeProxies;')(state);
+}
+function fail(msg) { console.error(msg); process.exit(1); }
+function eq(got, want, label) {
+  const g = JSON.stringify(got), w = JSON.stringify(want);
+  if (g !== w) fail(label + ': got ' + g + ', want ' + w);
+}
+
+const saved = (id, url) => ({ id, url, enabled: true });
+
+// A row the server has never seen survives, whatever it holds.
+eq(withState([{ id: 'p1', url: '', draft: true }])([]),
+   [{ id: 'p1', url: '', draft: true }], 'an empty draft survives');
+
+eq(withState([{ id: 'p1', url: 'http://typing.example:1', draft: true }])([]),
+   [{ id: 'p1', url: 'http://typing.example:1', draft: true }],
+   'a draft being typed survives');
+
+// Once the server lists the address the server's copy is the one kept.
+eq(withState([{ id: 'p1', url: 'http://a.example:1', draft: true }])([saved('a.example:1', 'http://a.example:1')]),
+   [saved('a.example:1', 'http://a.example:1')],
+   'a confirmed draft is not duplicated despite the id changing');
+
+// A server row with no local counterpart is passed through untouched.
+const two = [saved('a.example:1', 'http://a.example:1'), saved('b.example:2', 'http://b.example:2')];
+eq(withState([])(two), two, 'server rows pass through');
+
+// A row removed elsewhere is not resurrected by a stale local copy.
+eq(withState([{ id: 'gone', url: 'http://gone.example:1' }])([]), [],
+   'a non-draft row the server dropped does not come back');
+
+// Mixed: saved rows keep their order, drafts follow.
+eq(withState([
+     { id: 'a.example:1', url: 'http://a.example:1', draft: true },
+     { id: 'draft', url: '', draft: true },
+   ])([saved('a.example:1', 'http://a.example:1')]),
+   [saved('a.example:1', 'http://a.example:1'), { id: 'draft', url: '', draft: true }],
+   'saved first, draft appended');
+process.exit(0);
+`
+	cmd := exec.Command(node, "-e", script)
+	cmd.Dir = "."
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("panel proxy merge check failed: %v\n%s", err, out)
+	}
+
+	// The function's rules are only half of it: the defect was that the state
+	// was replaced wholesale at the call sites, and a test of the function
+	// cannot see that. Every path that adopts a server list has to go through
+	// the merge, so assert that on the source.
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	source := string(js)
+	for _, call := range []string{
+		"proxiesState = mergeProxies(payload.proxies || [])",
+		"proxiesState = mergeProxies(resp.proxies || [])",
+	} {
+		if !strings.Contains(source, call) {
+			t.Errorf("a server round trip adopts the response without merging: %s", call)
+		}
+	}
+	if strings.Contains(source, "proxiesState = payload.proxies") ||
+		strings.Contains(source, "proxiesState = resp.proxies") {
+		t.Error("the proxy state is replaced wholesale again; unsaved rows would vanish")
+	}
+}
+
+// stripWholeLineComments drops lines that are entirely a comment before a
+// source scan looks at them.
+//
+// The scan that guards against a renamed function is textual, so prose counts
+// as code: a comment reading "by address (its host)" was reported as a call to
+// an undeclared function named address. Only whole-line comments are removed,
+// deliberately -- a naive strip of everything after "//" would cut a line at
+// the "//" inside "http://..." and hide real code, which is a worse failure
+// than the false positive it fixes.
+func stripWholeLineComments(src string) string {
+	lines := strings.Split(src, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
