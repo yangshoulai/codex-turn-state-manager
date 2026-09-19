@@ -181,9 +181,14 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 			// be evaluating against a completely different hour.
 			zoneName, offset := now.Zone()
 			return map[string]any{
-				"allowsProbe":   a.svc.Windows().ShouldProbeNow(now),
-				"enabled":       enabled,
-				"serverTime":    now.Format(time.RFC3339),
+				"allowsProbe": a.svc.Windows().ShouldProbeNow(now),
+				"enabled":     enabled,
+				"serverTime":  now.Format(time.RFC3339),
+				// Preformatted in the server's own zone. The panel must not
+				// reformat this: a timestamp converted to the browser's zone
+				// and labelled with the server's zone name says two different
+				// things at once, which is worse than saying nothing.
+				"serverClock":   now.Format("15:04:05"),
 				"timezone":      now.Location().String(),
 				"zone":          zoneName,
 				"offsetMinutes": offset / 60,

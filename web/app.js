@@ -475,9 +475,24 @@ function refreshConfigSummary() {
     // evaluated in the host's timezone while these timestamps render in the
     // browser's, and an eight-hour gap makes "why did it probe at 02:44" a
     // question about clocks rather than about configuration.
-    const clock = windowState && windowState.serverTime
-      ? ` · 服务器 ${fmtClock(windowState.serverTime)} ${windowState.zone || ""}`.trimEnd()
-      : "";
+    // The server's own wall clock, already formatted there. Reformatting it
+    // through new Date() would render it in the browser's zone while the label
+    // still said the server's, which reads as a timezone claim that is false.
+    let clock = "";
+    if (windowState && windowState.serverClock) {
+      const zone = windowState.zone ? ` ${windowState.zone}` : "";
+      clock = ` · 服务器 ${windowState.serverClock}${zone}`;
+      // The window is evaluated on that clock, so a difference from the one the
+      // operator reads the records in is the whole explanation for "why did it
+      // probe outside my hours". Say the size of the gap rather than leaving it
+      // to be worked out.
+      const serverOffset = windowState.offsetMinutes;
+      const browserOffset = -new Date().getTimezoneOffset();
+      if (typeof serverOffset === "number" && serverOffset !== browserOffset) {
+        const hours = Math.abs(serverOffset - browserOffset) / 60;
+        clock += `（与浏览器相差 ${hours} 小时，窗口按服务器时间判定）`;
+      }
+    }
     parts.push(allowed === false
       ? `窗口 ${ranges}（当前禁止探测${clock}）`
       : `窗口 ${ranges}${clock}`);
