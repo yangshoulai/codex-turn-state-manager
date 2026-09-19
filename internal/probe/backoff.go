@@ -69,6 +69,13 @@ type Backoff struct {
 	RefreshThresholdPct int
 	// RetryAfter is the upstream Retry-After hint for rate limiting.
 	RetryAfter time.Duration
+	// NonTargetStreak is how many consecutive wrong-shaped values this pair has
+	// produced, including the one being scheduled for. The retry interval grows
+	// with it, so a pair that will never yield the shape stops being asked
+	// every few minutes.
+	NonTargetStreak int
+	// NonTargetCap bounds that growth. Zero means the default.
+	NonTargetCap time.Duration
 	// Jitter returns a duration in [0, n). Injectable for deterministic tests.
 	Jitter func(n time.Duration) time.Duration
 }
@@ -77,6 +84,22 @@ type Backoff struct {
 const (
 	NonTargetMinDelay = 2 * time.Minute
 	NonTargetMaxDelay = 5 * time.Minute
+
+	// NonTargetEscalateAfter is how many consecutive wrong-shaped answers a pair
+	// may give at the base cadence before the interval starts growing.
+	//
+	// A few in a row is a transient -- the upstream has not settled, or is
+	// answering a slightly different question than we asked -- and deserves the
+	// same prompt retry as any other miss. Past that, the pair is telling us
+	// this model does not yield the shape we want, and retrying every few
+	// minutes only spends proxy reputation to learn the same thing again.
+	NonTargetEscalateAfter = 3
+
+	// NonTargetDelayCapDefault bounds the grown interval when nothing is
+	// configured. Half an hour still notices a model that starts working again
+	// within the hour, while cutting the request rate by an order of magnitude
+	// for one that never does.
+	NonTargetDelayCapDefault = 30 * time.Minute
 
 	NoProxyDelay    = 5 * time.Minute
 	TimeoutAllDelay = 5 * time.Minute
@@ -88,6 +111,31 @@ const (
 	// Retry-After header.
 	DefaultRetryAfter = 5 * time.Minute
 )
+
+// nonTargetDelay grows the retry interval with the length of the run.
+//
+// The base delay carries the jitter, and each step past the threshold doubles
+// what the jitter produced, so two pairs in the same state do not converge on
+// the same schedule. The cap is a floor on the request rate, not a deadline:
+// past it the pair is still probed, just rarely, because the upstream may
+// change its mind about a model at any time.
+func (b Backoff) nonTargetDelay() time.Duration {
+	delay := b.jitter(NonTargetMaxDelay-NonTargetMinDelay) + NonTargetMinDelay
+	if b.NonTargetStreak <= NonTargetEscalateAfter {
+		return delay
+	}
+	cap := b.NonTargetCap
+	if cap <= 0 {
+		cap = NonTargetDelayCapDefault
+	}
+	for i := NonTargetEscalateAfter; i < b.NonTargetStreak; i++ {
+		delay *= 2
+		if delay >= cap {
+			return cap
+		}
+	}
+	return delay
+}
 
 // NextDelay returns how long to wait before the next probe of this pair.
 //
@@ -106,7 +154,7 @@ func (b Backoff) NextDelay(o Outcome) time.Duration {
 	case OutcomeSuccessNonTarget, OutcomeSuccessStale:
 		// A stale value is retried on the same cadence as a wrong-shaped one:
 		// both mean "come back later", neither means "this node is bad".
-		return b.jitter(NonTargetMaxDelay-NonTargetMinDelay) + NonTargetMinDelay
+		return b.nonTargetDelay()
 
 	case OutcomeNoProxyAvailable:
 		return NoProxyDelay

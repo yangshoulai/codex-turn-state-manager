@@ -137,6 +137,10 @@
           <input type="number" id="s-maxproxies" min="1" max="100">
           <span class="field-hint">默认 10。一轮探测最多尝试这么多个节点，用完即结束本轮</span>
         </label>
+        <label>非目标退避上限（分钟）
+          <input type="number" id="s-nontargetcap" min="5" max="1440">
+          <span class="field-hint">默认 30。连续拿不到目标长度的 pair，重试间隔从 2–5 分钟逐步翻倍到此上限，避免一直消耗代理</span>
+        </label>
       </div>
 
       <div class="strategy">

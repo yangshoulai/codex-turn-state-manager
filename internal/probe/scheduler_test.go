@@ -561,3 +561,78 @@ func TestSchedulerScanSurvivesASlowSync(t *testing.T) {
 		t.Fatal("Scan did not return while the account sync was blocked; the scan loop would stop permanently")
 	}
 }
+
+// TestScheduler_NonTargetBackoffGrowsThroughTheScan is the wiring check: the
+// pure delay function is only half of it, and the run length has to actually
+// reach the schedule the scan writes.
+//
+// A pair that keeps answering with the wrong shape used to be re-probed every
+// few minutes forever, and every round walks the proxy pool. The cost of
+// learning the same thing repeatedly lands on the proxies, which is what the
+// escalation exists to stop.
+func TestScheduler_NonTargetBackoffGrowsThroughTheScan(t *testing.T) {
+	ctx := context.Background()
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	h := newSchedHarness(t, []states.Pair{pair})
+
+	// Every probe misses, which is the case being scheduled for.
+	h.scheduler.SetProbeFunc(func(context.Context, string, string) Result {
+		return Result{Outcome: OutcomeSuccessNonTarget, StateValue: "short", StateLength: 5}
+	})
+
+	// Scan starts probes in goroutines, so it returns before the pair has been
+	// rescheduled. Wait for the schedule rather than assuming Scan's return
+	// means the round is over.
+	awaitScheduled := func(round int, after time.Time) time.Time {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			// Strictly after this round's start: the previous round's schedule
+			// is still in the map until the probe finishes, so "is it set" would
+			// read the stale one and return immediately.
+			if next, ok := h.scheduler.NextProbeAt(pair); ok && next.After(after) {
+				return next
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		t.Fatalf("round %d: no next probe scheduled", round)
+		return time.Time{}
+	}
+
+	var delays []time.Duration
+	for round := 0; round < 7; round++ {
+		at := h.clock.Now()
+		h.scheduler.Scan(ctx)
+		next := awaitScheduled(round, at)
+		delays = append(delays, next.Sub(at))
+
+		// Let the scheduled time arrive so the next scan picks the pair up
+		// again; without this the scan would find nothing due and the run would
+		// never grow.
+		h.clock.Add(next.Sub(at) + time.Second)
+	}
+
+	// The first three rounds stay at the base cadence; the interval then grows.
+	if delays[0] != NonTargetMinDelay {
+		t.Errorf("round 1 delay = %s, want the base %s", delays[0], NonTargetMinDelay)
+	}
+	if delays[3] <= delays[2] {
+		t.Errorf("the run did not grow the interval: %v", delays)
+	}
+	if last := delays[len(delays)-1]; last > NonTargetDelayCapDefault {
+		t.Errorf("delay %s exceeded the default cap %s", last, NonTargetDelayCapDefault)
+	}
+
+	// And a hit ends it: the pair goes back to the base cadence immediately.
+	h.scheduler.SetProbeFunc(func(context.Context, string, string) Result {
+		return Result{Outcome: OutcomeSuccessTarget, StateValue: "target", StateLength: 292}
+	})
+	at := h.clock.Now()
+	h.scheduler.Scan(ctx)
+	next := awaitScheduled(7, at)
+	// The escalation no longer applies: the interval is the TTL-derived one,
+	// which for the harness's one-hour TTL and 15% threshold is 51 minutes.
+	if got := next.Sub(at); got != 51*time.Minute {
+		t.Errorf("after a hit the interval is %s, want the TTL-derived 51m", got)
+	}
+}

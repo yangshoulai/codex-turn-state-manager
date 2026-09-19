@@ -340,6 +340,10 @@ func (s *Scheduler) runProbe(ctx context.Context, p states.Pair) {
 		TTL:                 values.StateTTL,
 		RefreshThresholdPct: values.RefreshThresholdPct,
 		Jitter:              s.jitter,
+		// The run length decides how long a pair that keeps answering with the
+		// wrong shape waits before asking again.
+		NonTargetStreak: s.NonTargetStreak(p),
+		NonTargetCap:    values.NonTargetBackoffCap,
 	}
 	if result.Err != nil {
 		s.log(hostapi.LogDebug, "probe finished", map[string]any{

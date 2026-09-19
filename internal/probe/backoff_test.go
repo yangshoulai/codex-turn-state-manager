@@ -218,3 +218,64 @@ func cooldownFor(pool *proxies.Pool, authIndex, proxyID string) proxies.Cooldown
 	}
 	return proxies.Cooldown{}
 }
+
+// TestNonTargetDelay_GrowsWithTheRun is the guard on proxy load.
+//
+// A pair that never yields the right shape used to be retried every two to five
+// minutes forever, and each round walks the pool -- which spends proxy
+// reputation to learn the same thing repeatedly. The interval now grows with
+// the run, so the steady-state request rate for such a pair falls by an order
+// of magnitude while a transient wrong shape still gets a prompt retry.
+func TestNonTargetDelay_GrowsWithTheRun(t *testing.T) {
+	// Deterministic jitter: the bottom of the base range, so the growth is what
+	// is being measured rather than the jitter.
+	b := func(streak int) Backoff {
+		return Backoff{
+			Jitter:          func(time.Duration) time.Duration { return 0 },
+			NonTargetStreak: streak,
+			NonTargetCap:    30 * time.Minute,
+		}
+	}
+
+	// The first few stay at the base cadence: a wrong shape twice in a row is
+	// not yet evidence of anything permanent.
+	for _, streak := range []int{1, 2, 3} {
+		if got := b(streak).NextDelay(OutcomeSuccessNonTarget); got != NonTargetMinDelay {
+			t.Errorf("streak %d: delay = %s, want the base %s", streak, got, NonTargetMinDelay)
+		}
+	}
+
+	// Then it doubles, and stops at the cap rather than growing without bound.
+	cases := map[int]time.Duration{
+		4:  4 * time.Minute,
+		5:  8 * time.Minute,
+		6:  16 * time.Minute,
+		7:  30 * time.Minute, // 32m clamped to the cap
+		20: 30 * time.Minute,
+	}
+	for streak, want := range cases {
+		if got := b(streak).NextDelay(OutcomeSuccessNonTarget); got != want {
+			t.Errorf("streak %d: delay = %s, want %s", streak, got, want)
+		}
+	}
+
+	// A stale value rides the same escalation: it means "come back later" for
+	// the same reason, and it is not a node fault either.
+	if got := b(6).NextDelay(OutcomeSuccessStale); got != 16*time.Minute {
+		t.Errorf("a stale value at streak 6 waited %s, want 16m", got)
+	}
+
+	// Without a configured cap the default applies, so the setting is a knob
+	// rather than a requirement.
+	noCap := Backoff{Jitter: func(time.Duration) time.Duration { return 0 }, NonTargetStreak: 40}
+	if got := noCap.NextDelay(OutcomeSuccessNonTarget); got != NonTargetDelayCapDefault {
+		t.Errorf("with no cap configured, delay = %s, want %s", got, NonTargetDelayCapDefault)
+	}
+
+	// A successful hit is unaffected by any of this: the run has ended, and the
+	// interval comes from the TTL rather than from anything above.
+	hit := Backoff{TTL: time.Hour, Jitter: func(time.Duration) time.Duration { return 0 }}
+	if got := hit.NextDelay(OutcomeSuccessTarget); got != time.Hour {
+		t.Errorf("a target hit waited %s, want the TTL-derived interval", got)
+	}
+}

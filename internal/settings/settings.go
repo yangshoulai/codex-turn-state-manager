@@ -32,6 +32,7 @@ const (
 	KeyAccountSyncSec         = "account_sync_interval_sec"
 	KeyProbeRetentionHours    = "probe_history_retention_hours"
 	KeyMaxProxiesPerProbe     = "max_proxies_per_probe"
+	KeyNonTargetBackoffCapMin = "non_target_backoff_cap_min"
 )
 
 // RoutingStrategy selects how the credential scheduler picks among candidates.
@@ -89,6 +90,12 @@ type Values struct {
 	// time failing; the cap bounds the cost of a round without changing which
 	// nodes are eligible.
 	MaxProxiesPerProbe int
+
+	// NonTargetBackoffCap bounds how long a pair that keeps answering with the
+	// wrong shape waits between rounds. The interval grows from the base delay
+	// towards this; without a cap the pair would eventually stop being probed
+	// at all, and the upstream may start yielding the right shape at any time.
+	NonTargetBackoffCap time.Duration
 }
 
 // Defaults returns the documented default configuration (design doc 3.3/3.5).
@@ -108,6 +115,7 @@ func Defaults() Values {
 		AccountSyncInterval:      5 * time.Minute,
 		ProbeRetention:           24 * time.Hour,
 		MaxProxiesPerProbe:       10,
+		NonTargetBackoffCap:      30 * time.Minute,
 	}
 }
 
@@ -124,6 +132,10 @@ const (
 	MaxProbeRetention    = 365 * 24 * time.Hour
 	MinProxiesPerProbe   = 1
 	MaxProxiesPerProbe   = 100
+	// Bounded so an operator cannot effectively disable probing for a pair, nor
+	// reintroduce the every-few-minutes retry the escalation exists to stop.
+	MinNonTargetBackoffCap = 5 * time.Minute
+	MaxNonTargetBackoffCap = 24 * time.Hour
 )
 
 // Store persists settings. Implemented by storage.SettingsStore.
@@ -224,6 +236,7 @@ type Patch struct {
 	AccountSyncInterval      *time.Duration
 	ProbeRetention           *time.Duration
 	MaxProxiesPerProbe       *int
+	NonTargetBackoffCapMin   *int
 }
 
 // Update applies a patch, validates it, persists it and publishes a new
@@ -276,6 +289,9 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	if p.MaxProxiesPerProbe != nil {
 		next.MaxProxiesPerProbe = *p.MaxProxiesPerProbe
 	}
+	if p.NonTargetBackoffCapMin != nil {
+		next.NonTargetBackoffCap = time.Duration(*p.NonTargetBackoffCapMin) * time.Minute
+	}
 
 	if err := next.Validate(); err != nil {
 		return nil, err
@@ -321,6 +337,10 @@ func (v *Values) Validate() error {
 		return fmt.Errorf("settings: max_proxies_per_probe must be between %d and %d, got %d",
 			MinProxiesPerProbe, MaxProxiesPerProbe, v.MaxProxiesPerProbe)
 	}
+	if v.NonTargetBackoffCap < MinNonTargetBackoffCap || v.NonTargetBackoffCap > MaxNonTargetBackoffCap {
+		return fmt.Errorf("settings: non_target_backoff_cap_min must be between %s and %s, got %s",
+			MinNonTargetBackoffCap, MaxNonTargetBackoffCap, v.NonTargetBackoffCap)
+	}
 	if v.MaxProbeDuration < MinMaxProbeDuration {
 		return fmt.Errorf("settings: max_probe_duration must be at least %s, got %s", MinMaxProbeDuration, v.MaxProbeDuration)
 	}
@@ -351,6 +371,7 @@ func encode(v Values) (map[string]string, error) {
 		KeyAccountSyncSec:         strconv.Itoa(int(v.AccountSyncInterval / time.Second)),
 		KeyProbeRetentionHours:    strconv.Itoa(int(v.ProbeRetention / time.Hour)),
 		KeyMaxProxiesPerProbe:     strconv.Itoa(v.MaxProxiesPerProbe),
+		KeyNonTargetBackoffCapMin: strconv.Itoa(int(v.NonTargetBackoffCap / time.Minute)),
 	}, nil
 }
 
@@ -435,6 +456,7 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	secsAt(KeyAccountSyncSec, &v.AccountSyncInterval)
 	hoursAt(KeyProbeRetentionHours, &v.ProbeRetention)
 	intAt(KeyMaxProxiesPerProbe, &v.MaxProxiesPerProbe)
+	minsAt(KeyNonTargetBackoffCapMin, &v.NonTargetBackoffCap)
 
 	if s, ok := raw[KeyAccountRoutingStrategy]; ok && strings.TrimSpace(s) != "" {
 		strategy, err := ParseRoutingStrategy(strings.TrimSpace(s))

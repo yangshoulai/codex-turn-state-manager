@@ -234,6 +234,7 @@ type settingsDTO struct {
 	AccountSyncIntervalSec   int    `json:"accountSyncIntervalSec"`
 	ProbeRetentionHours      int    `json:"probeHistoryRetentionHours"`
 	MaxProxiesPerProbe       int    `json:"maxProxiesPerProbe"`
+	NonTargetBackoffCapMin   int    `json:"nonTargetBackoffCapMin"`
 }
 
 func toSettingsDTO(v *settings.Values) settingsDTO {
@@ -252,6 +253,7 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		AccountSyncIntervalSec:   int(v.AccountSyncInterval / time.Second),
 		ProbeRetentionHours:      int(v.ProbeRetention / time.Hour),
 		MaxProxiesPerProbe:       v.MaxProxiesPerProbe,
+		NonTargetBackoffCapMin:   int(v.NonTargetBackoffCap / time.Minute),
 	}
 }
 
@@ -275,6 +277,7 @@ type settingsPatchDTO struct {
 	AccountSyncIntervalSec   *int    `json:"accountSyncIntervalSec"`
 	ProbeRetentionHours      *int    `json:"probeHistoryRetentionHours"`
 	MaxProxiesPerProbe       *int    `json:"maxProxiesPerProbe"`
+	NonTargetBackoffCapMin   *int    `json:"nonTargetBackoffCapMin"`
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +316,7 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		patch.ProbeRetention = &d
 	}
 	patch.MaxProxiesPerProbe = dto.MaxProxiesPerProbe
+	patch.NonTargetBackoffCapMin = dto.NonTargetBackoffCapMin
 	if dto.RoutingStrategy != nil {
 		strategy, err := settings.ParseRoutingStrategy(*dto.RoutingStrategy)
 		if err != nil {

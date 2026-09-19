@@ -140,6 +140,7 @@ const DEFAULTS = {
   maxProbeDurationSec: 90,
   probeHistoryRetentionHours: 24,
   maxProxiesPerProbe: 10,
+  nonTargetBackoffCapMin: 30,
   routingStrategy: "respect_cpa_priority",
 };
 
@@ -656,6 +657,7 @@ function fillSettingsForm(values) {
   $("s-routing").checked = values.statePriorityEnabled;
   $("s-retention").value = values.probeHistoryRetentionHours;
   $("s-maxproxies").value = values.maxProxiesPerProbe;
+  $("s-nontargetcap").value = values.nonTargetBackoffCapMin;
   $("s-scan").value = values.scanIntervalSec;
   $("s-concurrency").value = values.probeConcurrency;
   $("s-ttl").value = values.stateTtlMin;
@@ -722,6 +724,7 @@ on("save-settings", "click", async () => {
     maxProbeDurationSec: Number($("s-maxprobe").value),
     probeHistoryRetentionHours: Number($("s-retention").value),
     maxProxiesPerProbe: Number($("s-maxproxies").value),
+    nonTargetBackoffCapMin: Number($("s-nontargetcap").value),
     routingStrategy: strategy ? strategy.value : undefined,
   };
   try {

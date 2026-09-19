@@ -343,6 +343,14 @@ request succeeded, but this node is not yielding what that account needs.
 **Scanning is not probing.** A one-minute scan only enqueues probes that are actually
 due; a non-target-length result backs off for minutes, not seconds.
 
+**A pair that keeps missing backs off further.** The first few wrong-shaped answers
+retry at the base cadence — a transient deserves one — and the interval then doubles each
+round up to `non_target_backoff_cap_min` (default 30). A model that never yields the
+target shape would otherwise be re-probed every few minutes forever, and every round
+walks the pool, so the cost lands on the proxies rather than on the one pair that is
+never going to work. The run resets on any other outcome, so a model that starts working
+is retried at the base cadence immediately.
+
 **Self-healing.** If a request that carried plugin-injected state fails with
 `previous_response_not_found`, a routing error, or a run of 5xx, the binding is dropped
 and re-probed — so a bad value cannot poison traffic for the rest of its TTL.
@@ -366,6 +374,7 @@ Set from the panel or the Management API. Defaults:
 | `target_state_length` | `292` | Fallback length, used only when an account's plan is unknown; a known plan decides the shape |
 | `max_probe_duration_sec` | `90` | Wall-clock cap on one pair's traversal |
 | `max_proxies_per_probe` | `10` | Nodes one round may try before it stops, whatever the pool depth |
+| `non_target_backoff_cap_min` | `30` | Ceiling for the growing retry interval of a pair that keeps missing |
 | `account_sync_interval_sec` | `300` | How often the account list is re-read from CPA |
 | `probe_history_retention_hours` | `24` | Probe rows older than this are pruned |
 | `account_routing_strategy` | `respect_cpa_priority` | or `state_first` |
