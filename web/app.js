@@ -883,6 +883,17 @@ function renderAccounts() {
       el("div", { class: "who" }, [
         el("strong", { text: account.label || account.authIndex }),
         planBadge(account.plan),
+        // The shape the plugin will accept for this account. It varies by tier
+        // -- a Team account's values are a Plus account's wrong length -- so
+        // showing it is what lets an operator reading a probe log tell "this
+        // value is the wrong shape" from "something else is wrong".
+        account.expectedStateLength
+          ? el("span", {
+              class: "pill pill-idle",
+              title: `该账号的 State 需为 ${account.expectedStateBlocks} 个密文块（${account.expectedStateLength} 字符）；由套餐推导，套餐未知时用配置的目标长度`,
+              text: `${account.expectedStateLength} 字符`,
+            })
+          : null,
         quotaBadge(account.quota),
         el("span", { class: "pill " + statusClass, text: account.status || "unknown" }),
         account.blockedReason

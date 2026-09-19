@@ -2,6 +2,8 @@ package probe
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
 )
 
 const probeTargetLen = 32
@@ -210,12 +213,32 @@ func (h *recordingHistory) all() []HistoryEntry {
 	return out
 }
 
+// fakePlans stands in for the account registry: the executor only needs to be
+// told the tier, not how it was learned.
+type fakePlans struct {
+	mu   sync.Mutex
+	plan map[string]string
+}
+
+func (f *fakePlans) PlanType(authIndex string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.plan[authIndex]
+}
+
+func (f *fakePlans) set(authIndex, plan string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.plan[authIndex] = plan
+}
+
 type execHarness struct {
 	executor *Executor
 	pool     *proxies.Pool
 	host     *hostapi.MockHost
 	history  *recordingHistory
 	models   *models.Registry
+	plans    *fakePlans
 	policy   ExecutorPolicy
 }
 
@@ -234,6 +257,7 @@ func newExecHarness(t *testing.T) *execHarness {
 		pool:    pool,
 		host:    host,
 		history: history,
+		plans:   &fakePlans{plan: map[string]string{}},
 		policy: ExecutorPolicy{
 			TargetStateLength: probeTargetLen,
 			MaxProbeDuration:  5 * time.Second,
@@ -245,6 +269,7 @@ func newExecHarness(t *testing.T) *execHarness {
 		Pool:    pool,
 		Models:  h.models,
 		History: history,
+		Plans:   h.plans,
 		Policy:  func() ExecutorPolicy { return h.policy },
 		// Plain HTTP so the node receives a normal proxied request rather than
 		// a CONNECT tunnel, which is what makes the request assertable.
@@ -1028,5 +1053,94 @@ func TestExecutor_CooldownLadderEscalates(t *testing.T) {
 
 		// Past the cooldown so the node is selectable again for this account.
 		now = now.Add(got + time.Second)
+	}
+}
+
+// envelopeToken builds a value in the shape the upstream actually emits, so the
+// shape checks can be exercised rather than the length fallback.
+func envelopeToken(t *testing.T, blocks int) string {
+	t.Helper()
+	raw := make([]byte, 57+16*blocks)
+	raw[0] = 0x80
+	binary.BigEndian.PutUint64(raw[1:9], uint64(time.Now().Unix()))
+	for i := 9; i < len(raw); i++ {
+		raw[i] = byte(i % 251)
+	}
+	return base64.URLEncoding.EncodeToString(raw)
+}
+
+// TestExecutor_AcceptsTheAccountsShapeNotAFixedLength is the point of reading
+// the envelope: a personal account's correct value is a team account's wrong
+// one, and the same string cannot be both.
+func TestExecutor_AcceptsTheAccountsShapeNotAFixedLength(t *testing.T) {
+	cases := []struct {
+		name   string
+		plan   string
+		blocks int
+		want   Outcome
+	}{
+		{"personal account, personal value", "plus", 10, OutcomeSuccessTarget},
+		{"personal account, team value", "plus", 12, OutcomeSuccessNonTarget},
+		{"team account, team value", "team", 12, OutcomeSuccessTarget},
+		{"team account, personal value", "team", 10, OutcomeSuccessNonTarget},
+		{"business account, team value", "business", 12, OutcomeSuccessTarget},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newExecHarness(t)
+			h.plans.set("codex-auth-1", tc.plan)
+			h.addProxy(t, "p1", respondWith(http.StatusOK, envelopeToken(t, tc.blocks), ""))
+
+			got := h.probe(t)
+			if got.Outcome != tc.want {
+				t.Errorf("outcome = %s, want %s", got.Outcome, tc.want)
+			}
+			if got.StateBlocks != tc.blocks {
+				t.Errorf("StateBlocks = %d, want %d", got.StateBlocks, tc.blocks)
+			}
+		})
+	}
+}
+
+// TestExecutor_UnknownPlanUsesTheConfiguredLength keeps the setting meaningful
+// for an account whose tier the upstream has not stated.
+func TestExecutor_UnknownPlanUsesTheConfiguredLength(t *testing.T) {
+	h := newExecHarness(t)
+	// No plan recorded, and the fake upstream sends no plan header either.
+	h.addProxy(t, "p1", respondWith(http.StatusOK, envelopeToken(t, 12), ""))
+
+	// The harness's configured length is 32, which describes no block count, so
+	// the personal rule applies and a team value is rejected.
+	if got := h.probe(t); got.Outcome != OutcomeSuccessNonTarget {
+		t.Errorf("outcome = %s, want a non-target value for an unknown tier", got.Outcome)
+	}
+
+	// A non-target result benches the node for this account, so a second probe
+	// would find nothing to use. Clear that rather than letting it decide the
+	// test's outcome.
+	if err := h.pool.ResetAllCooldowns(context.Background()); err != nil {
+		t.Fatalf("ResetAllCooldowns: %v", err)
+	}
+
+	// Point the configured length at the team shape and the same value binds.
+	h.policy.TargetStateLength = states.EncodedLength(12)
+	if got := h.probe(t); got.Outcome != OutcomeSuccessTarget {
+		t.Errorf("outcome = %s, want acceptance once the configured length matches", got.Outcome)
+	}
+}
+
+// TestExecutor_PlanOnTheResponseWins covers the first probe of an unseen
+// account: the tier arrives on the same response as the value, and waiting for
+// the next round would reject a perfectly good state.
+func TestExecutor_PlanOnTheResponseWins(t *testing.T) {
+	h := newExecHarness(t)
+	h.addProxy(t, "p1", func(_ int, w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headers.TurnState, envelopeToken(t, 12))
+		w.Header().Set("X-Codex-Plan-Type", "team")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if got := h.probe(t); got.Outcome != OutcomeSuccessTarget {
+		t.Errorf("outcome = %s, want the team shape accepted on the strength of this response", got.Outcome)
 	}
 }

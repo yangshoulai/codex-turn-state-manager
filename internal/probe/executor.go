@@ -13,6 +13,7 @@ import (
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
 )
 
 // HistoryEntry is one row of probe_history -- one proxy attempt.
@@ -82,10 +83,32 @@ type Result struct {
 	// token. Reading it here is free; the panel would otherwise have no source
 	// for the plan at all, since the credential's own claim is often absent.
 	Signals headers.Signals
+
+	// StateBlocks is the ciphertext block count read from the value, and
+	// StateIssued when the upstream minted it. Zero when the value had no
+	// readable envelope, which is also when the length comparison decided the
+	// outcome.
+	StateBlocks int
+	StateIssued time.Time
 }
 
-// Succeeded reports whether a target-length state was harvested.
+// PlanSource reports an account's subscription tier, which decides how many
+// ciphertext blocks its state values carry and therefore how long they are.
+type PlanSource interface {
+	PlanType(authIndex string) string
+}
+
+// Succeeded reports whether a state of the account's shape was harvested.
 func (r Result) Succeeded() bool { return r.Outcome == OutcomeSuccessTarget }
+
+// expectation resolves the state shape this account's values must have.
+func (e *Executor) expectation(authIndex, planFromResponse string, policy ExecutorPolicy) states.Expectation {
+	plan := strings.TrimSpace(planFromResponse)
+	if plan == "" && e.plans != nil {
+		plan = e.plans.PlanType(authIndex)
+	}
+	return states.ExpectationFor(plan, policy.TargetStateLength)
+}
 
 // ExecutorPolicy is the per-run configuration, resolved from settings at call
 // time so a configuration change applies without rebuilding the executor.
@@ -104,6 +127,7 @@ type Executor struct {
 	pool    *proxies.Pool
 	models  *models.Registry
 	history HistoryStore
+	plans   PlanSource
 	policy  func() ExecutorPolicy
 
 	// baseURL is overridable so tests can point at an httptest server.
@@ -118,6 +142,10 @@ type ExecutorConfig struct {
 	Pool    *proxies.Pool
 	Models  *models.Registry
 	History HistoryStore
+	// Plans supplies an account's subscription tier, which decides the shape its
+	// state values must have. Optional: without it every account is judged by
+	// the configured target length, which is the previous behaviour.
+	Plans   PlanSource
 	Policy  func() ExecutorPolicy
 	BaseURL string
 }
@@ -139,6 +167,7 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 		pool:    cfg.Pool,
 		models:  cfg.Models,
 		history: cfg.History,
+		plans:   cfg.Plans,
 		policy:  policy,
 		baseURL: strings.TrimRight(baseURL, "/"),
 		now:     time.Now,
@@ -220,11 +249,17 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 		attempt := e.attempt(runCtx, node, authIndex, model, policy)
 		attempt.ProxyID = node.ID
 
+		// Carried field by field rather than assigned wholesale, so that a
+		// per-attempt field added without being listed here is silently lost
+		// on the way out -- which is exactly what happened to the parsed shape
+		// the first time it was added.
 		result.Outcome = attempt.Outcome
 		result.StateValue = attempt.StateValue
 		result.StateLength = attempt.StateLength
 		result.ProxyID = node.ID
 		result.Err = attempt.Err
+		result.StateBlocks = attempt.StateBlocks
+		result.StateIssued = attempt.StateIssued
 		result.ProxiesTried++
 
 		e.record(runCtx, authIndex, model, attempt, started)
@@ -343,17 +378,27 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 	switch resp.StatusCode {
 	case http.StatusOK:
 		value := headers.Get(resp.Header, headers.TurnState)
+		signals := headers.ParseSignals(resp.Header)
 		out := Result{
 			StateValue:  value,
 			StateLength: len(value),
 			Latency:     latency,
-			Signals:     headers.ParseSignals(resp.Header),
+			Signals:     signals,
 		}
-		if value != "" && len(value) == policy.TargetStateLength {
+		// The plan on this very response is the freshest evidence of what shape
+		// this account's values should have, and it arrives on the same
+		// response as the value being judged. Falling back to the stored plan
+		// and then to the configured length is what keeps a first probe working
+		// before anything has been learned.
+		env, ok := states.AcceptState(value, e.expectation(authIndex, signals.PlanType, policy))
+		if ok {
 			out.Outcome = OutcomeSuccessTarget
+			out.StateIssued = env.Issued
+			out.StateBlocks = env.Blocks
 		} else {
 			// Recorded, never bound (F-15).
 			out.Outcome = OutcomeSuccessNonTarget
+			out.StateBlocks = env.Blocks
 		}
 		return out
 

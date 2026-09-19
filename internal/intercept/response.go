@@ -18,9 +18,16 @@ import (
 // Normal traffic is a second, free source of state: every successful response
 // carrying a target-length value refreshes the binding for the account that
 // served it, which is what keeps active probing rare.
+// PlanSource reports an account's subscription tier, which decides how many
+// ciphertext blocks its state values carry.
+type PlanSource interface {
+	PlanType(authIndex string) string
+}
+
 type Collector struct {
 	settings *settings.Manager
 	states   *states.Registry
+	plans    PlanSource
 	corr     *CorrelationManager
 	logf     func(hostapi.LogLevel, string, map[string]any)
 
@@ -39,9 +46,14 @@ type Collector struct {
 type CollectorConfig struct {
 	Settings *settings.Manager
 	States   *states.Registry
-	Corr     *CorrelationManager
-	Log      func(hostapi.LogLevel, string, map[string]any)
-	Stats    *Stats
+	// Plans supplies an account's subscription tier, which decides the shape
+	// its state values must have. Optional: without it every account is judged
+	// by the configured target length, which is the previous behaviour.
+	Plans PlanSource
+	Corr  *CorrelationManager
+	Log   func(hostapi.LogLevel, string, map[string]any)
+	// Stats receives the pipeline counters.
+	Stats *Stats
 	// Signals receives the account state the upstream reports. The probe path
 	// reads the same headers, but its minimal request does not elicit them --
 	// only real turns do, which is where this runs.
@@ -59,6 +71,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
 		settings:     cfg.Settings,
 		states:       cfg.States,
+		plans:        cfg.Plans,
 		corr:         cfg.Corr,
 		logf:         cfg.Log,
 		stats:        cfg.Stats,
@@ -128,15 +141,6 @@ func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) Capt
 		StateLength: len(chunk.ResponseHeaders.Get(headers.TurnState)),
 	})
 
-	// The plan and rate-limit windows ride along on every real response, and
-	// CPA exposes neither to plugins. It is the only place to learn them, and
-	// it costs nothing.
-	if c.signals != nil && authIndex != "" {
-		if parsed := headers.ParseSignals(chunk.ResponseHeaders); !parsed.Empty() {
-			c.signals(authIndex, parsed)
-		}
-	}
-
 	return c.capture(ctx, chunk.RequestID, chunk.Model, authIndex, chunk.ResponseHeaders)
 }
 
@@ -171,6 +175,15 @@ func (c *Collector) capture(
 		return CaptureResult{Action: CaptureNoAuth}
 	}
 
+	// The plan and rate-limit windows ride along on every real response, and
+	// CPA exposes neither to plugins. It is the only place to learn them, and
+	// it costs nothing -- but it is still a response-header read, so it sits
+	// behind the same switch as the rest and is skipped with it.
+	signals := headers.ParseSignals(header)
+	if c.signals != nil && !signals.Empty() {
+		c.signals(authIndex, signals)
+	}
+
 	if model == "" && hasRec {
 		model = rec.Model
 	}
@@ -201,15 +214,23 @@ func (c *Collector) capture(
 	}
 	unchanged := injected != "" && injected == value
 
-	if len(value) != policy.TargetStateLength {
-		// Wrong length: bound never (F-15).
+	// Shape, not length: the account's plan decides how many ciphertext blocks
+	// its values carry, and a personal account's correct shape is a team
+	// account's wrong one. The plan on this response wins over the stored one,
+	// being newer.
+	plan := signals.PlanType
+	if plan == "" && c.plans != nil {
+		plan = c.plans.PlanType(authIndex)
+	}
+	if _, ok := states.AcceptState(value, states.ExpectationFor(plan, policy.TargetStateLength)); !ok {
+		// Wrong shape: bound never (F-15).
 		c.stats.skipNonTarget.Add(1)
 		if unchanged {
-			// We sent this value and got it back; it is simply not a length
+			// We sent this value and got it back; it is simply not a shape
 			// this plugin binds. Nothing to reconcile.
 			return CaptureResult{Action: CaptureNonTarget, AuthIndex: authIndex, StateLen: len(value)}
 		}
-		// A value of the wrong length that differs from what we hold says the
+		// A value of the wrong shape that differs from what we hold says the
 		// binding describes a token upstream no longer issues. Drop it -- TTL
 		// and all -- and let the next scan probe, rather than keep injecting a
 		// value the upstream has already moved past.

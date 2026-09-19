@@ -15,6 +15,7 @@ import (
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/headers"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
 )
 
 // Config is the per-(account, model) probe toggle.
@@ -71,6 +72,11 @@ type Registry struct {
 	plans PlanReader
 
 	mu sync.RWMutex
+	// targetLength supplies the configured fallback state length, used when an
+	// account's plan is unknown. A function rather than a cached value because
+	// settings are written through the management API, which does not tell this
+	// package -- a cached copy would go stale the moment an operator changed it.
+	targetLength func() int
 	// byIndex is keyed by AuthIndex; byAuthID is the reverse mapping the
 	// scheduler needs when CPA hands back an AuthID.
 	byIndex  map[string]Account
@@ -89,7 +95,7 @@ type PlanReader interface {
 }
 
 // NewRegistry builds an empty registry. Call Load then Sync.
-func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []string, plans PlanReader) *Registry {
+func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []string, plans PlanReader, targetLength func() int) *Registry {
 	if catalogModels == nil {
 		catalogModels = func() []string { return nil }
 	}
@@ -98,6 +104,7 @@ func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []st
 		store:         store,
 		catalogModels: catalogModels,
 		plans:         plans,
+		targetLength:  targetLength,
 		byIndex:       map[string]Account{},
 		byAuthID:      map[string]string{},
 		configs:       map[modelKey]bool{},
@@ -218,13 +225,48 @@ func (r *Registry) resolvePlans(ctx context.Context, authIndexes []string) {
 	}
 }
 
+// TargetStateLength returns the configured fallback length for accounts whose
+// plan the upstream has not stated.
+func (r *Registry) TargetStateLength() int {
+	if r.targetLength == nil {
+		return states.EncodedLength(states.PlanBlocks(""))
+	}
+	if n := r.targetLength(); n > 0 {
+		return n
+	}
+	return states.EncodedLength(states.PlanBlocks(""))
+}
+
+// PlanType reports an account's subscription tier as the upstream described it,
+// or "" when it has not said.
+//
+// Read through the two interfaces that judge a state value's shape, so neither
+// has to know how a plan is learned -- from traffic headers first, from the
+// credential's claim as a fallback.
+func (r *Registry) PlanType(authIndex string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	acc, ok := r.byIndex[authIndex]
+	if !ok {
+		return ""
+	}
+	return acc.Plan.Type
+}
+
 // AllWithBlockReason returns tracked accounts paired with the reason probing is
 // being skipped, so the panel can show why an account is idle.
 func (r *Registry) AllWithBlockReason(now time.Time) []AccountView {
 	accounts := r.All()
+	fallback := r.TargetStateLength()
 	out := make([]AccountView, 0, len(accounts))
 	for _, acc := range accounts {
-		out = append(out, AccountView{Account: acc, BlockedReason: BlockedReason(acc, now)})
+		expect := states.ExpectationFor(acc.Plan.Type, fallback)
+		out = append(out, AccountView{
+			Account:             acc,
+			BlockedReason:       BlockedReason(acc, now),
+			ExpectedStateBlocks: expect.Blocks,
+			ExpectedStateLength: expect.Length,
+		})
 	}
 	return out
 }
@@ -233,6 +275,13 @@ func (r *Registry) AllWithBlockReason(now time.Time) []AccountView {
 type AccountView struct {
 	Account
 	BlockedReason string `json:"blockedReason,omitempty"`
+	// ExpectedStateBlocks and ExpectedStateLength are the shape this account's
+	// values must have, derived from its plan. Surfaced because the shape varies
+	// by tier: a Team account's 332 is a Plus account's wrong length, and an
+	// operator comparing the panel against a probe log needs to see which rule
+	// is being applied rather than assume 292 for everyone.
+	ExpectedStateBlocks int `json:"expectedStateBlocks"`
+	ExpectedStateLength int `json:"expectedStateLength"`
 }
 
 // All returns tracked accounts sorted by label then authIndex.

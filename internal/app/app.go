@@ -123,7 +123,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		logf(hostapi.LogInfo, fmt.Sprintf(format, args...), nil)
 	})
 
-	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), a.catalog.Models, a)
+	// The registry judges state shape for the panel, and the executor and
+	// collector do it on the request path. All three read the same fallback, so
+	// a change to the setting cannot make the panel disagree with what binds.
+	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), a.catalog.Models, a,
+		func() int { return a.settings.Current().TargetStateLength })
 	if err := a.accounts.Load(ctx); err != nil {
 		return nil, a.fail(err)
 	}
@@ -147,6 +151,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		Host:    cfg.Host,
 		Pool:    a.proxies,
 		Models:  a.models,
+		Plans:   a.accounts,
 		History: db.Probes(),
 		Policy: func() probe.ExecutorPolicy {
 			v := a.settings.Current()
@@ -175,7 +180,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
 	})
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
-		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
+		Settings: a.settings, States: a.states, Plans: a.accounts,
+		Corr: a.corr, Log: logf, Stats: a.stats,
 		Signals: a.accounts.RecordSignals,
 		// A binding dropped as stale should be refilled by the next scan, not
 		// by a probe whose backoff predates the discovery.

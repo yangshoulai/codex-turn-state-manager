@@ -283,12 +283,29 @@ request path.
 
 ### Key behaviours
 
+**State shape.** The token carries its own block count and issue time. Ten blocks
+(292 characters) is the personal rule and twelve (332) the team rule; the plan
+decides which applies to an account.
+
 **State lifecycle.** A binding is `FRESH` until 85% of its TTL has elapsed, then
 `REFRESH_DUE` (still injected, but scheduled for renewal), then `EXPIRED`. Default TTL is
 60 minutes.
 
-**Only target-length values bind.** A harvested value whose length is not
-`target_state_length` is recorded and discarded — never bound.
+**Only the right shape binds.** A harvested value that is not the shape its
+account produces is recorded and discarded — never bound.
+
+The shape is **per plan, not one global length**: the token is a version byte, an
+issue timestamp, and a run of ciphertext blocks, and the tier decides how many
+blocks. Ten blocks encode to 292 characters and are what personal accounts
+produce; twelve encode to 332 and are what Team and Business accounts produce. A
+Team value is a plus account's wrong length, so one `target_state_length` cannot
+describe both. The plugin reads the block count from the token itself, resolves
+the expected count from the account's plan (the plan on the response first, then
+the stored one), and only falls back to comparing against `target_state_length`
+when the plan is unknown — which is also the one case that setting governs.
+
+The panel shows the resolved length on each account, so a probe log can be read
+against the rule actually being applied.
 
 **Least-recently-used proxy rotation.** Each probe walks the pool in LRU order, up to
 `max_proxies_per_probe` nodes,
@@ -338,7 +355,7 @@ Set from the panel or the Management API. Defaults:
 | `probe_concurrency` | `2` | Simultaneous pair probes (1–32); each walks the pool serially |
 | `state_ttl_min` | `60` | Binding lifetime |
 | `refresh_threshold_pct` | `15` | Re-probe once this much of the TTL remains |
-| `target_state_length` | `292` | The only length that binds |
+| `target_state_length` | `292` | Fallback length, used only when an account's plan is unknown; a known plan decides the shape |
 | `max_probe_duration_sec` | `90` | Wall-clock cap on one pair's traversal |
 | `max_proxies_per_probe` | `10` | Nodes one round may try before it stops, whatever the pool depth |
 | `account_sync_interval_sec` | `300` | How often the account list is re-read from CPA |

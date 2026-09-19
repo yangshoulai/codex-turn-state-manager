@@ -33,7 +33,7 @@ func newRegistry(t *testing.T, accounts int) (*Registry, *hostapi.MockHost) {
 	}
 	// A nil PlanReader makes resolvePlans a no-op, which keeps the credential
 	// path out of a test that is about the in-memory cache.
-	return NewRegistry(host, stubStore{}, nil, nil), host
+	return NewRegistry(host, stubStore{}, nil, nil, nil), host
 }
 
 func TestRegistry_RecordSignals(t *testing.T) {
