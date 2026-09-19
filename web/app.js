@@ -407,6 +407,9 @@ function statusPill(status) {
 const OUTCOME_PILL = {
   SUCCESS_TARGET: "pill-ok",
   SUCCESS_NON_TARGET: "pill-warn",
+  // The right shape, minted too long ago. Not a fault anywhere -- just a value
+  // worth waiting for a fresher one of.
+  SUCCESS_STALE: "pill-idle",
   RATE_LIMIT: "pill-warn",
   UPSTREAM_ERROR: "pill-warn",
   NETWORK_ERROR: "pill-bad",
@@ -1610,6 +1613,7 @@ async function loadStatus() {
     parts.push(`捕获 ${p.captured || 0}${p.capturedReused ? `+${p.capturedReused}续期` : ""}`);
   }
   if (p.invalidated) parts.push(`自愈 ${p.invalidated}`);
+  if (p.skipStale) parts.push(`过期值 ${p.skipStale}`);
 
   // Whether the scan loop is alive. A stalled loop looks exactly like an idle
   // one from every other number on this page -- pairs overdue, no new rows --

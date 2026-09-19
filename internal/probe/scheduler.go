@@ -85,7 +85,7 @@ type Scheduler struct {
 	// network access.
 	probeFn func(ctx context.Context, authIndex, model string) Result
 	// bindFn is injectable for the same reason.
-	bindFn func(ctx context.Context, authIndex, model, value string, proxyID string) error
+	bindFn func(ctx context.Context, authIndex, model, value string, proxyID string, issued time.Time) error
 	// signalFn receives the account state the upstream reported, when it
 	// reported any. Optional.
 	signalFn func(authIndex string, signals headers.Signals)
@@ -124,7 +124,7 @@ func (s *Scheduler) SetProbeFunc(f func(ctx context.Context, authIndex, model st
 }
 
 // SetBindFunc overrides the binding write. Tests only.
-func (s *Scheduler) SetBindFunc(f func(ctx context.Context, authIndex, model, value, proxyID string) error) {
+func (s *Scheduler) SetBindFunc(f func(ctx context.Context, authIndex, model, value, proxyID string, issued time.Time) error) {
 	s.bindFn = f
 }
 
@@ -324,7 +324,7 @@ func (s *Scheduler) runProbe(ctx context.Context, p states.Pair) {
 			// Master switch off: never bind.
 			return
 		}
-		if err := s.doBind(ctx, p, result.StateValue, result.ProxyID); err != nil {
+		if err := s.doBind(ctx, p, result.StateValue, result.ProxyID, result.StateIssued); err != nil {
 			s.log(hostapi.LogError, "could not bind state", map[string]any{
 				"authIndex": p.AuthIndex, "model": p.Model, "error": err.Error(),
 			})
@@ -358,15 +358,18 @@ func (s *Scheduler) doProbe(ctx context.Context, p states.Pair) Result {
 	return s.src.ProbeExecutor().Probe(ctx, p.AuthIndex, p.Model)
 }
 
-func (s *Scheduler) doBind(ctx context.Context, p states.Pair, value, proxyID string) error {
+func (s *Scheduler) doBind(ctx context.Context, p states.Pair, value, proxyID string, issued time.Time) error {
 	if s.bindFn != nil {
-		return s.bindFn(ctx, p.AuthIndex, p.Model, value, proxyID)
+		return s.bindFn(ctx, p.AuthIndex, p.Model, value, proxyID, issued)
 	}
 	_, err := s.src.StateRegistry().Bind(ctx, states.Binding{
 		Pair:       p,
 		StateValue: value,
-		Source:     states.SourceProbe,
-		ProxyID:    proxyID,
+		// The value's own age is what the expiry is measured from, so a value
+		// that spent most of its life in transit does not get a fresh TTL.
+		IssuedAt: issued,
+		Source:   states.SourceProbe,
+		ProxyID:  proxyID,
 	})
 	return err
 }

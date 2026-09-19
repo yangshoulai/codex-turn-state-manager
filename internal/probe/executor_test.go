@@ -260,6 +260,7 @@ func newExecHarness(t *testing.T) *execHarness {
 		plans:   &fakePlans{plan: map[string]string{}},
 		policy: ExecutorPolicy{
 			TargetStateLength: probeTargetLen,
+			TTL:               time.Hour,
 			MaxProbeDuration:  5 * time.Second,
 		},
 	}
@@ -1060,9 +1061,16 @@ func TestExecutor_CooldownLadderEscalates(t *testing.T) {
 // shape checks can be exercised rather than the length fallback.
 func envelopeToken(t *testing.T, blocks int) string {
 	t.Helper()
+	return envelopeTokenAt(t, blocks, time.Now())
+}
+
+// envelopeTokenAt builds a value minted at a chosen moment, so age can be
+// varied independently of shape.
+func envelopeTokenAt(t *testing.T, blocks int, issued time.Time) string {
+	t.Helper()
 	raw := make([]byte, 57+16*blocks)
 	raw[0] = 0x80
-	binary.BigEndian.PutUint64(raw[1:9], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint64(raw[1:9], uint64(issued.Unix()))
 	for i := 9; i < len(raw); i++ {
 		raw[i] = byte(i % 251)
 	}
@@ -1142,5 +1150,42 @@ func TestExecutor_PlanOnTheResponseWins(t *testing.T) {
 
 	if got := h.probe(t); got.Outcome != OutcomeSuccessTarget {
 		t.Errorf("outcome = %s, want the team shape accepted on the strength of this response", got.Outcome)
+	}
+}
+
+// TestExecutor_StaleValueIsNotBound covers the value that arrives already old.
+//
+// Binding it would replace a working binding with a dead one, and the round
+// would then report a target hit and wait a full TTL before trying again -- so
+// the pair would go quiet exactly when it should be looking for a fresh value.
+// The node is not at fault either: it answered correctly.
+func TestExecutor_StaleValueIsNotBound(t *testing.T) {
+	h := newExecHarness(t)
+
+	// The upstream mints values with a fortnight-old timestamp.
+	stale := envelopeTokenAt(t, 10, time.Now().Add(-14*24*time.Hour))
+	h.addProxy(t, "p1", respondWith(http.StatusOK, stale, ""))
+
+	got := h.probe(t)
+	if got.Outcome != OutcomeSuccessStale {
+		t.Fatalf("outcome = %s, want %s", got.Outcome, OutcomeSuccessStale)
+	}
+	if got.Succeeded() {
+		t.Error("a stale value reported success")
+	}
+	if rows := h.pool.CooldownsForProxy("p1"); len(rows) != 0 {
+		t.Error("a stale value benched the node; the node answered correctly")
+	}
+}
+
+// TestExecutor_FreshValueIsNotStale is the other side of it: the check must not
+// fire on a value that is simply new.
+func TestExecutor_FreshValueIsNotStale(t *testing.T) {
+	h := newExecHarness(t)
+	h.plans.set("codex-auth-1", "plus")
+	h.addProxy(t, "p1", respondWith(http.StatusOK, envelopeTokenAt(t, 10, time.Now().Add(-time.Minute)), ""))
+
+	if got := h.probe(t); got.Outcome != OutcomeSuccessTarget {
+		t.Errorf("outcome = %s, want a fresh value accepted", got.Outcome)
 	}
 }

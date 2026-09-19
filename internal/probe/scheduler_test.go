@@ -224,7 +224,7 @@ func newSchedHarness(t *testing.T, pairs []states.Pair) *schedHarness {
 		h.mu.Unlock()
 		return Result{Outcome: OutcomeSuccessTarget, StateValue: "target", StateLength: 292}
 	})
-	h.scheduler.SetBindFunc(func(_ context.Context, authIndex, model, value, proxyID string) error {
+	h.scheduler.SetBindFunc(func(_ context.Context, authIndex, model, value, proxyID string, issued time.Time) error {
 		h.mu.Lock()
 		h.binds = append(h.binds, authIndex+"/"+model)
 		h.mu.Unlock()

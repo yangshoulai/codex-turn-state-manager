@@ -15,6 +15,11 @@ const (
 	// OutcomeSuccessNonTarget means a state came back but its length is not
 	// target. Recorded, never bound.
 	OutcomeSuccessNonTarget Outcome = "SUCCESS_NON_TARGET"
+	// OutcomeSuccessStale is a value of the right shape that the upstream minted
+	// too long ago to be worth binding. It is not a proxy fault and not a shape
+	// problem: the node did its job and the upstream will mint a fresh value in
+	// time.
+	OutcomeSuccessStale Outcome = "SUCCESS_STALE"
 	// OutcomeNoProxyAvailable means the pool had no usable node.
 	OutcomeNoProxyAvailable Outcome = "PROBE_NO_PROXY_AVAILABLE"
 	// OutcomeTimeoutAllProxies means the traversal hit maxProbeDuration.
@@ -98,7 +103,9 @@ func (b Backoff) NextDelay(o Outcome) time.Duration {
 		}
 		return time.Duration(float64(b.TTL) * (1 - float64(pct)/100))
 
-	case OutcomeSuccessNonTarget:
+	case OutcomeSuccessNonTarget, OutcomeSuccessStale:
+		// A stale value is retried on the same cadence as a wrong-shaped one:
+		// both mean "come back later", neither means "this node is bad".
 		return b.jitter(NonTargetMaxDelay-NonTargetMinDelay) + NonTargetMinDelay
 
 	case OutcomeNoProxyAvailable:

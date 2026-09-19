@@ -2,6 +2,7 @@ package intercept
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -222,7 +223,8 @@ func (c *Collector) capture(
 	if plan == "" && c.plans != nil {
 		plan = c.plans.PlanType(authIndex)
 	}
-	if _, ok := states.AcceptState(value, states.ExpectationFor(plan, policy.TargetStateLength)); !ok {
+	env, shapeOK := states.AcceptState(value, states.ExpectationFor(plan, policy.TargetStateLength))
+	if !shapeOK {
 		// Wrong shape: bound never (F-15).
 		c.stats.skipNonTarget.Add(1)
 		if unchanged {
@@ -242,8 +244,15 @@ func (c *Collector) capture(
 	if _, err := c.states.Bind(ctx, states.Binding{
 		Pair:       pair,
 		StateValue: value,
-		Source:     states.SourceTraffic,
+		// A value that reaches us already past its life is recorded and
+		// dropped: binding it would replace a working binding with a dead one.
+		IssuedAt: env.Issued,
+		Source:   states.SourceTraffic,
 	}); err != nil {
+		if errors.Is(err, states.ErrStateExpired) {
+			c.stats.skipStale.Add(1)
+			return CaptureResult{Action: CaptureStale, AuthIndex: authIndex, StateLen: len(value)}
+		}
 		c.log(hostapi.LogError, "could not bind state from traffic", map[string]any{
 			"authIndex": authIndex, "model": model, "error": err.Error(),
 		})

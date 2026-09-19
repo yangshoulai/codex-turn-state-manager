@@ -157,6 +157,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			v := a.settings.Current()
 			return probe.ExecutorPolicy{
 				TargetStateLength: v.TargetStateLength,
+				TTL:               v.StateTTL,
 				MaxProbeDuration:  v.MaxProbeDuration,
 				MaxProxies:        v.MaxProxiesPerProbe,
 			}

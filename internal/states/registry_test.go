@@ -2,6 +2,8 @@ package states
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -391,12 +393,31 @@ func TestPolicy_Expiry(t *testing.T) {
 	p := Policy{TTL: 40 * time.Minute, RefreshThresholdPct: 25}
 	bound := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 
-	expires, refresh := p.Expiry(bound)
+	// No issue time known: anchored on when we bound it.
+	expires, refresh := p.Expiry(time.Time{}, bound)
 	if want := bound.Add(40 * time.Minute); !expires.Equal(want) {
 		t.Errorf("Expiry expires = %v, want %v", expires, want)
 	}
 	if want := bound.Add(30 * time.Minute); !refresh.Equal(want) {
 		t.Errorf("Expiry refresh = %v, want %v", refresh, want)
+	}
+
+	// A value minted ten minutes before we stored it has ten minutes less life
+	// left, which is the whole point of reading the envelope.
+	issued := bound.Add(-10 * time.Minute)
+	expires, refresh = p.Expiry(issued, bound)
+	if want := issued.Add(40 * time.Minute); !expires.Equal(want) {
+		t.Errorf("with an issue time, expires = %v, want %v", expires, want)
+	}
+	if want := issued.Add(30 * time.Minute); !refresh.Equal(want) {
+		t.Errorf("with an issue time, refresh = %v, want %v", refresh, want)
+	}
+
+	// An issue time in the future is nonsense; the bind time is used instead of
+	// extending the value's life on the strength of a bad clock.
+	future := bound.Add(time.Hour)
+	if expires, _ = p.Expiry(future, bound); !expires.Equal(bound.Add(40 * time.Minute)) {
+		t.Errorf("a future issue time extended the life: expires = %v", expires)
 	}
 }
 
@@ -409,5 +430,73 @@ func TestPolicy_AcceptsLength(t *testing.T) {
 		if p.AcceptsLength(n) {
 			t.Errorf("%d should be rejected", n)
 		}
+	}
+}
+
+// TestRegistry_BindRefusesAValuePastItsLife is the safety net behind the
+// callers' own staleness check: a value whose issue time puts it beyond the TTL
+// must not displace one that still has life in it.
+func TestRegistry_BindRefusesAValuePastItsLife(t *testing.T) {
+	ctx := context.Background()
+	reg, _, now := newTestRegistry(t, time.Hour, 15)
+
+	// A good binding first, so the refusal has something to protect.
+	if _, err := reg.Bind(ctx, Binding{
+		Pair: Pair{AuthIndex: "a", Model: "m"}, StateValue: strings.Repeat("s", 292),
+		Source: SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	_, err := reg.Bind(ctx, Binding{
+		Pair: Pair{AuthIndex: "a", Model: "m"}, StateValue: strings.Repeat("s", 292),
+		// Minted two hours ago against a one-hour TTL.
+		IssuedAt: now.Add(-2 * time.Hour),
+		Source:   SourceProbe,
+	})
+	if !errors.Is(err, ErrStateExpired) {
+		t.Fatalf("Bind of a stale value = %v, want ErrStateExpired", err)
+	}
+
+	// The earlier binding survived: a stale value is not allowed to clear it.
+	b, status := reg.Lookup("a", "m")
+	if status != StatusFresh {
+		t.Errorf("status = %s after a refused bind, want the previous binding intact", status)
+	}
+	if b.ExpiresAt.Before(now.Add(30 * time.Minute)) {
+		t.Errorf("expiresAt = %v, want the original binding's expiry", b.ExpiresAt)
+	}
+}
+
+// TestRegistry_BindAnchorsTheTtlOnTheIssueTime is the behaviour the envelope
+// buys: a value that spent most of its life before reaching us does not get a
+// full TTL.
+func TestRegistry_BindAnchorsTheTtlOnTheIssueTime(t *testing.T) {
+	ctx := context.Background()
+	reg, _, now := newTestRegistry(t, time.Hour, 15)
+
+	// Forty minutes of a sixty-minute TTL leaves a third of the life: still
+	// fresh, because the refresh window opens at eighty-five percent.
+	issued := now.Add(-40 * time.Minute)
+	if _, err := reg.Bind(ctx, Binding{
+		Pair: Pair{AuthIndex: "a", Model: "m"}, StateValue: strings.Repeat("s", 292),
+		IssuedAt: issued,
+		Source:   SourceProbe,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	b, _ := reg.Lookup("a", "m")
+	if want := issued.Add(time.Hour); !b.ExpiresAt.Equal(want) {
+		t.Errorf("expiresAt = %v, want %v (issued + ttl, not bound + ttl)", b.ExpiresAt, want)
+	}
+	if status := reg.StatusOf(b, *now); status != StatusFresh {
+		t.Errorf("status = %s at 40 of 60 minutes, want %s", status, StatusFresh)
+	}
+	// Push past the eighty-five percent mark and the same binding is due for
+	// renewal, which is what having the issue time makes measurable.
+	later := issued.Add(55 * time.Minute)
+	if status := reg.StatusOf(b, later); status != StatusRefreshDue {
+		t.Errorf("status = %s at 55 of 60 minutes, want %s", status, StatusRefreshDue)
 	}
 }

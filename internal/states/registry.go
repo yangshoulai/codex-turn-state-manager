@@ -4,6 +4,7 @@ package states
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,11 +44,19 @@ type Pair struct {
 	Model     string `json:"model"`
 }
 
+// ErrStateExpired means the value's own issue time puts it beyond its TTL, so
+// binding it would only displace something still usable.
+var ErrStateExpired = errors.New("states: state value is already past its ttl")
+
 // Binding is one turn-state value bound to a (authIndex, model) pair.
 type Binding struct {
 	Pair
-	StateValue   string    `json:"stateValue"`
-	StateLength  int       `json:"stateLength"`
+	StateValue  string `json:"stateValue"`
+	StateLength int    `json:"stateLength"`
+	// IssuedAt is when the upstream minted the value, read from its envelope.
+	// Zero when the envelope was unreadable. It is the anchor the expiry is
+	// computed from and is not persisted: the derived timestamps are.
+	IssuedAt     time.Time `json:"issuedAt,omitzero"`
 	BoundAt      time.Time `json:"boundAt"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 	RefreshAfter time.Time `json:"refreshAfter"`
@@ -126,11 +135,24 @@ type Policy struct {
 	TargetStateLength   int
 }
 
-// Expiry derives the absolute timestamps a binding gets at boundAt.
-func (p Policy) Expiry(boundAt time.Time) (expiresAt, refreshAfter time.Time) {
+// Expiry derives the absolute timestamps a binding gets.
+//
+// The clock starts when the upstream minted the value, not when we got round to
+// storing it, whenever that is known. A value that arrives already part-way
+// through its life would otherwise be handed a full TTL and kept alive past the
+// point the upstream stopped honouring it -- which reads as "it worked, then it
+// stopped working" with nothing in between.
+//
+// issued may be zero, which is the case for a value whose envelope we cannot
+// read; the binding is then anchored on boundAt as it was before.
+func (p Policy) Expiry(issued, boundAt time.Time) (expiresAt, refreshAfter time.Time) {
+	anchor := boundAt
+	if !issued.IsZero() && issued.Before(boundAt) {
+		anchor = issued
+	}
 	ttl := p.TTL
-	expiresAt = boundAt.Add(ttl)
-	refreshAfter = boundAt.Add(time.Duration(float64(ttl) * (1 - float64(p.RefreshThresholdPct)/100)))
+	expiresAt = anchor.Add(ttl)
+	refreshAfter = anchor.Add(time.Duration(float64(ttl) * (1 - float64(p.RefreshThresholdPct)/100)))
 	return expiresAt, refreshAfter
 }
 
@@ -231,7 +253,15 @@ func (r *Registry) Bind(ctx context.Context, b Binding) (Action, error) {
 		b.BoundAt = now
 	}
 	b.StateLength = len(b.StateValue)
-	b.ExpiresAt, b.RefreshAfter = policy.Expiry(b.BoundAt)
+	b.ExpiresAt, b.RefreshAfter = policy.Expiry(b.IssuedAt, b.BoundAt)
+
+	// A value whose life has already run out must not replace one that still
+	// has some. The caller is expected to have noticed before getting here, but
+	// this is the rule's home and a binding that is born expired is never what
+	// anyone meant.
+	if !b.ExpiresAt.After(now) {
+		return "", ErrStateExpired
+	}
 
 	prev, existed := (*r.snap.Load())[b.Pair]
 	action := ActionBound

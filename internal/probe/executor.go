@@ -114,7 +114,10 @@ func (e *Executor) expectation(authIndex, planFromResponse string, policy Execut
 // time so a configuration change applies without rebuilding the executor.
 type ExecutorPolicy struct {
 	TargetStateLength int
-	MaxProbeDuration  time.Duration
+	// TTL is how long a state value is good for, counted from when the upstream
+	// minted it rather than from when we stored it.
+	TTL              time.Duration
+	MaxProbeDuration time.Duration
 	// MaxProxies caps one traversal. Zero means no cap, which is what the
 	// tests that predate the setting rely on.
 	MaxProxies int
@@ -159,7 +162,11 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 	policy := cfg.Policy
 	if policy == nil {
 		policy = func() ExecutorPolicy {
-			return ExecutorPolicy{TargetStateLength: 292, MaxProbeDuration: 90 * time.Second}
+			return ExecutorPolicy{
+				TargetStateLength: 292,
+				TTL:               time.Hour,
+				MaxProbeDuration:  90 * time.Second,
+			}
 		}
 	}
 	return &Executor{
@@ -391,6 +398,16 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 		// and then to the configured length is what keeps a first probe working
 		// before anything has been learned.
 		env, ok := states.AcceptState(value, e.expectation(authIndex, signals.PlanType, policy))
+		if ok && !env.Issued.IsZero() && !e.now().Before(env.Issued.Add(policy.TTL)) {
+			// The right shape, but minted longer ago than a value is good for.
+			// Binding it would replace a working binding with a dead one, and
+			// blaming the node would bench a proxy that behaved correctly.
+			ok = false
+			out.Outcome = OutcomeSuccessStale
+			out.StateIssued = env.Issued
+			out.StateBlocks = env.Blocks
+			return out
+		}
 		if ok {
 			out.Outcome = OutcomeSuccessTarget
 			out.StateIssued = env.Issued

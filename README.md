@@ -287,6 +287,14 @@ request path.
 (292 characters) is the personal rule and twelve (332) the team rule; the plan
 decides which applies to an account.
 
+**TTL runs from when the upstream minted the value**, not from when the plugin
+stored it. The envelope carries an issue timestamp, so a value that spent most of
+its life before reaching us does not get a fresh hour — and one that arrives
+already past its TTL is recorded and dropped rather than displacing a binding
+that still works. Without this, a value harvested late would be injected until
+the upstream stopped honouring it, which looks like "it worked, then it stopped"
+with nothing in between.
+
 **State lifecycle.** A binding is `FRESH` until 85% of its TTL has elapsed, then
 `REFRESH_DUE` (still injected, but scheduled for renewal), then `EXPIRED`. Default TTL is
 60 minutes.
@@ -353,7 +361,7 @@ Set from the panel or the Management API. Defaults:
 | `state_priority_enabled` | `true` | Whether the plugin may interfere in CPA's account choice. Off still injects state it already holds |
 | `scan_interval_sec` | `60` | How often the scheduler checks for due pairs |
 | `probe_concurrency` | `2` | Simultaneous pair probes (1–32); each walks the pool serially |
-| `state_ttl_min` | `60` | Binding lifetime |
+| `state_ttl_min` | `60` | Binding lifetime, counted from the value's issue time |
 | `refresh_threshold_pct` | `15` | Re-probe once this much of the TTL remains |
 | `target_state_length` | `292` | Fallback length, used only when an account's plan is unknown; a known plan decides the shape |
 | `max_probe_duration_sec` | `90` | Wall-clock cap on one pair's traversal |
