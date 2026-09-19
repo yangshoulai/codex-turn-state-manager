@@ -121,9 +121,9 @@
           <input type="number" id="s-threshold" min="0" max="90">
           <span class="field-hint">默认 15。剩余不足此比例即提前重探</span>
         </label>
-        <label>目标长度
+        <label>目标长度（兜底）
           <input type="number" id="s-length" min="1">
-          <span class="field-hint">默认 292。只有这个长度会被绑定</span>
+          <span class="field-hint">默认 292。仅当账号套餐未知时使用；套餐已知时按套餐推导：个人版（Free / Plus / Pro）10 个密文块 = 292，Team / Business 12 块 = 332</span>
         </label>
         <label>单次探测总超时（秒）
           <input type="number" id="s-maxprobe" min="5">

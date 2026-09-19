@@ -1071,8 +1071,8 @@ function renderModels(authIndex, container, blockedReason) {
     const futile = m.nonTargetStreak >= 3
       ? el("span", {
           class: "pill pill-warn",
-          title: `连续 ${m.nonTargetStreak} 次返回非目标长度，该模型可能永远不会产出可用的 State`,
-          text: `连续 ${m.nonTargetStreak} 次非目标长度`,
+          title: `连续 ${m.nonTargetStreak} 次返回非目标形状，该模型可能永远不会产出可用的 State`,
+          text: `连续 ${m.nonTargetStreak} 次非目标形状`,
         })
       : null;
 

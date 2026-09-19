@@ -637,3 +637,33 @@ process.exit(0);
 		t.Fatalf("panel weekday check failed: %v\n%s", err, out)
 	}
 }
+
+// TestPanelTargetLengthIsDescribedAsAFallback guards the one place the rule is
+// read by an operator rather than by the code.
+//
+// The setting kept its name and its number when the shape became per-plan, and
+// the panel went on saying "only this length is bound" -- which is false for
+// every account whose plan is known. The behaviour was documented and tested;
+// the sentence the operator actually reads was not.
+func TestPanelTargetLengthIsDescribedAsAFallback(t *testing.T) {
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(html)
+
+	// The old absolute claim must not come back.
+	if strings.Contains(page, "只有这个长度会被绑定") {
+		t.Error("the panel still claims the configured length is the only one bound")
+	}
+	// And the control has to say what it is now for.
+	label := "目标长度（兜底）"
+	if !strings.Contains(page, label) {
+		t.Errorf("index.html does not label the setting as %q", label)
+	}
+	for _, want := range []string{"套餐未知时使用", "332"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the setting's hint does not mention %q", want)
+		}
+	}
+}
