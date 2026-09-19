@@ -158,12 +158,14 @@ func TestParsePlanAcceptsPaddedPayload(t *testing.T) {
 	}
 }
 
-// TestBlockedReason covers which accounts the probe scheduler skips.
+// TestJudge covers which accounts the probe scheduler refuses to probe.
 //
-// CPA already knows more about an account's health than the plugin can infer,
-// and probing one it has already written off spends a request to relearn it --
-// and in the quota case spends part of the very budget that is exhausted.
-func TestBlockedReason(t *testing.T) {
+// The list of blocking states is deliberately short. A probe is one cheap
+// direct request whose whole purpose is to find out what the account does right
+// now, so the only states worth refusing are the ones it cannot possibly
+// succeed from. Treating CPA's *temporary* conditions as blocking is what left
+// an account the operator had already refreshed sitting at 已暂停探测.
+func TestJudge(t *testing.T) {
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	later := now.Add(30 * time.Minute)
 	past := now.Add(-time.Minute)
@@ -171,43 +173,81 @@ func TestBlockedReason(t *testing.T) {
 	cases := []struct {
 		name    string
 		account Account
+		known   bool
 		blocked bool
+		kind    VerdictKind
 	}{
-		{"active account is probeable", Account{Status: hostapi.AccountStatusActive}, false},
-		{"disabled flag", Account{Status: hostapi.AccountStatusActive, Disabled: true}, true},
-		{"disabled status", Account{Status: hostapi.AccountStatusDisabled}, true},
+		{"active account is probeable", Account{Status: hostapi.AccountStatusActive}, true, false, VerdictOK},
+		{"unknown account is gone", Account{Status: hostapi.AccountStatusActive}, false, true, VerdictDeleted},
+
+		{"disabled flag", Account{Status: hostapi.AccountStatusActive, Disabled: true}, true, true, VerdictDisabled},
+		{"disabled status", Account{Status: hostapi.AccountStatusDisabled}, true, true, VerdictDisabled},
+		{"awaiting mfa", Account{Status: hostapi.AccountStatusPending}, true, true, VerdictPending},
+		{"refreshing", Account{Status: hostapi.AccountStatusRefreshing}, true, true, VerdictRefreshing},
+
+		// A rejected credential is an account-level fact no retry fixes.
+		{"401 in the message", Account{Status: hostapi.AccountStatusError,
+			StatusMessage: "upstream returned 401"}, true, true, VerdictAuth},
+		{"403 in the message", Account{Status: hostapi.AccountStatusActive,
+			StatusMessage: "403 Forbidden"}, true, true, VerdictAuth},
+		{"revoked token", Account{Status: hostapi.AccountStatusError,
+			StatusMessage: "token has been revoked"}, true, true, VerdictAuth},
+
+		// A status code embedded in a longer number is not a 401.
+		{"a longer number is not a 401", Account{Status: hostapi.AccountStatusError,
+			StatusMessage: "request 14012 failed"}, true, false, VerdictCooldown},
+
+		// Everything below is "come back later", and probing is how the plugin
+		// finds out whether later has arrived. This is the change that unsticks
+		// a rate-limited account.
 		{"quota exhausted", Account{Status: hostapi.AccountStatusActive, Unavailable: true,
-			StatusMessage: "account quota exhausted"}, true},
-		{"cooling down", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &later}, true},
-		{"cooldown elapsed", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &past}, false},
-		{"error status", Account{Status: hostapi.AccountStatusError}, true},
-		{"awaiting mfa", Account{Status: hostapi.AccountStatusPending}, true},
-		{"refreshing", Account{Status: hostapi.AccountStatusRefreshing}, true},
-		// An unknown state is not evidence of a fault; one cheap request is how
-		// it becomes known.
-		{"unknown status", Account{Status: hostapi.AccountStatusUnknown}, false},
-		{"empty status", Account{}, false},
+			StatusMessage: "account quota exhausted"}, true, false, VerdictCooldown},
+		{"cooling down", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &later}, true, false, VerdictCooldown},
+		{"cooldown elapsed", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &past}, true, false, VerdictOK},
+		{"error status with no auth marker", Account{Status: hostapi.AccountStatusError}, true, false, VerdictCooldown},
+		{"429 in the message", Account{Status: hostapi.AccountStatusError,
+			StatusMessage: "upstream returned 429"}, true, false, VerdictCooldown},
+		{"503 in the message", Account{Status: hostapi.AccountStatusError,
+			StatusMessage: "upstream returned 503"}, true, false, VerdictCooldown},
+
+		{"unknown status", Account{Status: hostapi.AccountStatusUnknown}, true, false, VerdictOK},
+		{"empty status", Account{}, true, false, VerdictOK},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reason := BlockedReason(tc.account, now)
-			if got := reason != ""; got != tc.blocked {
-				t.Errorf("BlockedReason = %q, blocked = %v, want %v", reason, got, tc.blocked)
+			got := Judge(tc.account, tc.known, now)
+			if got.Blocked != tc.blocked {
+				t.Errorf("Blocked = %v (%q), want %v", got.Blocked, got.Reason, tc.blocked)
+			}
+			if got.Kind != tc.kind {
+				t.Errorf("Kind = %q, want %q", got.Kind, tc.kind)
+			}
+			// A non-OK verdict always carries a reason: the panel shows it, and
+			// an empty one would render as a blank pill.
+			if tc.kind != VerdictOK && got.Reason == "" {
+				t.Error("reason is empty; the panel has nothing to show")
 			}
 		})
 	}
 }
 
-// TestBlockedReasonSurfacesTheProviderMessage pins that CPA's own explanation
-// reaches the operator rather than being flattened into a generic "unavailable".
-func TestBlockedReasonSurfacesTheProviderMessage(t *testing.T) {
+// TestJudgeSurfacesTheProviderMessage pins that CPA's own explanation reaches
+// the operator rather than being flattened into a generic "unavailable".
+//
+// It is also what makes a non-blocking cooldown legible: the account is still
+// being probed, and the reason says why it may not answer.
+func TestJudgeSurfacesTheProviderMessage(t *testing.T) {
 	acc := Account{
 		Status:        hostapi.AccountStatusActive,
 		Unavailable:   true,
 		StatusMessage: "5h limit reached",
 	}
-	if got := BlockedReason(acc, time.Now()); !strings.Contains(got, "5h limit reached") {
-		t.Errorf("BlockedReason = %q, want it to carry the provider's message", got)
+	got := Judge(acc, true, time.Now())
+	if !strings.Contains(got.Reason, "5h limit reached") {
+		t.Errorf("Reason = %q, want it to carry the provider's message", got.Reason)
+	}
+	if got.Blocked {
+		t.Error("a quota cooldown must not stop probing")
 	}
 }

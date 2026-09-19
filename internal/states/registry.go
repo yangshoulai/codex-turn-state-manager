@@ -323,6 +323,29 @@ func (r *Registry) Delete(ctx context.Context, p Pair, source Source) error {
 	return nil
 }
 
+// DeleteAccount drops every binding held for an account.
+//
+// Called when CPA no longer lists the account. Leaving the bindings behind
+// would keep injecting a state value for an account that cannot serve the
+// request -- and worse, one the plugin would never probe again, so the value
+// would sit there until its TTL lapsed with nothing to replace it.
+func (r *Registry) DeleteAccount(ctx context.Context, authIndex string, source Source) (int, error) {
+	var pairs []Pair
+	for p := range *r.snap.Load() {
+		if p.AuthIndex == authIndex {
+			pairs = append(pairs, p)
+		}
+	}
+	var deleted int
+	for _, p := range pairs {
+		if err := r.Delete(ctx, p, source); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 // Invalidate drops a binding after a request carrying it failed, so a bad
 // value cannot keep poisoning traffic for the rest of its TTL (design doc
 // 3.12). It is Delete with source=probe and no history-sourced blame.

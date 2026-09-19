@@ -86,6 +86,12 @@ type fakePairs struct {
 	pairs   []states.Pair
 	syncs   int
 	syncErr error
+	// accountSyncs counts the per-account refreshes the scan performed, so a
+	// test can pin that it happens once per account per scan rather than once
+	// per pair.
+	accountSyncs int
+	// removed names accounts CPA no longer lists.
+	removed []string
 	// syncBlocks, when set, holds Sync until the channel is closed or the
 	// caller's context expires. It stands in for a host call that hangs.
 	syncBlocks chan struct{}
@@ -122,6 +128,29 @@ func (f *fakePairs) syncCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.syncs
+}
+
+// SyncAccount stands in for the per-probe account refresh. removed holds the
+// accounts CPA no longer lists, so a test can drop one mid-run.
+func (f *fakePairs) SyncAccount(_ context.Context, authIndex string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accountSyncs++
+	if f.syncErr != nil {
+		return false, f.syncErr
+	}
+	for _, gone := range f.removed {
+		if gone == authIndex {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (f *fakePairs) accountSyncCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.accountSyncs
 }
 
 // schedSource implements ConfigSource for tests.
@@ -636,3 +665,127 @@ func TestScheduler_NonTargetBackoffGrowsThroughTheScan(t *testing.T) {
 		t.Errorf("after a hit the interval is %s, want the TTL-derived 51m", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// account freshness
+
+// TestScan_SyncsAccountsOutsideTheProbeWindow is the regression test for the
+// bug that left an account stuck at 已暂停探测.
+//
+// The account sync used to sit behind the master-switch and time-window gates,
+// so with probing switched off -- or merely outside the configured hours -- CPA
+// was never asked about its accounts again. An operator who fixed an account in
+// CPA and came back to a panel still showing the old status had no way to tell
+// a stale cache from a broken plugin.
+func TestScan_SyncsAccountsOutsideTheProbeWindow(t *testing.T) {
+	t.Run("probing switched off", func(t *testing.T) {
+		h := newSchedHarness(t, []states.Pair{{AuthIndex: "a", Model: "m"}})
+		if _, err := h.settings.Update(context.Background(),
+			settings.Patch{GlobalProbeEnabled: boolPtr(false)}); err != nil {
+			t.Fatalf("disable probing: %v", err)
+		}
+
+		h.scheduler.Scan(context.Background())
+
+		if got := h.pairs.syncCount(); got != 1 {
+			t.Errorf("account syncs = %d, want 1 even with probing off", got)
+		}
+	})
+
+	t.Run("outside the time window", func(t *testing.T) {
+		h := newSchedHarness(t, []states.Pair{{AuthIndex: "a", Model: "m"}})
+		// 12:00 is outside 08:00-09:00.
+		if err := h.source.windows.Upsert(context.Background(), TimeWindow{
+			ID: "w1", Label: "早间", StartTime: "08:00", EndTime: "09:00", Enabled: true,
+		}); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+
+		h.scheduler.Scan(context.Background())
+
+		// ShouldProbeNow is the "may we probe" answer, so false is the case
+		// this test is about.
+		if h.source.windows.ShouldProbeNow(h.clock.Now()) {
+			t.Fatal("the harness is not actually outside the window")
+		}
+		if got := h.pairs.syncCount(); got != 1 {
+			t.Errorf("account syncs = %d, want 1 even outside the window", got)
+		}
+		if got := h.probeCount(); got != 0 {
+			t.Errorf("probes = %d, want 0 outside the window", got)
+		}
+	})
+}
+
+// TestScan_RefreshesEachAccountOncePerScan pins the cost of the per-probe
+// freshness check.
+//
+// Several models share an account, and asking CPA the same question once per
+// model would multiply the host calls by the size of the model list for an
+// answer that is identical.
+func TestScan_RefreshesEachAccountOncePerScan(t *testing.T) {
+	h := newSchedHarness(t, []states.Pair{
+		{AuthIndex: "a", Model: "m1"},
+		{AuthIndex: "a", Model: "m2"},
+		{AuthIndex: "a", Model: "m3"},
+		{AuthIndex: "b", Model: "m1"},
+	})
+	// Room for all four at once. The default concurrency is 2, and a scan that
+	// runs out of slots stops rather than queueing.
+	if _, err := h.settings.Update(context.Background(),
+		settings.Patch{ProbeConcurrency: intPtr(8)}); err != nil {
+		t.Fatalf("raise concurrency: %v", err)
+	}
+
+	h.scheduler.Scan(context.Background())
+	if !waitFor(t, func() bool { return h.probeCount() == 4 }) {
+		t.Fatalf("probes = %d, want 4", h.probeCount())
+	}
+
+	if got := h.pairs.accountSyncCount(); got != 2 {
+		t.Errorf("per-account refreshes = %d, want 2 (one per account, not per pair)", got)
+	}
+}
+
+// TestScan_DropsPairsWhoseAccountIsGone covers the removal path: CPA answers,
+// and the account is not in the answer.
+func TestScan_DropsPairsWhoseAccountIsGone(t *testing.T) {
+	h := newSchedHarness(t, []states.Pair{
+		{AuthIndex: "a", Model: "m"},
+		{AuthIndex: "gone", Model: "m"},
+	})
+	h.pairs.removed = []string{"gone"}
+
+	h.scheduler.Scan(context.Background())
+	if !waitFor(t, func() bool { return h.probeCount() == 1 }) {
+		t.Fatalf("probes = %d, want 1", h.probeCount())
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, p := range h.probes {
+		if p.AuthIndex == "gone" {
+			t.Error("probed an account CPA no longer lists")
+		}
+	}
+}
+
+// TestScan_KeepsProbingWhenTheRefreshFails pins the distinction the whole
+// removal path rests on: "could not ask" is not "gone".
+//
+// A transient host error must not tear down an account's bindings, because
+// doing so is unrecoverable from the plugin's side -- the bindings are deleted,
+// and the next probe that would rebuild them is the one that was just skipped.
+func TestScan_KeepsProbingWhenTheRefreshFails(t *testing.T) {
+	h := newSchedHarness(t, []states.Pair{{AuthIndex: "a", Model: "m"}})
+	h.pairs.syncErr = context.DeadlineExceeded
+
+	h.scheduler.Scan(context.Background())
+	if !waitFor(t, func() bool { return h.probeCount() == 1 }) {
+		t.Fatalf("probes = %d, want 1: a failed refresh must not stop probing", h.probeCount())
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func intPtr(n int) *int { return &n }

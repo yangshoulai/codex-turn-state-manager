@@ -141,6 +141,10 @@
           <input type="number" id="s-nontargetcap" min="5" max="1440">
           <span class="field-hint">默认 30。连续拿不到目标长度的 pair，重试间隔从 2–5 分钟逐步翻倍到此上限，避免一直消耗代理</span>
         </label>
+        <label>调用记录保留（小时）
+          <input type="number" id="s-callretention" min="1" max="24">
+          <span class="field-hint">默认 24，上限也是 24。每个请求记一行（请求携带的 State、注入值、HTTP 状态、响应 State），一条记录含三个 State 值，所以按流量增长</span>
+        </label>
       </div>
 
       <div class="strategy">
@@ -224,8 +228,12 @@
     </div>
     <div class="modal-body" id="modal-body"></div>
     <div class="modal-foot">
-      <button id="modal-clear" class="btn btn-danger" type="button">清除历史</button>
-      <button id="modal-reset-all" class="btn btn-danger" type="button" hidden>重置全部冷却</button>
+      <span id="modal-note" class="muted small"></span>
+      <span id="modal-pager" class="actions"></span>
+      <span class="actions">
+        <button id="modal-clear" class="btn btn-danger" type="button">清除历史</button>
+        <button id="modal-reset-all" class="btn btn-danger" type="button" hidden>重置全部冷却</button>
+      </span>
     </div>
   </div>
 </div>

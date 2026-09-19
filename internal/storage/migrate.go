@@ -12,7 +12,7 @@ import (
 
 // CurrentSchemaVersion is the schema version this build expects. Bump it in
 // the same commit that appends a migration -- never edit a released migration.
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 // Migration is one forward-only schema step.
 //
@@ -155,6 +155,52 @@ var migrations = []Migration{
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_proxy_cooldown_proxy
 				ON proxy_cooldown(proxy_id)`,
+		},
+	},
+	{
+		Version: 5,
+		Name:    "account_models_and_call_history",
+		Stmts: []string{
+			// The model list belongs to the account, not to the plugin: two
+			// accounts on different plans do not offer the same models, and the
+			// shared manifest this used to read is the union of every tier. The
+			// list is fetched from the upstream endpoint the Codex client itself
+			// uses and stored per account, because fetching it costs a request
+			// against the account's own quota and the answer changes rarely.
+			//
+			// models is a JSON array so the list is one row per account: there is
+			// no query that reads it by element, and a row per model would need a
+			// second table plus a transaction to keep the two consistent.
+			`CREATE TABLE IF NOT EXISTS account_models (
+				auth_index TEXT PRIMARY KEY,
+				models     TEXT NOT NULL DEFAULT '[]',
+				source     TEXT NOT NULL DEFAULT '',
+				synced_at  TEXT NOT NULL,
+				error      TEXT NOT NULL DEFAULT ''
+			)`,
+			// One row per intercepted request, joining what the request carried,
+			// what the plugin injected into it, what upstream answered, and how
+			// the host says it ended.
+			//
+			// The three state columns hold full values, not prefixes: the whole
+			// point of the table is comparing them, and three 300-character
+			// strings per call is a bounded cost against a 24-hour retention.
+			`CREATE TABLE IF NOT EXISTS call_history (
+				id             INTEGER PRIMARY KEY AUTOINCREMENT,
+				auth_index     TEXT NOT NULL,
+				model          TEXT NOT NULL,
+				request_id     TEXT NOT NULL DEFAULT '',
+				carried_state  TEXT NOT NULL DEFAULT '',
+				injected_state TEXT NOT NULL DEFAULT '',
+				response_state TEXT NOT NULL DEFAULT '',
+				status_code    INTEGER NOT NULL DEFAULT 0,
+				outcome        TEXT NOT NULL DEFAULT '',
+				created_at     TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_call_history_auth
+				ON call_history(auth_index, created_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_call_history_created
+				ON call_history(created_at)`,
 		},
 	},
 }

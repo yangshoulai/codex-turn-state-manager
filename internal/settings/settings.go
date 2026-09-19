@@ -33,6 +33,7 @@ const (
 	KeyProbeRetentionHours    = "probe_history_retention_hours"
 	KeyMaxProxiesPerProbe     = "max_proxies_per_probe"
 	KeyNonTargetBackoffCapMin = "non_target_backoff_cap_min"
+	KeyCallHistoryRetentionH  = "call_history_retention_hours"
 )
 
 // RoutingStrategy selects how the credential scheduler picks among candidates.
@@ -96,6 +97,15 @@ type Values struct {
 	// towards this; without a cap the pair would eventually stop being probed
 	// at all, and the upstream may start yielding the right shape at any time.
 	NonTargetBackoffCap time.Duration
+
+	// CallHistoryRetention bounds how long one intercepted request is kept.
+	//
+	// Capped at a day on purpose. A call row carries three full turn-state
+	// values, so the table grows with traffic rather than with time, and the
+	// question it answers -- "what did this request carry and what came back" --
+	// is about the last few minutes. A week of rows would be a slower panel and
+	// a bigger secret surface for nobody's benefit.
+	CallHistoryRetention time.Duration
 }
 
 // Defaults returns the documented default configuration (design doc 3.3/3.5).
@@ -116,6 +126,7 @@ func Defaults() Values {
 		ProbeRetention:           24 * time.Hour,
 		MaxProxiesPerProbe:       10,
 		NonTargetBackoffCap:      30 * time.Minute,
+		CallHistoryRetention:     24 * time.Hour,
 	}
 }
 
@@ -136,6 +147,9 @@ const (
 	// reintroduce the every-few-minutes retry the escalation exists to stop.
 	MinNonTargetBackoffCap = 5 * time.Minute
 	MaxNonTargetBackoffCap = 24 * time.Hour
+	// Call history is bounded by design: see Values.CallHistoryRetention.
+	MinCallHistoryRetention = time.Hour
+	MaxCallHistoryRetention = 24 * time.Hour
 )
 
 // Store persists settings. Implemented by storage.SettingsStore.
@@ -237,6 +251,7 @@ type Patch struct {
 	ProbeRetention           *time.Duration
 	MaxProxiesPerProbe       *int
 	NonTargetBackoffCapMin   *int
+	CallHistoryRetention     *time.Duration
 }
 
 // Update applies a patch, validates it, persists it and publishes a new
@@ -292,6 +307,9 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	if p.NonTargetBackoffCapMin != nil {
 		next.NonTargetBackoffCap = time.Duration(*p.NonTargetBackoffCapMin) * time.Minute
 	}
+	if p.CallHistoryRetention != nil {
+		next.CallHistoryRetention = *p.CallHistoryRetention
+	}
 
 	if err := next.Validate(); err != nil {
 		return nil, err
@@ -341,6 +359,10 @@ func (v *Values) Validate() error {
 		return fmt.Errorf("settings: non_target_backoff_cap_min must be between %s and %s, got %s",
 			MinNonTargetBackoffCap, MaxNonTargetBackoffCap, v.NonTargetBackoffCap)
 	}
+	if v.CallHistoryRetention < MinCallHistoryRetention || v.CallHistoryRetention > MaxCallHistoryRetention {
+		return fmt.Errorf("settings: call_history_retention_hours must be between %s and %s, got %s",
+			MinCallHistoryRetention, MaxCallHistoryRetention, v.CallHistoryRetention)
+	}
 	if v.MaxProbeDuration < MinMaxProbeDuration {
 		return fmt.Errorf("settings: max_probe_duration must be at least %s, got %s", MinMaxProbeDuration, v.MaxProbeDuration)
 	}
@@ -372,6 +394,7 @@ func encode(v Values) (map[string]string, error) {
 		KeyProbeRetentionHours:    strconv.Itoa(int(v.ProbeRetention / time.Hour)),
 		KeyMaxProxiesPerProbe:     strconv.Itoa(v.MaxProxiesPerProbe),
 		KeyNonTargetBackoffCapMin: strconv.Itoa(int(v.NonTargetBackoffCap / time.Minute)),
+		KeyCallHistoryRetentionH:  strconv.Itoa(int(v.CallHistoryRetention / time.Hour)),
 	}, nil
 }
 
@@ -457,6 +480,7 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	hoursAt(KeyProbeRetentionHours, &v.ProbeRetention)
 	intAt(KeyMaxProxiesPerProbe, &v.MaxProxiesPerProbe)
 	minsAt(KeyNonTargetBackoffCapMin, &v.NonTargetBackoffCap)
+	hoursAt(KeyCallHistoryRetentionH, &v.CallHistoryRetention)
 
 	if s, ok := raw[KeyAccountRoutingStrategy]; ok && strings.TrimSpace(s) != "" {
 		strategy, err := ParseRoutingStrategy(strings.TrimSpace(s))

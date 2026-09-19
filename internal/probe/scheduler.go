@@ -34,6 +34,11 @@ type ConfigSource interface {
 type EnabledPairSource interface {
 	EnabledPairs() []states.Pair
 	Sync(ctx context.Context) (int, error)
+	// SyncAccount re-reads one account from CPA and reports whether CPA still
+	// lists it. A false answer with a nil error means the account is gone; an
+	// error means the question could not be asked, which is not the same thing
+	// and must not be treated as removal.
+	SyncAccount(ctx context.Context, authIndex string) (bool, error)
 }
 
 // pairState is the scheduler's per-pair bookkeeping.
@@ -178,27 +183,28 @@ func (s *Scheduler) Scan(ctx context.Context) {
 	// pair with a next_probe_at in the past and no new history rows.
 	s.markScanned(s.now())
 
-	caps := s.src.SettingsManager().Current().Capabilities()
-	if !caps.Probe {
-		// Master switch off, or the probe sub-switch off. Nothing to do.
-		return
-	}
-	if !s.src.WindowManager().ShouldProbeNow(s.now()) {
-		return
-	}
-
+	// One snapshot for the whole pass, so a switch flipped mid-scan cannot
+	// produce a half-applied decision.
+	values := s.src.SettingsManager().Current()
 	now := s.now()
-	settingsNow := s.src.SettingsManager().Current()
 
-	// Account sync runs on its own, slower cadence than the scan: it hits the
+	// The account sync runs before every gate below, and that ordering is
+	// load-bearing.
+	//
+	// It is not probing: it reads CPA's account list and nothing else. Leaving
+	// it after the master-switch and time-window returns meant an account whose
+	// state CPA had changed -- the operator re-authorised it, it ran out of
+	// quota, it was removed -- stayed frozen at whatever the last in-window
+	// scan saw. The visible symptom was an account the operator had already
+	// refreshed in CPA sitting at 已暂停探测 until the window next opened.
+	//
+	// The sync also runs on its own, slower cadence than the scan: it hits the
 	// CPA host API, and the account list changes far less often than the probe
 	// schedule does.
-	if now.Sub(s.lastSyncAt()) >= settingsNow.AccountSyncInterval {
-		// Bounded, and this is the only thing here that talks to the host. The
-		// sync runs on the scan goroutine, so a call that never returns stops
-		// every future scan: no pair is ever scheduled again, with no error and
-		// no log line. The initial sync in app.Start already carries a timeout;
-		// this one did not, which is an asymmetry rather than a decision.
+	if now.Sub(s.lastSyncAt()) >= values.AccountSyncInterval {
+		// Bounded: this runs on the scan goroutine, so a call that never
+		// returns stops every future scan -- no pair ever scheduled again, with
+		// no error and no log line.
 		syncCtx, cancelSync := context.WithTimeout(ctx, s.syncTimeout)
 		n, err := s.src.EnabledPairSource().Sync(syncCtx)
 		cancelSync()
@@ -211,7 +217,24 @@ func (s *Scheduler) Scan(ctx context.Context) {
 		}
 	}
 
-	for _, p := range s.src.EnabledPairSource().EnabledPairs() {
+	if !values.Capabilities().Probe {
+		// Master switch off, or the probe sub-switch off. Nothing to do.
+		return
+	}
+	if !s.src.WindowManager().ShouldProbeNow(now) {
+		return
+	}
+
+	pairs := s.src.EnabledPairSource().EnabledPairs()
+	// Re-read each account from CPA before deciding what to probe. The list
+	// above was built from a snapshot that may be minutes old, and probing is
+	// the one action that spends the account's own quota.
+	pairs = s.verifyAccounts(ctx, pairs)
+	if len(pairs) == 0 {
+		return
+	}
+
+	for _, p := range pairs {
 		if !s.due(p, now) {
 			continue
 		}
@@ -221,7 +244,7 @@ func (s *Scheduler) Scan(ctx context.Context) {
 			continue
 		}
 
-		if !s.acquire(settingsNow.ProbeConcurrency) {
+		if !s.acquire(values.ProbeConcurrency) {
 			// Every slot is busy; the next tick will pick this pair up.
 			return
 		}
@@ -234,6 +257,56 @@ func (s *Scheduler) Scan(ctx context.Context) {
 			s.runProbe(ctx, p)
 		}(p)
 	}
+}
+
+// verifyAccounts re-reads every account behind a due pair and drops the pairs
+// whose account CPA no longer lists.
+//
+// Once per account per scan rather than once per pair: several models share an
+// account, and asking CPA the same question six times in one pass answers it
+// once and wastes five host calls.
+func (s *Scheduler) verifyAccounts(ctx context.Context, pairs []states.Pair) []states.Pair {
+	if len(pairs) == 0 {
+		return pairs
+	}
+	source := s.src.EnabledPairSource()
+
+	checked := make(map[string]bool, len(pairs))
+	gone := map[string]string{}
+	for _, p := range pairs {
+		if checked[p.AuthIndex] {
+			continue
+		}
+		checked[p.AuthIndex] = true
+
+		listed, err := source.SyncAccount(ctx, p.AuthIndex)
+		if err != nil {
+			// "Could not ask" is not "gone". Keep probing with the cached view
+			// rather than tearing down an account over a transient host error.
+			s.log(hostapi.LogWarn, "could not refresh account before probing", map[string]any{
+				"authIndex": p.AuthIndex, "error": err.Error(),
+			})
+			continue
+		}
+		if !listed {
+			gone[p.AuthIndex] = "CPA 的账号池中已没有该账号"
+			s.log(hostapi.LogWarn, "dropping account that CPA no longer lists", map[string]any{
+				"authIndex": p.AuthIndex,
+			})
+		}
+	}
+	if len(gone) == 0 {
+		return pairs
+	}
+
+	out := pairs[:0]
+	for _, p := range pairs {
+		if _, dropped := gone[p.AuthIndex]; dropped {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // due reports whether a pair's next_probe_at has arrived. A pair with no

@@ -21,6 +21,19 @@ type Injector struct {
 	corr     *CorrelationManager
 	logf     func(hostapi.LogLevel, string, map[string]any)
 	stats    *Stats
+	// calls records one row per request. Optional.
+	calls CallRecorder
+}
+
+// CallRecorder receives the request-side half of the call history.
+//
+// Declared as an interface rather than taking *callhistory.Recorder so this
+// package stays independent of the store, and so a nil recorder is a working
+// configuration rather than a panic.
+type CallRecorder interface {
+	Begin(requestID, authIndex, model, carried, injected string)
+	Response(requestID, state string, status int)
+	Complete(requestID string, status int, outcome string)
 }
 
 // InjectorConfig configures an Injector.
@@ -30,6 +43,8 @@ type InjectorConfig struct {
 	Corr     *CorrelationManager
 	Log      func(hostapi.LogLevel, string, map[string]any)
 	Stats    *Stats
+	// Calls receives what each request carried and what was injected into it.
+	Calls CallRecorder
 }
 
 // NewInjector builds an injector.
@@ -43,6 +58,7 @@ func NewInjector(cfg InjectorConfig) *Injector {
 		corr:     cfg.Corr,
 		logf:     cfg.Log,
 		stats:    cfg.Stats,
+		calls:    cfg.Calls,
 	}
 }
 
@@ -88,9 +104,18 @@ func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 		return Decision{Action: ActionUnresolvedAuth}
 	}
 
+	// Read before anything is written: this is what the request already carried,
+	// which is the only way to tell "we injected this and upstream echoed it"
+	// from "the client sent it and upstream kept it".
+	carried := ""
+	if req.Headers != nil {
+		carried = headers.Get(req.Headers, headers.TurnState)
+	}
+
 	binding, status := i.states.Lookup(req.AuthIndex, req.Model)
 	if !status.Usable() {
 		i.stats.noBinding.Add(1)
+		i.beginCall(req, carried, "")
 		return Decision{Action: ActionNoBinding, AuthIndex: req.AuthIndex}
 	}
 
@@ -101,6 +126,7 @@ func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 	if req.RequestID != "" {
 		i.corr.MarkInjected(req.RequestID, binding.StateValue)
 	}
+	i.beginCall(req, carried, binding.StateValue)
 
 	// Logged at debug: this is the one place the plugin changes a user's
 	// outbound request, and "did injection actually happen" is otherwise
@@ -118,6 +144,18 @@ func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 
 // Correlation exposes the manager, for the response side and diagnostics.
 func (i *Injector) Correlation() *CorrelationManager { return i.corr }
+
+// beginCall records the request-side half of the call history.
+//
+// Failures here are impossible by construction -- the recorder buffers in
+// memory -- but it is still called last and guarded, because a diagnostic must
+// never be able to break the request it is describing.
+func (i *Injector) beginCall(req *hostapi.InterceptedRequest, carried, injected string) {
+	if i.calls == nil {
+		return
+	}
+	i.calls.Begin(req.RequestID, req.AuthIndex, req.Model, carried, injected)
+}
 
 func (i *Injector) log(level hostapi.LogLevel, msg string, fields map[string]any) {
 	if i.logf != nil {

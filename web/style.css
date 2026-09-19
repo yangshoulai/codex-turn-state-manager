@@ -108,9 +108,15 @@ h3 { font-size: 13px; }
 
 /* ---------- layout ---------- */
 
+/*
+ * The panel fills the host page.
+ *
+ * It was capped at 1080px and centred, which is right for a document and wrong
+ * here: inside CPA's plugin page the panel is the whole content area, and the
+ * cap left a third of a wide screen as dead margin while the account tables --
+ * the densest thing on the page -- scrolled horizontally instead.
+ */
 main {
-  max-width: 1080px;
-  margin: 0 auto;
   padding: 20px;
   display: flex;
   flex-direction: column;
@@ -399,26 +405,56 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 .add-model .muted { font-size: 12px; }
 
 .account { border: 1px solid var(--line); border-radius: var(--radius-sm); margin-bottom: 10px; overflow: hidden; }
+/* The header row is a container, not a control.
+   It used to be one big <button>, which meant the per-account actions had to be
+   nested inside it -- invalid HTML, and in practice a click on 同步 also
+   toggled the account open. The toggle is the left region only. */
 .account-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  padding: 11px 13px;
+  padding: 7px 13px 7px 0;
   background: var(--surface-sunken);
-  cursor: pointer;
+}
+.account-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 13px;
+  background: none;
   border: 0;
-  width: 100%;
   font: inherit;
   color: inherit;
   text-align: left;
+  cursor: pointer;
 }
-.account-head:hover { background: #f3f3f1; }
-.account-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.account-head .who { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.account-toggle:hover { background: #f3f3f1; }
+.account-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.account-head .who { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
 .account-head .who strong { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-head .meta { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-soft); }
+.account-head .meta { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-soft); flex: none; }
+.account-head .row-actions { flex: none; }
 .account-body { padding: 4px 13px 12px; }
+
+/* Call history. The three State columns are equal and truncate together; the
+   status and the model are readings and are pinned. */
+#call-history .history-table th:nth-child(1), #call-history .history-table td:nth-child(1) { width: 78px; }
+#call-history .history-table th:nth-child(2), #call-history .history-table td:nth-child(2) { width: 168px; }
+#call-history .history-table th:nth-child(3), #call-history .history-table td:nth-child(3),
+#call-history .history-table th:nth-child(4), #call-history .history-table td:nth-child(4),
+#call-history .history-table th:nth-child(7), #call-history .history-table td:nth-child(7) { width: 150px; }
+#call-history .history-table th:nth-child(5), #call-history .history-table td:nth-child(5) { width: 74px; }
+#call-history .history-table th:nth-child(6), #call-history .history-table td:nth-child(6) { width: 96px; }
+
+/* Binding history: the proxy column carries the longest string in the table and
+   was the one that pushed the modal into a horizontal scroll. */
+#binding-history .history-table th:nth-child(1), #binding-history .history-table td:nth-child(1) { width: 118px; }
+#binding-history .history-table th:nth-child(2), #binding-history .history-table td:nth-child(2) { width: 88px; }
+#binding-history .history-table th:nth-child(3), #binding-history .history-table td:nth-child(3) { width: 76px; }
+#binding-history .history-table th:nth-child(4), #binding-history .history-table td:nth-child(4) { width: 148px; }
+#binding-history .history-table th:nth-child(5), #binding-history .history-table td:nth-child(5) { width: 60px; }
 
 /* ---------- pills ---------- */
 
@@ -469,8 +505,7 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
 }
 
 .fatal {
-  margin: 20px auto 0;
-  max-width: 1080px;
+  margin: 20px 0 0;
   padding: 12px 16px;
   border: 1px solid #e2c3c0;
   background: var(--bad-soft);
@@ -492,12 +527,16 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
   padding: 24px;
   z-index: 40;
 }
+/* Wide enough for the history tables, which are the densest thing the panel
+   renders: six columns of timestamps, pills and prefixes. At 720px they wrapped
+   and then overflowed, so the row the operator opened the dialog for was the
+   one that got cut off. */
 .modal-card {
   background: var(--surface);
   border-radius: 12px;
   width: 100%;
-  max-width: 720px;
-  max-height: 82vh;
+  max-width: 1040px;
+  max-height: 86vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -506,11 +545,41 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 14px 18px;
 }
 .modal-head { border-bottom: 1px solid var(--line); }
-.modal-foot { border-top: 1px solid var(--line); justify-content: flex-end; }
-.modal-body { padding: 14px 18px; overflow: auto; }
+.modal-head h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-foot { border-top: 1px solid var(--line); }
+/* Paging lives in the footer rather than after the table, so the controls stay
+   reachable while the body scrolls. */
+.modal-body { padding: 14px 18px 6px; overflow: auto; }
+.modal-body .pager { padding: 10px 0 8px; }
+
+/*
+ * History tables get a fixed layout.
+ *
+ * Everything in them is either a fixed-width reading (a clock, a status, a
+ * count) or a long opaque string. Left to auto layout, the long strings win the
+ * width and the readings collapse; the columns that cannot be shortened are
+ * pinned, and the ones that can are allowed to ellipsise.
+ */
+.history-table { table-layout: fixed; }
+.history-table th, .history-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The copy button sits beside the prefix, and the pair must stay on one line:
+   letting it wrap made a two-line cell in an otherwise single-line table. */
+.history-table .cell-inline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.history-table .cell-inline > span { overflow: hidden; text-overflow: ellipsis; }
+.history-table .row-actions { justify-content: flex-start; }
 
 /* ---------- toast ---------- */
 
@@ -604,3 +673,14 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
   color: var(--ink-soft);
 }
 .notice strong { color: var(--ink); font-weight: 600; margin-right: 4px; }
+
+/* The model list's provenance, shown under the table. */
+.list-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}

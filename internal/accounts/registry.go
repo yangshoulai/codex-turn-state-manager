@@ -9,6 +9,8 @@ package accounts
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -30,6 +32,57 @@ type ConfigStore interface {
 	ListAccountModels(ctx context.Context) ([]Config, error)
 	UpsertAccountModel(ctx context.Context, c Config) error
 	DeleteAccountModel(ctx context.Context, authIndex, model string) error
+}
+
+// Model list sources.
+const (
+	// ModelSourceUpstream means the list was read from the account's own
+	// catalog endpoint.
+	ModelSourceUpstream = "upstream"
+	// ModelSourceCatalog means it is the shared manifest, used until the
+	// account's own list has been fetched and whenever that fetch fails.
+	ModelSourceCatalog = "catalog"
+)
+
+// ErrUnknownAccount means the registry does not track the account.
+//
+// A sentinel rather than a formatted string so callers can answer 404 rather
+// than a blanket 502: "this account does not exist" is the caller's mistake,
+// and reporting it as a bad gateway sends an operator to look at CPA's health
+// for what is actually a stale panel row.
+var ErrUnknownAccount = errors.New("accounts: unknown account")
+
+// ModelList is the model list held for one account.
+type ModelList struct {
+	AuthIndex string   `json:"authIndex"`
+	Models    []string `json:"models"`
+	// Source names where the list came from: "upstream" for the account's own
+	// catalog, "catalog" for the shared manifest fallback.
+	Source string `json:"source"`
+	// SyncedAt is when the list was fetched. Zero for the fallback, which is
+	// not fetched per account at all.
+	SyncedAt time.Time `json:"syncedAt,omitempty"`
+	// Error is the last fetch failure. Kept rather than discarded so the panel
+	// can say the list is stale *because* the refresh failed, instead of
+	// presenting yesterday's answer as today's.
+	Error string `json:"error,omitempty"`
+}
+
+// ModelListStore persists per-account model lists.
+type ModelListStore interface {
+	ListModelLists(ctx context.Context) ([]ModelList, error)
+	SaveModelList(ctx context.Context, l ModelList) error
+	// DeleteModelList drops an account's list and its probe toggles.
+	DeleteModelList(ctx context.Context, authIndex string) error
+}
+
+// ModelFetcher loads an account's model list from upstream.
+//
+// Declared here and implemented by the composition root, which owns the live
+// credential lookup and the outbound call. A fetch failure is never fatal: the
+// caller keeps whatever list it already had.
+type ModelFetcher interface {
+	FetchModels(ctx context.Context, authIndex string) ([]string, error)
 }
 
 // Account is a tracked Codex account.
@@ -63,9 +116,12 @@ type Account struct {
 type Registry struct {
 	host  hostapi.Host
 	store ConfigStore
-	// catalogModels supplies the account model list, refreshed from the same
-	// manifest CPA syncs. The plugin cannot read CPA's own registry, so this is
-	// the nearest authoritative source it can obtain by itself.
+	// modelStore persists the per-account model lists. Optional: without it the
+	// registry falls back to the shared catalog for every account, which is the
+	// previous behaviour.
+	modelStore ModelListStore
+	// catalogModels supplies the shared manifest, used until an account's own
+	// list has been fetched.
 	catalogModels func() []string
 	// plans reads an account's subscription tier. Optional: without it the
 	// panel simply shows no plan.
@@ -82,6 +138,17 @@ type Registry struct {
 	byIndex  map[string]Account
 	byAuthID map[string]string
 	configs  map[modelKey]bool
+	// modelLists holds each account's loaded catalog, keyed by AuthIndex.
+	modelLists map[string]ModelList
+	// fetcher loads model lists. Installed by the composition root.
+	fetcher ModelFetcher
+	// logger receives cleanup failures. Optional.
+	logger func(string, ...any)
+	// onRemoved is told when an account CPA no longer lists is dropped. The
+	// registry cannot clear bindings itself -- it does not own them -- and
+	// leaving them behind would keep injecting state for an account that will
+	// never be probed again.
+	onRemoved func(ctx context.Context, authIndex string)
 }
 
 type modelKey struct {
@@ -94,35 +161,79 @@ type PlanReader interface {
 	ReadPlan(ctx context.Context, authIndex string) (Plan, error)
 }
 
+// RegistryConfig assembles a Registry.
+//
+// A struct rather than a parameter list: the registry has grown past the point
+// where positional arguments of mostly-identical types are readable, and a
+// mis-ordered call would compile.
+type RegistryConfig struct {
+	Host hostapi.Host
+	// Store persists the per-pair probe toggles. Required.
+	Store ConfigStore
+	// ModelStore persists the per-account model lists. Optional; without it
+	// every account falls back to the shared catalog.
+	ModelStore ModelListStore
+	// CatalogModels supplies the shared manifest fallback. Optional.
+	CatalogModels func() []string
+	// Plans reads an account's subscription tier. Optional.
+	Plans PlanReader
+	// TargetLength supplies the configured fallback state length. Optional.
+	TargetLength func() int
+}
+
 // NewRegistry builds an empty registry. Call Load then Sync.
-func NewRegistry(host hostapi.Host, store ConfigStore, catalogModels func() []string, plans PlanReader, targetLength func() int) *Registry {
+func NewRegistry(cfg RegistryConfig) *Registry {
+	catalogModels := cfg.CatalogModels
 	if catalogModels == nil {
 		catalogModels = func() []string { return nil }
 	}
 	return &Registry{
-		host:          host,
-		store:         store,
+		host:          cfg.Host,
+		store:         cfg.Store,
+		modelStore:    cfg.ModelStore,
 		catalogModels: catalogModels,
-		plans:         plans,
-		targetLength:  targetLength,
+		plans:         cfg.Plans,
+		targetLength:  cfg.TargetLength,
 		byIndex:       map[string]Account{},
 		byAuthID:      map[string]string{},
 		configs:       map[modelKey]bool{},
+		modelLists:    map[string]ModelList{},
 	}
 }
 
-// Load restores persisted probe toggles.
+// SetModelFetcher installs the upstream model-list loader.
+func (r *Registry) SetModelFetcher(f ModelFetcher) {
+	r.mu.Lock()
+	r.fetcher = f
+	r.mu.Unlock()
+}
+
+// Load restores persisted probe toggles and model lists.
 func (r *Registry) Load(ctx context.Context) error {
 	cfgs, err := r.store.ListAccountModels(ctx)
 	if err != nil {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.configs = make(map[modelKey]bool, len(cfgs))
 	for _, c := range cfgs {
 		r.configs[modelKey{c.AuthIndex, c.Model}] = c.ProbeEnabled
 	}
+	r.mu.Unlock()
+
+	if r.modelStore == nil {
+		return nil
+	}
+	lists, err := r.modelStore.ListModelLists(ctx)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.modelLists = make(map[string]ModelList, len(lists))
+	for _, l := range lists {
+		r.modelLists[l.AuthIndex] = l
+	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -135,9 +246,88 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	count, missing := r.adopt(list, time.Now())
+	r.resolvePlans(ctx, missing)
+	return count, nil
+}
 
-	now := time.Now()
+// SyncAccount refreshes one account from CPA and reports whether it still
+// exists.
+//
+// This is the per-probe freshness check the design requires: an account's state
+// is CPA's to know and can change at any moment -- the operator re-authorises
+// it, it runs out of quota, it is removed -- and a snapshot taken minutes ago is
+// not evidence about right now.
+//
+// The second return value is false only when CPA answered and the account was
+// not in the answer. A failed call leaves the cached view alone and reports the
+// error: "the host did not answer" is not "the account is gone", and acting on
+// that confusion would delete a healthy account's bindings.
+func (r *Registry) SyncAccount(ctx context.Context, authIndex string) (Account, bool, error) {
+	list, err := r.host.ListAccounts(ctx)
+	if err != nil {
+		acc, known := r.Get(authIndex)
+		return acc, known, err
+	}
+	r.adopt(list, time.Now())
+	acc, known := r.Get(authIndex)
+	return acc, known, nil
+}
 
+// Forget removes an account the caller has established CPA no longer lists.
+//
+// Idempotent: forgetting an account the registry does not track does nothing,
+// so a caller that repeats the call cannot fire the removal hook twice.
+func (r *Registry) Forget(ctx context.Context, authIndex string) {
+	r.mu.RLock()
+	_, known := r.byIndex[authIndex]
+	r.mu.RUnlock()
+	if !known {
+		return
+	}
+	r.dropAccount(ctx, authIndex)
+}
+
+// dropAccount removes an account and everything keyed by its auth index: the
+// cached entry, the model list, the probe toggles, and -- through the removal
+// hook -- its bindings. Leaving a binding behind would keep injecting a state
+// value for an account that cannot serve the request, and nothing would ever
+// replace it, because the account is never probed again.
+//
+// Unguarded on purpose. The sync path calls this from inside its own critical
+// section, after the account map has already been replaced, so a "is it still
+// tracked" test there would always answer no and silently skip the cleanup.
+func (r *Registry) dropAccount(ctx context.Context, authIndex string) {
+	r.mu.Lock()
+	delete(r.byIndex, authIndex)
+	for authID, idx := range r.byAuthID {
+		if idx == authIndex {
+			delete(r.byAuthID, authID)
+		}
+	}
+	for key := range r.configs {
+		if key.authIndex == authIndex {
+			delete(r.configs, key)
+		}
+	}
+	delete(r.modelLists, authIndex)
+	hook := r.onRemoved
+	r.mu.Unlock()
+
+	if r.modelStore != nil {
+		if err := r.modelStore.DeleteModelList(ctx, authIndex); err != nil {
+			r.logf("could not drop model list for removed account %s: %v", authIndex, err)
+		}
+	}
+	if hook != nil {
+		hook(ctx, authIndex)
+	}
+}
+
+// adopt replaces the cached account list from a host snapshot and returns how
+// many Codex accounts it contained, plus the accounts whose plan is still
+// unknown.
+func (r *Registry) adopt(list []hostapi.Account, now time.Time) (int, []string) {
 	next := make(map[string]Account, len(list))
 	nextAuthID := make(map[string]string, len(list))
 	count := 0
@@ -168,6 +358,12 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	}
 
 	r.mu.Lock()
+	var gone []string
+	for idx := range r.byIndex {
+		if _, still := next[idx]; !still {
+			gone = append(gone, idx)
+		}
+	}
 	// Preserve what this build learned from upstream response headers rather
 	// than from the host's account list, which carries neither. The plan is
 	// looked up from a credential and read once per process; the quota is
@@ -194,8 +390,14 @@ func (r *Registry) Sync(ctx context.Context) (int, error) {
 	}
 	r.mu.Unlock()
 
-	r.resolvePlans(ctx, missing)
-	return count, nil
+	// An account CPA no longer lists is not merely idle: its bindings and
+	// probe toggles are dead weight that would be resurrected if the same auth
+	// index ever came back with different credentials.
+	for _, idx := range gone {
+		r.dropAccount(context.Background(), idx)
+	}
+
+	return count, missing
 }
 
 // resolvePlans fills in plans for accounts that do not have one yet.
@@ -253,28 +455,38 @@ func (r *Registry) PlanType(authIndex string) string {
 	return acc.Plan.Type
 }
 
-// AllWithBlockReason returns tracked accounts paired with the reason probing is
-// being skipped, so the panel can show why an account is idle.
-func (r *Registry) AllWithBlockReason(now time.Time) []AccountView {
+// AllWithVerdict returns tracked accounts paired with the judged reason probing
+// is or is not happening, so the panel can say why an account is idle without
+// re-deriving the rule.
+func (r *Registry) AllWithVerdict(now time.Time) []AccountView {
 	accounts := r.All()
 	fallback := r.TargetStateLength()
 	out := make([]AccountView, 0, len(accounts))
 	for _, acc := range accounts {
 		expect := states.ExpectationFor(acc.Plan.Type, fallback)
+		v := Judge(acc, true, now)
+		list, hasList := r.ModelList(acc.AuthIndex)
 		out = append(out, AccountView{
 			Account:             acc,
-			BlockedReason:       BlockedReason(acc, now),
+			Verdict:             v,
 			ExpectedStateBlocks: expect.Blocks,
 			ExpectedStateLength: expect.Length,
+			ModelSource:         list.Source,
+			ModelsSyncedAt:      list.SyncedAt,
+			ModelsError:         list.Error,
+			ModelCount:          len(list.Models),
+			ModelsLoaded:        hasList && list.Source == ModelSourceUpstream,
 		})
 	}
 	return out
 }
 
-// AccountView is an account plus the derived reason it is not being probed.
+// AccountView is an account plus what the plugin derived about it.
 type AccountView struct {
 	Account
-	BlockedReason string `json:"blockedReason,omitempty"`
+	// Verdict is the judged answer to "may this be probed, and why". The panel
+	// renders it rather than recomputing the rule from the raw host fields.
+	Verdict Verdict `json:"verdict"`
 	// ExpectedStateBlocks and ExpectedStateLength are the shape this account's
 	// values must have, derived from its plan. Surfaced because the shape varies
 	// by tier: a Team account's 332 is a Plus account's wrong length, and an
@@ -282,6 +494,17 @@ type AccountView struct {
 	// is being applied rather than assume 292 for everyone.
 	ExpectedStateBlocks int `json:"expectedStateBlocks"`
 	ExpectedStateLength int `json:"expectedStateLength"`
+
+	// ModelSource, ModelCount, ModelsSyncedAt and ModelsError describe where
+	// this account's model list came from. The panel needs all four: a list
+	// that fell back to the shared catalog looks identical to one that was
+	// fetched, and "synced 3 days ago with an error since" is a different
+	// situation from "synced an hour ago".
+	ModelSource    string    `json:"modelSource,omitempty"`
+	ModelCount     int       `json:"modelCount"`
+	ModelsSyncedAt time.Time `json:"modelsSyncedAt,omitempty"`
+	ModelsError    string    `json:"modelsError,omitempty"`
+	ModelsLoaded   bool      `json:"modelsLoaded"`
 }
 
 // All returns tracked accounts sorted by label then authIndex.
@@ -405,9 +628,10 @@ func (r *Registry) ForgetModel(ctx context.Context, authIndex, model string) err
 
 // EnabledPairs returns every (authIndex, model) with probing switched on.
 //
-// Accounts CPA reports as unhealthy are filtered out here, which is the single
-// gate the probe scheduler draws from: an account that is disabled, refreshing,
-// awaiting MFA, or cooling down after a quota rejection is not worth a request.
+// Accounts the verdict refuses are filtered out here, which is the single gate
+// the probe scheduler draws from. Note how narrow that gate is: a disabled,
+// removed, expired-credential, refreshing or MFA-pending account is skipped,
+// while one that is merely rate-limited or in CPA's temporary cooldown is not.
 func (r *Registry) EnabledPairs() []Config {
 	now := time.Now()
 
@@ -419,7 +643,7 @@ func (r *Registry) EnabledPairs() []Config {
 			continue
 		}
 		acc, ok := r.byIndex[k.authIndex]
-		if !ok || BlockedReason(acc, now) != "" {
+		if !ok || Judge(acc, true, now).Blocked {
 			continue
 		}
 		out = append(out, Config{AuthIndex: k.authIndex, Model: k.model, ProbeEnabled: true})
@@ -435,19 +659,20 @@ func (r *Registry) EnabledPairs() []Config {
 
 // Models returns the model list for an account, with per-model probe toggles.
 //
-// The list comes from the shared manifest rather than from operator input or a
-// hardcoded table. The plugin has no way to read CPA's own model registry, so
-// this is the nearest authoritative source: the same file CPA syncs, parsed the
-// same way. Which of the models an account can actually serve is answered by
-// probing, not by guessing.
+// The list is the account's own, fetched from the catalog endpoint the Codex
+// client uses. Until that first fetch lands -- and permanently on a host with
+// no egress -- it falls back to the shared manifest, which is the union of
+// every tier and therefore an over-approximation for any one account. Which of
+// the listed models an account can actually serve is answered by probing, not
+// by guessing.
 func (r *Registry) Models(authIndex string) ([]ModelState, bool) {
 	if _, ok := r.Get(authIndex); !ok {
 		return nil, false
 	}
-	models := r.catalogModels()
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	models, _ := r.modelsLocked(authIndex)
 	out := make([]ModelState, 0, len(models))
 	for _, m := range models {
 		out = append(out, ModelState{
@@ -458,61 +683,133 @@ func (r *Registry) Models(authIndex string) ([]ModelState, bool) {
 	return out, true
 }
 
-// BlockedReason explains why an account should not be probed, or returns an
-// empty string when it should.
-//
-// CPA already knows far more about an account's health than the plugin can
-// infer, and it reports it through host.auth.list: whether the account is
-// disabled, mid-refresh, waiting on an external step, or temporarily
-// unavailable because the provider said so -- quota exhaustion being the case
-// that matters here. Probing an account in any of those states spends a request
-// to learn what CPA already knew, and in the quota case it spends part of the
-// very budget that is exhausted.
-//
-// A blocked account is never dropped from the panel: the operator needs to see
-// that it exists and why it is idle.
-func BlockedReason(a Account, now time.Time) string {
-	switch {
-	case a.Disabled:
-		return "账号已禁用"
-	case a.Status == hostapi.AccountStatusDisabled:
-		return "账号已禁用"
-	case a.Unavailable:
-		if a.StatusMessage != "" {
-			return "账号暂时不可用：" + a.StatusMessage
-		}
-		return "账号暂时不可用（可能已达额度上限）"
-	case a.NextRetryAfter != nil && now.Before(*a.NextRetryAfter):
-		return "账号冷却中，可重试于 " + a.NextRetryAfter.Local().Format("15:04:05")
-	case a.Status == hostapi.AccountStatusError:
-		if a.StatusMessage != "" {
-			return "账号处于错误状态：" + a.StatusMessage
-		}
-		return "账号处于错误状态"
-	case a.Status == hostapi.AccountStatusPending:
-		return "账号等待外部操作（如 MFA）"
-	case a.Status == hostapi.AccountStatusRefreshing:
-		return "账号正在刷新凭证"
-	case a.Status == hostapi.AccountStatusUnknown || a.Status == "":
-		// An unknown state is not evidence of a fault. Probing costs one cheap
-		// request and is how the state becomes known.
-		return ""
+// modelsLocked resolves an account's list, preferring its own. Callers must
+// hold at least a read lock.
+func (r *Registry) modelsLocked(authIndex string) ([]string, bool) {
+	if list, ok := r.modelLists[authIndex]; ok && len(list.Models) > 0 {
+		return list.Models, true
 	}
-	return ""
+	return r.catalogModels(), false
 }
 
-// ProbeBlocked reports whether probing should be skipped for an account.
-func (r *Registry) ProbeBlocked(authIndex string, now time.Time) (bool, string) {
-	acc, ok := r.Get(authIndex)
+// ModelList returns the stored list for an account and whether it is the
+// account's own rather than the shared fallback.
+func (r *Registry) ModelList(authIndex string) (ModelList, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	list, ok := r.modelLists[authIndex]
 	if !ok {
-		return true, "账号不在 CPA 的账号池中"
+		return ModelList{AuthIndex: authIndex, Models: r.catalogModels(), Source: ModelSourceCatalog}, false
 	}
-	reason := BlockedReason(acc, now)
-	return reason != "", reason
+	return list, true
+}
+
+// MissingModelLists returns the accounts whose own list has not been fetched.
+func (r *Registry) MissingModelLists() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.byIndex))
+	for idx := range r.byIndex {
+		if _, ok := r.modelLists[idx]; !ok {
+			out = append(out, idx)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// LoadModels fetches and stores one account's model list.
+//
+// With force false an account that already has a list is skipped: the list is
+// read from upstream against the account's own quota and changes rarely, so it
+// is loaded once and thereafter only when an operator asks. A failed fetch is
+// recorded on the existing entry rather than replacing the list with nothing --
+// a stale list is worth more than an empty one.
+func (r *Registry) LoadModels(ctx context.Context, authIndex string, force bool) (ModelList, error) {
+	r.mu.RLock()
+	fetcher := r.fetcher
+	existing, has := r.modelLists[authIndex]
+	_, known := r.byIndex[authIndex]
+	r.mu.RUnlock()
+
+	if !known {
+		return ModelList{}, fmt.Errorf("%w %q", ErrUnknownAccount, authIndex)
+	}
+	if has && !force {
+		return existing, nil
+	}
+	if fetcher == nil {
+		return existing, errors.New("accounts: no model fetcher is installed")
+	}
+
+	models, err := fetcher.FetchModels(ctx, authIndex)
+	if err != nil {
+		// Keep the list, record why it is old. The panel shows the error
+		// alongside the sync time so "this may be out of date" is visible
+		// rather than inferred.
+		stale := existing
+		stale.AuthIndex = authIndex
+		if stale.Models == nil {
+			stale.Models = r.catalogModels()
+			stale.Source = ModelSourceCatalog
+		}
+		stale.Error = err.Error()
+		stale.SyncedAt = time.Now()
+		if r.modelStore != nil {
+			// Best effort: failing to record the failure must not turn into a
+			// second failure the caller has to handle.
+			_ = r.modelStore.SaveModelList(ctx, stale)
+		}
+		r.mu.Lock()
+		r.modelLists[authIndex] = stale
+		r.mu.Unlock()
+		return stale, err
+	}
+
+	list := ModelList{
+		AuthIndex: authIndex,
+		Models:    models,
+		Source:    ModelSourceUpstream,
+		SyncedAt:  time.Now(),
+	}
+	if r.modelStore != nil {
+		if err := r.modelStore.SaveModelList(ctx, list); err != nil {
+			return list, err
+		}
+	}
+	r.mu.Lock()
+	r.modelLists[authIndex] = list
+	r.mu.Unlock()
+	return list, nil
 }
 
 // ModelState is one row of the panel's per-account model table.
 type ModelState struct {
 	Model        string `json:"model"`
 	ProbeEnabled bool   `json:"probeEnabled"`
+}
+
+// logf writes a diagnostic line if the composition root installed a logger.
+//
+// The registry has no logger of its own because the only thing it has to report
+// is a persistence failure during cleanup, and dropping a removed account's
+// bookkeeping is not worth aborting a sync over.
+func (r *Registry) logf(format string, args ...any) {
+	if r.logger != nil {
+		r.logger(format, args...)
+	}
+}
+
+// SetAccountRemovalHook installs the callback run when an account is dropped.
+func (r *Registry) SetAccountRemovalHook(fn func(ctx context.Context, authIndex string)) {
+	r.mu.Lock()
+	r.onRemoved = fn
+	r.mu.Unlock()
+}
+
+// SetLogger installs the diagnostic sink.
+func (r *Registry) SetLogger(logf func(string, ...any)) {
+	r.mu.Lock()
+	r.logger = logf
+	r.mu.Unlock()
 }

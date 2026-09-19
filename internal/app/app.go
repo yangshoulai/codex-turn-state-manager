@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/callhistory"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/intercept"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/management"
@@ -54,6 +56,11 @@ type App struct {
 	windows   *probe.WindowManager
 	executor  *probe.Executor
 	scheduler *probe.Scheduler
+
+	// modelFetcher reads an account's own model catalog from upstream.
+	modelFetcher *models.AccountFetcher
+	// calls records one row per intercepted request.
+	calls *callhistory.Recorder
 
 	corr      *intercept.CorrelationManager
 	stats     *intercept.Stats
@@ -126,16 +133,47 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	// The registry judges state shape for the panel, and the executor and
 	// collector do it on the request path. All three read the same fallback, so
 	// a change to the setting cannot make the panel disagree with what binds.
-	a.accounts = accounts.NewRegistry(cfg.Host, db.AccountModels(), a.catalog.Models, a,
-		func() int { return a.settings.Current().TargetStateLength })
+	a.accounts = accounts.NewRegistry(accounts.RegistryConfig{
+		Host:          cfg.Host,
+		Store:         db.AccountModels(),
+		ModelStore:    db.ModelLists(),
+		CatalogModels: a.catalog.Models,
+		Plans:         a,
+		TargetLength:  func() int { return a.settings.Current().TargetStateLength },
+	})
+	a.accounts.SetLogger(func(format string, args ...any) {
+		logf(hostapi.LogWarn, fmt.Sprintf(format, args...), nil)
+	})
 	if err := a.accounts.Load(ctx); err != nil {
 		return nil, a.fail(err)
 	}
+	// The model list comes from upstream rather than from CPA, which exposes no
+	// such callback; the composition root owns the credential lookup because
+	// only it is allowed to reach the host (NF-06).
+	a.modelFetcher = models.NewAccountFetcher(cfg.UpstreamBaseURL)
+	a.accounts.SetModelFetcher(a)
 
 	a.states = states.NewRegistry(db.Bindings(), db.Bindings(), a)
 	if err := a.states.Load(ctx); err != nil {
 		return nil, a.fail(err)
 	}
+	// An account CPA no longer lists must not keep a binding: the plugin would
+	// go on injecting a state value for an account that can never be probed
+	// again, so nothing would ever replace it.
+	a.accounts.SetAccountRemovalHook(func(ctx context.Context, authIndex string) {
+		n, err := a.states.DeleteAccount(ctx, authIndex, states.SourceProbe)
+		if err != nil {
+			logf(hostapi.LogWarn, "could not drop bindings for a removed account", map[string]any{
+				"authIndex": authIndex, "error": err.Error(),
+			})
+			return
+		}
+		if n > 0 {
+			logf(hostapi.LogInfo, "dropped bindings for an account CPA no longer lists", map[string]any{
+				"authIndex": authIndex, "bindings": n,
+			})
+		}
+	})
 
 	a.proxies = proxies.NewPool(db.Proxies())
 	if err := a.proxies.Load(ctx); err != nil {
@@ -177,12 +215,15 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 
 	a.corr = intercept.NewCorrelationManager(intercept.DefaultCorrelationTTL)
 	a.stats = &intercept.Stats{}
+	a.calls = callhistory.New(callhistory.Config{Settings: a.settings, Store: db.Calls()})
 	a.injector = intercept.NewInjector(intercept.InjectorConfig{
 		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
+		Calls: a.calls,
 	})
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
 		Settings: a.settings, States: a.states, Plans: a.accounts,
 		Corr: a.corr, Log: logf, Stats: a.stats,
+		Calls:   a.calls,
 		Signals: a.accounts.RecordSignals,
 		// A binding dropped as stale should be refilled by the next scan, not
 		// by a probe whose backoff predates the discovery.
@@ -236,10 +277,25 @@ func (a *App) Start() {
 			} else {
 				a.log(hostapi.LogInfo, "initial account sync complete", map[string]any{"accounts": n})
 			}
+			a.loadMissingModels(syncCtx)
 		}()
 
 		a.scheduler.Start(ctx)
 		a.catalog.Start(ctx)
+
+		// The call-history writer owns the only goroutine that touches the
+		// table, so the request path never waits on a disk.
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.calls.Run(ctx)
+		}()
+
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.modelsLoop(ctx)
+		}()
 
 		a.wg.Add(1)
 		go func() {
@@ -247,6 +303,43 @@ func (a *App) Start() {
 			a.pruneLoop(ctx)
 		}()
 	})
+}
+
+// loadMissingModels fetches the model list for every account that has none.
+//
+// Run right after the first account sync so the panel has real per-account
+// lists rather than the shared manifest from the first render onwards.
+func (a *App) loadMissingModels(ctx context.Context) {
+	for _, authIndex := range a.accounts.MissingModelLists() {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := a.accounts.LoadModels(ctx, authIndex, false); err != nil {
+			a.log(hostapi.LogInfo, "could not load the account model list", map[string]any{
+				"authIndex": authIndex, "error": err.Error(),
+			})
+		}
+	}
+}
+
+// modelsLoop retries the first-time model load for accounts that did not get
+// one, and never re-reads a list it already has.
+//
+// A separate loop rather than work inside the scan: the first load is a burst of
+// outbound requests against each account's own quota, and folding it into the
+// scan would put it behind the probe switch and the time window -- so an
+// operator who keeps probing switched off would never see a model list at all.
+func (a *App) modelsLoop(ctx context.Context) {
+	ticker := time.NewTicker(3 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.loadMissingModels(ctx)
+		}
+	}
 }
 
 // Stop shuts the plugin down, leaving the database in a clean state.
@@ -263,7 +356,7 @@ func (a *App) Stop() {
 	})
 }
 
-// pruneLoop drops probe history past its retention.
+// pruneLoop drops history past its retention.
 //
 // It wakes more often than the retention window so a day-long setting is
 // enforced within the hour rather than up to two days late.
@@ -275,18 +368,29 @@ func (a *App) pruneLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			retention := a.settings.Current().ProbeRetention
-			cutoff := time.Now().Add(-retention)
+			values := a.settings.Current()
+			cutoff := time.Now().Add(-values.ProbeRetention)
 			n, err := a.db.Probes().PruneProbesBefore(ctx, cutoff)
 			if err != nil {
 				a.log(hostapi.LogWarn, "probe history prune failed", map[string]any{"error": err.Error()})
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				a.log(hostapi.LogInfo, "probe history pruned", map[string]any{
 					"rows": n, "olderThan": cutoff.UTC().Format(time.RFC3339),
 				})
 			}
+
+			callCutoff := time.Now().Add(-values.CallHistoryRetention)
+			m, err := a.db.Calls().PruneCallsBefore(ctx, callCutoff)
+			if err != nil {
+				a.log(hostapi.LogWarn, "call history prune failed", map[string]any{"error": err.Error()})
+			} else if m > 0 {
+				a.log(hostapi.LogInfo, "call history pruned", map[string]any{
+					"rows": m, "olderThan": callCutoff.UTC().Format(time.RFC3339),
+				})
+			}
+			// Requests that never reached a terminal state would otherwise sit
+			// in the recorder's map forever.
+			a.calls.Sweep()
 		}
 	}
 }
@@ -413,8 +517,77 @@ func (e enabledPairs) EnabledPairs() []states.Pair {
 // Sync implements probe.EnabledPairSource.
 func (e enabledPairs) Sync(ctx context.Context) (int, error) { return e.registry.Sync(ctx) }
 
+// SyncAccount implements probe.EnabledPairSource.
+func (e enabledPairs) SyncAccount(ctx context.Context, authIndex string) (bool, error) {
+	_, listed, err := e.registry.SyncAccount(ctx, authIndex)
+	return listed, err
+}
+
 // SyncAccounts pulls the account list from CPA.
 func (a *App) SyncAccounts(ctx context.Context) (int, error) { return a.accounts.Sync(ctx) }
+
+// SyncOneAccount refreshes a single account from CPA and, when models is true,
+// re-reads its model list from upstream.
+//
+// The model reload is opt-in because it costs a request against the account's
+// own quota; plain "refresh this account's state" is free. This is what the
+// panel's per-account sync button calls, and the reason it exists at all: the
+// operator can see CPA's current view of an account without waiting for the
+// next scheduled sync, which is the only way to confirm that a fix they just
+// made in CPA has been picked up.
+func (a *App) SyncOneAccount(ctx context.Context, authIndex string, models bool) (accounts.AccountView, error) {
+	acc, listed, err := a.accounts.SyncAccount(ctx, authIndex)
+	if err != nil {
+		return accounts.AccountView{}, err
+	}
+	if !listed {
+		return accounts.AccountView{}, fmt.Errorf("%w: %s", accounts.ErrUnknownAccount, authIndex)
+	}
+	if models {
+		if _, err := a.accounts.LoadModels(ctx, authIndex, true); err != nil {
+			// The account refresh succeeded; only the model list did not. Report
+			// it as one of the view's fields rather than as a failed sync, so the
+			// panel still shows the account it just refreshed.
+			a.log(hostapi.LogInfo, "account model reload failed", map[string]any{
+				"authIndex": authIndex, "error": err.Error(),
+			})
+		}
+	}
+
+	views := a.accounts.AllWithVerdict(time.Now())
+	for _, v := range views {
+		if v.AuthIndex == authIndex {
+			return v, nil
+		}
+	}
+	return accounts.AccountView{Account: acc}, nil
+}
+
+// ModelLists reports the model list held for an account.
+func (a *App) ModelList(authIndex string) (accounts.ModelList, bool) {
+	return a.accounts.ModelList(authIndex)
+}
+
+// FetchModels implements accounts.ModelFetcher.
+//
+// The credential is read immediately before the call and discarded with it
+// (NF-06); only the derived model ids are kept.
+func (a *App) FetchModels(ctx context.Context, authIndex string) ([]string, error) {
+	cred, err := a.cfg.Host.GetCredential(ctx, authIndex)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cred.AccessToken) == "" {
+		return nil, errors.New("app: credential has no access_token")
+	}
+	return a.modelFetcher.List(ctx, cred.AccessToken, accounts.ParseAccountIDFromCredential(cred.Raw))
+}
+
+// CallHistory returns the call-history store.
+func (a *App) CallHistory() callhistory.Store { return a.db.Calls() }
+
+// CallRecorder exposes the recorder for diagnostics.
+func (a *App) CallRecorder() *callhistory.Recorder { return a.calls }
 
 // TriggerProbe runs one on-demand probe for a pair, using a single node.
 //

@@ -38,6 +38,8 @@ type Collector struct {
 	stats   *Stats
 	signals func(authIndex string, signals headers.Signals)
 	onStale func(pair states.Pair)
+	// calls receives the response half of the call history. Optional.
+	calls CallRecorder
 
 	failMu       sync.Mutex
 	serverErrors map[states.Pair]int
@@ -62,6 +64,8 @@ type CollectorConfig struct {
 	// OnStale is told when a binding was discarded as stale, so the pair can be
 	// probed again promptly.
 	OnStale func(pair states.Pair)
+	// Calls receives what upstream answered and how the request ended.
+	Calls CallRecorder
 }
 
 // NewCollector builds a collector.
@@ -78,6 +82,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		stats:        cfg.Stats,
 		signals:      cfg.Signals,
 		onStale:      cfg.OnStale,
+		calls:        cfg.Calls,
 		serverErrors: map[states.Pair]int{},
 	}
 }
@@ -142,21 +147,31 @@ func (c *Collector) Observe(ctx context.Context, chunk hostapi.StreamChunk) Capt
 		StateLength: len(chunk.ResponseHeaders.Get(headers.TurnState)),
 	})
 
-	return c.capture(ctx, chunk.RequestID, chunk.Model, authIndex, chunk.ResponseHeaders)
+	return c.capture(ctx, chunk.RequestID, chunk.Model, authIndex, chunk.ResponseHeaders, chunk.StatusCode)
 }
 
 // ObserveResponse handles the non-streaming response interceptor, which is the
 // simpler of the two paths for observing a state value.
 func (c *Collector) ObserveResponse(ctx context.Context, chunk hostapi.StreamChunk) CaptureResult {
 	c.stats.nonStream.Add(1)
-	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders)
+	return c.capture(ctx, chunk.RequestID, chunk.Model, chunk.AuthIndex, chunk.ResponseHeaders, chunk.StatusCode)
 }
 
 func (c *Collector) capture(
 	ctx context.Context,
 	requestID, model, authIndex string,
 	header http.Header,
+	statusCode int,
 ) CaptureResult {
+	// Recorded first, before any of this function's own decisions. The call log
+	// describes what happened on the wire; whether the plugin chose to bind the
+	// value is a separate question from whether upstream sent one, and an
+	// operator debugging a binding that never appears needs the second answer
+	// even when the first is "we ignored it".
+	if c.calls != nil {
+		c.calls.Response(requestID, headers.Get(header, headers.TurnState), statusCode)
+	}
+
 	caps := c.settings.Current().Capabilities()
 
 	rec, hasRec := c.corr.Complete(requestID)
@@ -338,6 +353,13 @@ const (
 // purpose: the plugin only invalidates state that *this* request actually
 // carried, so an unrelated failure never throws away good state.
 func (c *Collector) ObserveCompletion(ctx context.Context, comp hostapi.Completion, body []byte) FailureSignal {
+	// The call log is written before the self-healing rules run, because every
+	// request belongs in it -- including the ones the rules below decide to do
+	// nothing about, which are the majority.
+	if c.calls != nil {
+		c.calls.Complete(comp.RequestID, comp.StatusCode, string(comp.Outcome))
+	}
+
 	if !c.settings.Current().Capabilities().Enabled {
 		return FailureSignal{}
 	}

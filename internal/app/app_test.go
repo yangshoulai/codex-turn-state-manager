@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/callhistory"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/intercept"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/proxies"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
@@ -1298,3 +1301,192 @@ func TestApp_AccountModelsBulkEndpoint(t *testing.T) {
 		t.Error("codex-auth-1 came back with no models")
 	}
 }
+
+// TestApp_CallHistoryRecordsAWholeRequest drives the three request-path entry
+// points in the order the host calls them and reads the row back.
+//
+// This is the wiring test for the call log: the injector, the response
+// interceptor and the completion callback each see a third of the request, and
+// a row only appears if all three are connected to the same recorder. The unit
+// tests in internal/callhistory cover the joining; this covers the plumbing.
+func TestApp_CallHistoryRecordsAWholeRequest(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	a.Start()
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair: states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5.5"},
+		// A real state value has a readable envelope, but the injector does not
+		// parse it -- it serves whatever is bound -- so a placeholder is enough
+		// to observe injection.
+		StateValue: "BOUND-STATE-VALUE",
+		Source:     states.SourceManual,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	const requestID = "req-e2e-1"
+	req := &hostapi.InterceptedRequest{
+		Stage:     hostapi.StageAfterAuth,
+		RequestID: requestID,
+		Provider:  hostapi.ProviderCodex,
+		Model:     "gpt-5.5",
+		AuthIndex: "codex-auth-1",
+		Headers:   http.Header{"X-Codex-Turn-State": []string{"CLIENT-SUPPLIED"}},
+	}
+	decision := a.InjectState(req)
+	if decision.Action != intercept.ActionInjected {
+		t.Fatalf("InjectState = %q, want %q", decision.Action, intercept.ActionInjected)
+	}
+
+	a.ObserveStreamChunk(ctx, hostapi.StreamChunk{
+		RequestID:  requestID,
+		Model:      "gpt-5.5",
+		AuthIndex:  "codex-auth-1",
+		ChunkIndex: hostapi.StreamChunkHeaderInitIndex,
+		ResponseHeaders: http.Header{
+			"X-Codex-Turn-State": []string{"UPSTREAM-RETURNED"},
+		},
+	})
+	a.ObserveCompletion(ctx, hostapi.Completion{
+		RequestID:  requestID,
+		Model:      "gpt-5.5",
+		Outcome:    hostapi.CompletionSucceeded,
+		StatusCode: http.StatusOK,
+	}, nil)
+
+	// The writer is asynchronous and batches on the queue going quiet, so give
+	// it a moment rather than asserting straight away.
+	store := a.CallHistory()
+	var rows []callhistory.Record
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var err error
+		rows, err = store.ListCalls(ctx, callhistory.Query{AuthIndex: "codex-auth-1"})
+		if err != nil {
+			t.Fatalf("ListCalls: %v", err)
+		}
+		if len(rows) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+
+	row := rows[0]
+	if row.CarriedState != "CLIENT-SUPPLIED" {
+		t.Errorf("CarriedState = %q, want what the request arrived with", row.CarriedState)
+	}
+	if row.InjectedState != "BOUND-STATE-VALUE" {
+		t.Errorf("InjectedState = %q, want the bound value", row.InjectedState)
+	}
+	if row.ResponseState != "UPSTREAM-RETURNED" {
+		t.Errorf("ResponseState = %q, want what upstream answered", row.ResponseState)
+	}
+	if row.StatusCode != http.StatusOK || row.Outcome != "succeeded" {
+		t.Errorf("status = %d outcome = %q", row.StatusCode, row.Outcome)
+	}
+	if row.Model != "gpt-5.5" {
+		t.Errorf("Model = %q", row.Model)
+	}
+}
+
+// TestApp_CallHistoryIsEmptyWhenTheMasterSwitchIsOff pins the master switch as
+// the gate for the log too. A plugin that is switched off should look like it
+// was never loaded, not like it is quietly observing.
+func TestApp_CallHistoryIsEmptyWhenTheMasterSwitchIsOff(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	a.Start()
+	if _, err := a.Settings().Update(ctx, settings.Patch{GlobalEnabled: boolPtr(false)}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	a.InjectState(&hostapi.InterceptedRequest{
+		Stage: hostapi.StageAfterAuth, RequestID: "req-off",
+		Model: "gpt-5.5", AuthIndex: "codex-auth-1", Headers: http.Header{},
+	})
+	a.ObserveCompletion(ctx, hostapi.Completion{
+		RequestID: "req-off", Model: "gpt-5.5",
+		Outcome: hostapi.CompletionSucceeded, StatusCode: 200,
+	}, nil)
+
+	time.Sleep(100 * time.Millisecond)
+	rows, err := a.CallHistory().ListCalls(ctx, callhistory.Query{})
+	if err != nil {
+		t.Fatalf("ListCalls: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 with the master switch off", len(rows))
+	}
+}
+
+// TestApp_SyncOneAccountRefreshesStatusAndModels covers the panel's per-account
+// button end to end: CPA's view is re-read, and the call to LoadModels is made
+// even though upstream cannot answer in a test.
+func TestApp_SyncOneAccountRefreshesStatusAndModels(t *testing.T) {
+	ctx := context.Background()
+	host := mockHost(1)
+	a := newTestApp(t, host)
+	a.Start()
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	// The operator fixes the account in CPA.
+	host.SetAccountStatus("codex-auth-1", hostapi.AccountStatusActive, false)
+
+	view, err := a.SyncOneAccount(ctx, "codex-auth-1", true)
+	if err != nil {
+		t.Fatalf("SyncOneAccount: %v", err)
+	}
+	if view.Status != hostapi.AccountStatusActive {
+		t.Errorf("status = %q, want active", view.Status)
+	}
+	if view.Verdict.Blocked {
+		t.Errorf("verdict = %+v, want probeable", view.Verdict)
+	}
+
+	if _, err := a.SyncOneAccount(ctx, "nobody", false); !errors.Is(err, accounts.ErrUnknownAccount) {
+		t.Errorf("unknown account error = %v, want ErrUnknownAccount", err)
+	}
+}
+
+// TestApp_ForgetsAnAccountCPADropped covers the removal path from the outside:
+// a sync that no longer lists an account must take its binding with it.
+func TestApp_ForgetsAnAccountCPADropped(t *testing.T) {
+	ctx := context.Background()
+	host := mockHost(2)
+	a := newTestApp(t, host)
+	a.Start()
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+	if _, err := a.States().Bind(ctx, states.Binding{
+		Pair:       states.Pair{AuthIndex: "codex-auth-2", Model: "gpt-5.5"},
+		StateValue: "VALUE",
+		Source:     states.SourceManual,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	host.RemoveAccount("codex-auth-2")
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts after removal: %v", err)
+	}
+
+	if _, ok := a.Accounts().Get("codex-auth-2"); ok {
+		t.Error("the removed account is still tracked")
+	}
+	for pair := range a.States().All() {
+		if pair.AuthIndex == "codex-auth-2" {
+			t.Error("a binding for the removed account survived")
+		}
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/callhistory"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/intercept"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/models"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/probe"
@@ -39,8 +40,13 @@ type Service interface {
 
 	Catalog() *models.Catalog
 	PipelineStats() intercept.StatsSnapshot
+	CallHistory() callhistory.Store
+	CallRecorder() *callhistory.Recorder
 
 	SyncAccounts(ctx context.Context) (int, error)
+	// SyncOneAccount refreshes a single account and, when models is true,
+	// re-reads its model list from upstream.
+	SyncOneAccount(ctx context.Context, authIndex string, models bool) (accounts.AccountView, error)
 	TriggerProbe(ctx context.Context, authIndex, model string) (probe.Result, error)
 }
 
@@ -112,6 +118,9 @@ func Routes() []Route {
 		{http.MethodPut, "/proxy-nodes", func(a *API) http.HandlerFunc { return a.replaceProxies }},
 
 		{http.MethodGet, "/probe-history", func(a *API) http.HandlerFunc { return a.probeHistory }},
+
+		{http.MethodGet, "/call-history", func(a *API) http.HandlerFunc { return a.callHistory }},
+		{http.MethodDelete, "/call-history", func(a *API) http.HandlerFunc { return a.clearCallHistory }},
 	}
 }
 
@@ -213,6 +222,14 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		// the plugin has ever actually injected, which a header rewrite
 		// otherwise leaves no trace of.
 		"pipeline": a.svc.PipelineStats(),
+		// Whether the call log is keeping up. A recorder whose writer has fallen
+		// behind shows a history with holes in it, and the operator would have no
+		// way to tell that from a quiet proxy.
+		"callLog": map[string]any{
+			"pending":    a.svc.CallRecorder().Pending(),
+			"dropped":    a.svc.CallRecorder().Dropped(),
+			"writeError": a.svc.CallRecorder().WriteError(),
+		},
 	})
 }
 
@@ -235,6 +252,7 @@ type settingsDTO struct {
 	ProbeRetentionHours      int    `json:"probeHistoryRetentionHours"`
 	MaxProxiesPerProbe       int    `json:"maxProxiesPerProbe"`
 	NonTargetBackoffCapMin   int    `json:"nonTargetBackoffCapMin"`
+	CallHistoryRetentionH    int    `json:"callHistoryRetentionHours"`
 }
 
 func toSettingsDTO(v *settings.Values) settingsDTO {
@@ -254,6 +272,7 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		ProbeRetentionHours:      int(v.ProbeRetention / time.Hour),
 		MaxProxiesPerProbe:       v.MaxProxiesPerProbe,
 		NonTargetBackoffCapMin:   int(v.NonTargetBackoffCap / time.Minute),
+		CallHistoryRetentionH:    int(v.CallHistoryRetention / time.Hour),
 	}
 }
 
@@ -278,6 +297,7 @@ type settingsPatchDTO struct {
 	ProbeRetentionHours      *int    `json:"probeHistoryRetentionHours"`
 	MaxProxiesPerProbe       *int    `json:"maxProxiesPerProbe"`
 	NonTargetBackoffCapMin   *int    `json:"nonTargetBackoffCapMin"`
+	CallHistoryRetentionH    *int    `json:"callHistoryRetentionHours"`
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -317,6 +337,10 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	patch.MaxProxiesPerProbe = dto.MaxProxiesPerProbe
 	patch.NonTargetBackoffCapMin = dto.NonTargetBackoffCapMin
+	if dto.CallHistoryRetentionH != nil {
+		d := time.Duration(*dto.CallHistoryRetentionH) * time.Hour
+		patch.CallHistoryRetention = &d
+	}
 	if dto.RoutingStrategy != nil {
 		strategy, err := settings.ParseRoutingStrategy(*dto.RoutingStrategy)
 		if err != nil {
@@ -419,7 +443,7 @@ func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
-	list := a.svc.Accounts().AllWithBlockReason(a.now())
+	list := a.svc.Accounts().AllWithVerdict(a.now())
 	if list == nil {
 		list = []accounts.AccountView{}
 	}
@@ -445,13 +469,37 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }
 
+// syncAccounts pulls the account list from CPA.
+//
+// With an authIndex it refreshes that one account instead of all of them, and
+// with models=1 it also re-reads that account's model list from upstream. The
+// per-account form is what the panel's row button uses: after changing
+// something in CPA, "has the plugin noticed" is a question about one account,
+// and waiting for the next scheduled sync to answer it is the thing that made a
+// stale status look stuck.
 func (a *API) syncAccounts(w http.ResponseWriter, r *http.Request) {
-	n, err := a.svc.SyncAccounts(r.Context())
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
+	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
+	if authIndex == "" {
+		n, err := a.svc.SyncAccounts(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": n})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"accounts": n})
+
+	models := r.URL.Query().Get("models") == "1"
+	view, err := a.svc.SyncOneAccount(r.Context(), authIndex, models)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, accounts.ErrUnknownAccount) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": view})
 }
 
 // listAccountModels returns each account's models with their binding state.
@@ -468,14 +516,35 @@ func (a *API) listAccountModels(w http.ResponseWriter, r *http.Request) {
 		for _, acc := range a.svc.Accounts().All() {
 			byAccount[acc.AuthIndex] = a.accountModelViews(acc.AuthIndex)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"accounts": byAccount})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accounts": byAccount,
+			// Where each list came from, sent alongside the tables so the panel
+			// can say "this is the account's own catalog" or "this is the shared
+			// fallback because the fetch has not succeeded yet" without a second
+			// request per account.
+			"lists": a.modelListMeta(),
+		})
 		return
 	}
 	if _, ok := a.svc.Accounts().Models(authIndex); !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown account %q", authIndex))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": a.accountModelViews(authIndex)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"models": a.accountModelViews(authIndex),
+		"list":   a.modelListMeta()[authIndex],
+	})
+}
+
+// modelListMeta reports where each account's model list came from, keyed by
+// auth index.
+func (a *API) modelListMeta() map[string]accounts.ModelList {
+	out := map[string]accounts.ModelList{}
+	for _, acc := range a.svc.Accounts().All() {
+		list, _ := a.svc.Accounts().ModelList(acc.AuthIndex)
+		out[acc.AuthIndex] = list
+	}
+	return out
 }
 
 type modelView struct {
@@ -786,6 +855,109 @@ func (a *API) probeHistory(w http.ResponseWriter, r *http.Request) {
 		"offset": q.Offset,
 		"total":  total,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// call history
+
+// callView is one intercepted request as the panel renders it.
+//
+// The three state values are not sent. Each is ~300 characters, three of them
+// per row over a page of fifty is 45 KB of secrets fanned out on every poll,
+// and the panel's question is structural -- "did we inject, did upstream echo
+// it, what status came back" -- which prefixes and lengths answer. A caller
+// that genuinely needs a value asks for that one row with expand=1.
+type callView struct {
+	ID        int64     `json:"id"`
+	AuthIndex string    `json:"authIndex"`
+	Model     string    `json:"model"`
+	RequestID string    `json:"requestId,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+
+	CarriedPrefix  string `json:"carriedPrefix,omitempty"`
+	InjectedPrefix string `json:"injectedPrefix,omitempty"`
+	ResponsePrefix string `json:"responsePrefix,omitempty"`
+	CarriedLength  int    `json:"carriedLength"`
+	InjectedLength int    `json:"injectedLength"`
+	ResponseLength int    `json:"responseLength"`
+
+	CarriedState  string `json:"carriedState,omitempty"`
+	InjectedState string `json:"injectedState,omitempty"`
+	ResponseState string `json:"responseState,omitempty"`
+
+	StatusCode int    `json:"statusCode"`
+	Outcome    string `json:"outcome,omitempty"`
+}
+
+func (a *API) callHistory(w http.ResponseWriter, r *http.Request) {
+	q := callhistory.Query{
+		AuthIndex: strings.TrimSpace(r.URL.Query().Get("authIndex")),
+		Model:     strings.TrimSpace(r.URL.Query().Get("model")),
+		Limit:     intQuery(r, "limit", 50),
+		Offset:    intQuery(r, "offset", 0),
+	}.Normalise()
+
+	rows, err := a.svc.CallHistory().ListCalls(r.Context(), q)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	total, err := a.svc.CallHistory().CountCalls(r.Context(), q)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	expand := r.URL.Query().Get("expand") == "1"
+	out := make([]callView, 0, len(rows))
+	for _, rec := range rows {
+		view := callView{
+			ID: rec.ID, AuthIndex: rec.AuthIndex, Model: rec.Model,
+			RequestID: rec.RequestID, CreatedAt: rec.CreatedAt,
+			CarriedPrefix:  prefix(rec.CarriedState, 8),
+			InjectedPrefix: prefix(rec.InjectedState, 8),
+			ResponsePrefix: prefix(rec.ResponseState, 8),
+			CarriedLength:  rec.CarriedLength(),
+			InjectedLength: rec.InjectedLength(),
+			ResponseLength: rec.ResponseLength(),
+			StatusCode:     rec.StatusCode,
+			Outcome:        rec.Outcome,
+		}
+		if expand {
+			view.CarriedState = rec.CarriedState
+			view.InjectedState = rec.InjectedState
+			view.ResponseState = rec.ResponseState
+		}
+		out = append(out, view)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"calls": out, "limit": q.Limit, "offset": q.Offset, "total": total,
+	})
+}
+
+func (a *API) clearCallHistory(w http.ResponseWriter, r *http.Request) {
+	authIndex := strings.TrimSpace(r.URL.Query().Get("authIndex"))
+	if authIndex == "" {
+		writeError(w, http.StatusBadRequest,
+			errors.New("authIndex query parameter is required"))
+		return
+	}
+	// Keyed by account, never global: clearing everything is what the retention
+	// window is for, and a button that silently empties the table for every
+	// account is a mis-click away from losing the evidence someone was reading.
+	store, ok := a.svc.CallHistory().(interface {
+		DeleteCallsForAccount(ctx context.Context, authIndex string) (int64, error)
+	})
+	if !ok {
+		writeError(w, http.StatusNotImplemented, errors.New("delete is unavailable"))
+		return
+	}
+	n, err := store.DeleteCallsForAccount(r.Context(), authIndex)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"deleted": n})
 }
 
 // ---------------------------------------------------------------------------

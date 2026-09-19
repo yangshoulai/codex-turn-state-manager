@@ -141,6 +141,7 @@ const DEFAULTS = {
   probeHistoryRetentionHours: 24,
   maxProxiesPerProbe: 10,
   nonTargetBackoffCapMin: 30,
+  callHistoryRetentionHours: 24,
   routingStrategy: "respect_cpa_priority",
 };
 
@@ -154,8 +155,16 @@ let expanded = new Set();
 // refresh. modelsLoaded distinguishes "not fetched yet" from "this account has
 // no models", which read the same on screen otherwise.
 const modelCache = new Map();
+// modelLists holds where each account's model list came from, keyed by auth
+// index. Without it a fallback list and the account's own list render
+// identically, and the operator cannot tell "this account offers six models"
+// from "the fetch has not succeeded yet".
+let modelLists = new Map();
 let modelsLoaded = false;
 let modelsError = "";
+// callPage is the call-history modal's cursor. Kept in module scope so paging
+// can re-render without reopening the dialog.
+let callPage = { authIndex: "", offset: 0, limit: 50, total: 0 };
 // windowState is the scheduler's live view of the time window, from /status.
 let windowState = null;
 // Seed model names for the add control. Suggestions only: the plugin cannot
@@ -391,6 +400,56 @@ function quotaBadge(quota) {
   const resets = [quota.primaryResetAt, quota.secondaryResetAt].filter(Boolean);
   const title = resets.length ? `上游报告的额度使用率；最近重置 ${fmtTime(resets[0])}` : "上游报告的额度使用率";
   return el("span", { class: "pill " + cls, text: parts.join(" · "), title });
+}
+
+/*
+ * A verdict is what the plugin decided about an account, and it is not the same
+ * question as what CPA reports.
+ *
+ * The distinction the panel has to get right: "已暂停探测" means probing has
+ * actually stopped, and only four states cause that. A temporary cooldown --
+ * quota exhausted, a rate limit, a 5xx -- does not, and labelling it 已暂停探测
+ * is what made an account CPA had merely throttled look permanently written
+ * off. Cooldowns get their own neutral pill and say so.
+ */
+const VERDICT_PILL = {
+  deleted: ["pill-bad", "CPA 已无此账号"],
+  disabled: ["pill-idle", "已禁用"],
+  auth: ["pill-bad", "凭证被拒"],
+  pending: ["pill-warn", "等待外部操作"],
+  refreshing: ["pill-warn", "刷新凭证中"],
+};
+
+function verdictPill(verdict) {
+  if (!verdict || !verdict.kind || verdict.kind === "ok") return null;
+  if (verdict.kind === "cooldown") {
+    return el("span", {
+      class: "pill pill-idle",
+      title: verdict.reason || "CPA 侧的临时状态，插件仍会探测",
+      text: "限流冷却",
+    });
+  }
+  const [cls, label] = VERDICT_PILL[verdict.kind] || ["pill-warn", verdict.kind];
+  return el("span", { class: "pill " + cls, title: verdict.reason || "", text: label });
+}
+
+// verdictNotice explains a verdict in words under the account's model table,
+// because the pill has room for a label and not for a reason.
+function verdictNotice(verdict) {
+  if (!verdict || !verdict.reason) return null;
+  if (verdict.blocked) {
+    return el("p", { class: "notice" }, [
+      el("strong", { text: "该账号暂停探测。" }),
+      el("span", { text: verdict.reason }),
+    ]);
+  }
+  if (verdict.kind === "cooldown") {
+    return el("p", { class: "notice" }, [
+      el("strong", { text: "仍在探测。" }),
+      el("span", { text: verdict.reason + " —— CPA 侧的临时状态，探测就是确认它是否已经恢复的方式。" }),
+    ]);
+  }
+  return null;
 }
 
 const STATUS_PILL = {
@@ -658,6 +717,7 @@ function fillSettingsForm(values) {
   $("s-retention").value = values.probeHistoryRetentionHours;
   $("s-maxproxies").value = values.maxProxiesPerProbe;
   $("s-nontargetcap").value = values.nonTargetBackoffCapMin;
+  $("s-callretention").value = values.callHistoryRetentionHours;
   $("s-scan").value = values.scanIntervalSec;
   $("s-concurrency").value = values.probeConcurrency;
   $("s-ttl").value = values.stateTtlMin;
@@ -725,6 +785,7 @@ on("save-settings", "click", async () => {
     probeHistoryRetentionHours: Number($("s-retention").value),
     maxProxiesPerProbe: Number($("s-maxproxies").value),
     nonTargetBackoffCapMin: Number($("s-nontargetcap").value),
+    callHistoryRetentionHours: Number($("s-callretention").value),
     routingStrategy: strategy ? strategy.value : undefined,
   };
   try {
@@ -875,6 +936,7 @@ function renderAccounts() {
 
   for (const account of visible) {
     const open = expanded.has(account.authIndex);
+    const verdict = account.verdict || { kind: "ok", blocked: false };
     // CPA's ready state is "active"; anything else is worth a second look.
     const statusClass = account.status === "active" && !account.disabled ? "pill-ok"
       : account.disabled ? "pill-idle" : "pill-warn";
@@ -882,11 +944,15 @@ function renderAccounts() {
     const body = el("div", { class: "account-body", dataset: { accountBody: account.authIndex } });
     body.hidden = !open;
 
-    const head = el("div", {
-      class: "account-head",
+    // The toggle is a button in its own right, and the actions are siblings of
+    // it. They used to be nested inside one big header button, which is invalid
+    // markup and made every click on 同步 collapse the account as well.
+    const toggle = el("button", {
+      class: "account-toggle", type: "button",
+      "aria-expanded": open ? "true" : "false",
       onclick: () => toggleAccount(account.authIndex),
     }, [
-      el("div", { class: "who" }, [
+      el("span", { class: "who" }, [
         el("strong", { text: account.label || account.authIndex }),
         planBadge(account.plan),
         // The shape the plugin will accept for this account. It varies by tier
@@ -902,20 +968,72 @@ function renderAccounts() {
           : null,
         quotaBadge(account.quota),
         el("span", { class: "pill " + statusClass, text: account.status || "unknown" }),
-        account.blockedReason
-          ? el("span", { class: "pill pill-warn", title: account.blockedReason, text: "已暂停探测" })
-          : null,
+        verdictPill(verdict),
       ]),
+      el("span", { class: "chevron", "aria-hidden": "true" }),
+    ]);
+
+    const actions = el("div", { class: "row-actions" }, [
+      el("button", {
+        class: "btn btn-sm", type: "button", text: "同步",
+        title: "立即向 CPA 重读该账号的状态，并重新拉取它的模型清单",
+        onclick: (ev) => syncAccount(account.authIndex, ev.currentTarget),
+      }),
+      el("button", {
+        class: "btn btn-sm", type: "button", text: "调用历史",
+        title: "该账号每个请求携带的 State、插件注入的值、上游 HTTP 状态、响应返回的 State",
+        onclick: () => showCallHistory(account.authIndex),
+      }),
+    ]);
+
+    const head = el("div", { class: "account-head" }, [
+      toggle,
       el("div", { class: "meta" }, [
         el("span", { text: `${account.bindings || 0} 个绑定` }),
         el("span", { class: "mono", text: account.authIndex }),
-        el("span", { text: open ? "▾" : "▸" }),
       ]),
+      actions,
     ]);
 
     const block = el("div", { class: "account" }, [head, body]);
-    if (open) renderModels(account.authIndex, body, account.blockedReason);
+    if (open) renderModels(account.authIndex, body, verdict);
     host.append(block);
+  }
+}
+
+/*
+ * syncAccount re-reads one account from CPA and its model list from upstream.
+ *
+ * Both, always. The two are one operator intent -- "make the plugin's view of
+ * this account current" -- and the model fetch is a single request against the
+ * account's own quota, made only when someone presses this button. Splitting it
+ * into two buttons or a modifier key would make the panel's behaviour depend on
+ * something invisible.
+ */
+async function syncAccount(authIndex, button) {
+  const label = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "同步中…";
+  }
+  try {
+    const payload = await api("POST",
+      `/accounts/sync?${qs({ authIndex, models: 1 })}`);
+    const account = payload.account || {};
+    const bits = [account.status || "unknown"];
+    if (account.verdict && account.verdict.reason) bits.push(account.verdict.reason);
+    if (account.modelsLoaded) bits.push(`模型 ${account.modelCount} 个`);
+    else if (account.modelsError) bits.push("模型清单拉取失败：" + account.modelsError);
+    toast(bits.join(" · "), !!(account.verdict && account.verdict.blocked));
+    invalidate("accounts");
+    await Promise.allSettled([loadAccounts(), loadAllModels()]);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
   }
 }
 
@@ -979,7 +1097,7 @@ async function addModel(authIndex, container, model) {
     await loadAllModels();
     invalidate(`models:${authIndex}`);
     const account = accountsState.find((a) => a.authIndex === authIndex);
-    renderModels(authIndex, container, account && account.blockedReason);
+    renderModels(authIndex, container, account && account.verdict);
     await loadAccounts();
   } catch (err) {
     toast(err.message, true);
@@ -1000,6 +1118,8 @@ async function loadAllModels() {
     for (const [authIndex, models] of Object.entries(byAccount)) {
       modelCache.set(authIndex, models || []);
     }
+    modelLists = new Map(Object.entries(payload.lists || {}));
+    modelsError = "";
     modelsLoaded = true;
   } catch (err) {
     modelsError = err.message;
@@ -1008,7 +1128,7 @@ async function loadAllModels() {
 
 // renderModels draws one account's table from the cache. It never fetches, so
 // expanding an account is instant.
-function renderModels(authIndex, container, blockedReason) {
+function renderModels(authIndex, container, verdict) {
   if (!container.hasChildNodes()) {
     container.append(el("div", { class: "empty", text: "加载中…" }));
   }
@@ -1034,7 +1154,7 @@ function renderModels(authIndex, container, blockedReason) {
   // changed() is called unconditionally so the memo tracks reality either way;
   // rebuilding identical rows on every poll is what makes the table flicker.
   const drawn = container.querySelector("table") !== null;
-  const moved = changed(`models:${authIndex}`, [models, blockedReason]);
+  const moved = changed(`models:${authIndex}`, [models, verdict, modelLists.get(authIndex)]);
   if (drawn && !moved) return;
   clear(container);
   const rows = models.map((m) => {
@@ -1096,18 +1216,43 @@ function renderModels(authIndex, container, blockedReason) {
      { label: "长度" }, { label: "下次探测" }, { label: "提示" }, { label: "" }],
     rows, "该账号的模型清单为空"));
 
-  // The list is maintained by the plugin from the same manifest CPA syncs, so
-  // there is nothing to add by hand -- only per-model probe toggles.
-  if (blockedReason) {
-    container.append(el("p", { class: "notice" }, [
-      el("strong", { text: "该账号暂停探测。" }),
-      el("span", { text: blockedReason }),
-    ]));
+  const notice = verdictNotice(verdict);
+  if (notice) container.append(notice);
+
+  container.append(modelSourceLine(authIndex));
+}
+
+/*
+ * modelSourceLine says where this account's model list came from.
+ *
+ * Two very different situations render as the same table otherwise: the
+ * account's own catalog, read from upstream, and the shared manifest used as a
+ * fallback until that read succeeds. The fallback is the union of every plan
+ * tier, so it lists models this account may not offer -- and an operator
+ * comparing it against what the account actually serves would conclude the
+ * plugin was broken rather than that the list was a placeholder.
+ */
+function modelSourceLine(authIndex) {
+  const list = modelLists.get(authIndex);
+  const parts = [];
+
+  if (list && list.source === "upstream") {
+    parts.push(el("span", { class: "pill pill-ok", text: "账号自身的模型清单" }));
+    if (list.syncedAt) parts.push(el("span", { text: "同步于 " + fmtTime(list.syncedAt) }));
+    if (list.error) {
+      parts.push(el("span", { class: "pill pill-warn", text: "最近一次刷新失败" }));
+      parts.push(el("span", { text: list.error }));
+    }
+  } else {
+    parts.push(el("span", { class: "pill pill-idle", text: "共用清单（兜底）" }));
+    parts.push(el("span", {
+      text: "尚未从该账号拉取到它自己的模型清单，当前显示的是各套餐的并集。" +
+            "点该账号的「同步」重新拉取。",
+    }));
+    if (list && list.error) parts.push(el("span", { text: list.error }));
   }
 
-  container.append(el("p", { class: "muted small",
-    text: "模型清单自动同步自 CPA 的模型表，不需要手动维护；" +
-          "账号不支持某个模型时，探测会返回 MODEL_UNSUPPORTED。" }));
+  return el("p", { class: "list-source" }, parts);
 }
 
 async function deleteBinding(authIndex, model) {
@@ -1127,12 +1272,17 @@ let modalContext = null;
 
 async function showHistory(authIndex, model) {
   modalContext = { kind: "history", authIndex, model };
-  $("modal-title").textContent = `${authIndex} / ${model} — 绑定历史`;
+  $("modal-title").textContent = `${accountLabel(authIndex)} / ${model} — 绑定历史`;
   $("modal-clear").hidden = false;
+  $("modal-clear").textContent = "清除该组合的绑定历史";
   $("modal-reset-all").hidden = true;
+  $("modal-note").textContent =
+    "只显示 State 值前 8 位；点复制图标取回完整值到剪贴板，不会写进页面。";
+  clear($("modal-pager"));
   $("modal").hidden = false;
 
   const body = $("modal-body");
+  body.id = "modal-body";
   clear(body);
   body.append(el("div", { class: "empty", text: "加载中…" }));
 
@@ -1140,33 +1290,146 @@ async function showHistory(authIndex, model) {
     const payload = await api("GET",
       `/bindings/history?${qs({ authIndex, model, limit: 100 })}`);
     const rows = (payload.history || []).map((h) => el("tr", null, [
-      el("td", { class: "mono", text: fmtTime(h.createdAt) }),
+      el("td", { class: "mono", text: fmtTime(h.createdAt), title: fmtTime(h.createdAt) }),
       el("td", null, el("span", {
         class: "pill " + (h.action === "deleted" ? "pill-bad"
           : h.action === "replaced" ? "pill-warn" : "pill-ok"),
         text: h.action,
       })),
       el("td", null, el("span", { class: "pill pill-idle", text: h.source })),
-      el("td", { class: "mono" }, [
-        el("span", { text: h.statePrefix ? h.statePrefix + "…" : "—" }),
+      // Prefix and copy button on one line. As siblings in a table cell the
+      // button wrapped below the text, which turned a one-line row into a
+      // two-line block and was the worst of the modal's layout problems.
+      el("td", null, el("div", { class: "cell-inline" }, [
+        el("span", { class: "mono", text: h.statePrefix ? h.statePrefix + "…" : "—" }),
         h.stateLength ? copyButton(authIndex, model, h.id) : null,
-      ]),
+      ])),
       el("td", { class: "num", text: h.stateLength || "—" }),
-      el("td", { class: "mono", text: proxyLabel(h.proxyId) }),
+      el("td", { class: "mono", text: proxyLabel(h.proxyId), title: proxyLabel(h.proxyId) }),
     ]));
     clear(body);
-    body.append(table(
+    body.append(el("div", { id: "binding-history" }, table(
       [{ label: "时间" }, { label: "操作" }, { label: "来源" },
        { label: "State 前缀" }, { label: "长度" }, { label: "代理" }],
-      rows, "暂无历史记录"));
-    if (rows.length) {
-      body.append(el("p", { class: "muted small",
-        text: "列表只显示 State 值前 8 位；点复制图标取回完整值到剪贴板，不会写进页面。" }));
-    }
+      rows, "暂无历史记录")));
+    body.querySelector("table").classList.add("history-table");
   } catch (err) {
     clear(body);
     body.append(el("div", { class: "empty", text: err.message }));
   }
+}
+
+/* ---------------------------------------------------------- call history */
+
+/*
+ * showCallHistory opens the per-account request log.
+ *
+ * The four facts it puts on one row -- what the request carried, what the
+ * plugin injected, what upstream answered, and how the host says it ended --
+ * arrive from three different callbacks and are otherwise only visible by
+ * correlating host logs. This is the view for "the binding exists, injection
+ * says it happened, so why did this request behave as if it had no state".
+ */
+async function showCallHistory(authIndex) {
+  modalContext = { kind: "calls", authIndex };
+  $("modal-title").textContent = `${accountLabel(authIndex)} — 调用历史`;
+  $("modal-clear").hidden = false;
+  $("modal-clear").textContent = "清除该账号的调用记录";
+  $("modal-reset-all").hidden = true;
+  $("modal-note").textContent =
+    "只显示 State 值前 8 位。状态码 0 表示这次请求没有走到终态（客户端断开或宿主没有回报）。";
+  $("modal").hidden = false;
+
+  callPage = { authIndex, offset: 0, limit: callPage.limit || 50, total: 0 };
+  await loadCalls();
+}
+
+// OUTCOME_PILL uses the probe outcomes; the host's completion outcomes are a
+// different vocabulary and get their own mapping rather than falling through to
+// a neutral pill for all four.
+const COMPLETION_PILL = {
+  succeeded: ["pill-ok", "成功"],
+  failed: ["pill-bad", "失败"],
+  rejected: ["pill-warn", "被拦截"],
+  canceled: ["pill-idle", "已取消"],
+};
+
+function httpPill(code) {
+  if (!code) return el("span", { class: "muted small", text: "—" });
+  const cls = code < 300 ? "pill-ok" : code < 500 ? "pill-warn" : "pill-bad";
+  return el("span", { class: "pill " + cls, text: String(code) });
+}
+
+// stateCell renders one of the three State values. anEmpty is what to say when
+// there is none, and it differs per column: "the request carried nothing" and
+// "the plugin injected nothing" are different facts.
+function stateCell(value, prefix, length, anEmpty) {
+  if (!length) return el("span", { class: "muted small", text: anEmpty });
+  return el("span", { class: "mono", title: `${length} 字符：${prefix}…`, text: prefix + "…" });
+}
+
+async function loadCalls() {
+  const { authIndex, offset, limit } = callPage;
+  const body = $("modal-body");
+  clear(body);
+  body.append(el("div", { class: "empty", text: "加载中…" }));
+
+  try {
+    const payload = await api("GET",
+      `/call-history?${qs({ authIndex, limit, offset })}`);
+    callPage.total = payload.total != null ? payload.total : (payload.calls || []).length;
+
+    const rows = (payload.calls || []).map((c) => {
+      const [outcomeCls, outcomeLabel] = COMPLETION_PILL[c.outcome] || ["pill-idle", c.outcome || "—"];
+      return el("tr", null, [
+        el("td", { class: "mono", text: fmtClock(c.createdAt), title: fmtTime(c.createdAt) }),
+        el("td", { class: "mono", text: c.model, title: c.model }),
+        el("td", null, stateCell(c.carriedState, c.carriedPrefix, c.carriedLength, "未携带")),
+        el("td", null, stateCell(c.injectedState, c.injectedPrefix, c.injectedLength, "未注入")),
+        el("td", null, httpPill(c.statusCode)),
+        el("td", null, stateCell(c.responseState, c.responsePrefix, c.responseLength, "未返回")),
+        el("td", null, el("span", { class: "pill " + outcomeCls, text: outcomeLabel })),
+      ]);
+    });
+
+    clear(body);
+    const wrap = el("div", { id: "call-history" });
+    wrap.append(table(
+      [{ label: "时间" }, { label: "模型" }, { label: "请求 State" },
+       { label: "注入值" }, { label: "HTTP" }, { label: "响应 State" }, { label: "结果" }],
+      rows, "该账号还没有调用记录"));
+    if (rows.length) wrap.querySelector("table").classList.add("history-table");
+    body.append(wrap);
+    // The pager lives in the footer: at the end of a fifty-row table it was
+    // only reachable by scrolling past every row it controls.
+    renderCallPager(rows.length);
+  } catch (err) {
+    clear(body);
+    body.append(el("div", { class: "empty", text: err.message }));
+  }
+}
+
+function renderCallPager(shown) {
+  const host = $("modal-pager");
+  clear(host);
+  const { offset, total, limit } = callPage;
+  const from = shown ? offset + 1 : 0;
+  const to = offset + shown;
+  host.append(el("div", { class: "pager" }, [
+    el("span", { class: "muted small", text: `第 ${from}–${to} 条，共 ${total} 条` }),
+    el("span", { class: "actions" }, [
+      el("button", {
+        class: "btn btn-sm", type: "button", text: "上一页",
+        disabled: offset === 0,
+        onclick: () => { callPage.offset = Math.max(0, offset - limit); loadCalls(); },
+      }),
+      el("button", {
+        class: "btn btn-sm", type: "button", text: "下一页",
+        disabled: offset + shown >= total,
+        onclick: () => { callPage.offset = offset + limit; loadCalls(); },
+      }),
+    ]),
+  ]));
 }
 
 on("modal-close", "click", () => { $("modal").hidden = true; });
@@ -1191,6 +1454,8 @@ async function showCooldowns(proxyId) {
   $("modal-title").textContent = `${proxyLabel(proxyId)} — 各账号冷却状态`;
   $("modal-clear").hidden = true;
   $("modal-reset-all").hidden = false;
+  $("modal-note").textContent = "";
+  clear($("modal-pager"));
   $("modal").hidden = false;
 
   const body = $("modal-body");
@@ -1266,9 +1531,17 @@ on("modal-reset-all", "click", async () => {
 
 on("modal-clear", "click", async () => {
   if (!modalContext) return;
-  if (!confirm("清除该组合的全部绑定历史？此操作不可撤销。")) return;
-  const { authIndex, model } = modalContext;
   try {
+    if (modalContext.kind === "calls") {
+      const { authIndex } = modalContext;
+      if (!confirm("清除该账号的全部调用记录？此操作不可撤销。")) return;
+      const resp = await api("DELETE", `/call-history?${qs({ authIndex })}`);
+      toast(`已清除 ${resp.deleted} 条调用记录`);
+      await showCallHistory(authIndex);
+      return;
+    }
+    const { authIndex, model } = modalContext;
+    if (!confirm("清除该组合的全部绑定历史？此操作不可撤销。")) return;
     await api("DELETE", `/bindings/history?${qs({ authIndex, model })}`);
     toast("历史已清除");
     showHistory(authIndex, model);
@@ -1476,12 +1749,31 @@ function accountLabel(authIndex) {
   return (account && (account.label || account.email)) || authIndex;
 }
 
-// proxyLabel resolves a probe record's proxy id to the node's address, which is
-// what the operator configured. The id itself is internal.
+// proxyLabel resolves a probe record's proxy id to something the operator
+// recognises: the node's scheme, host and port.
+//
+// Deliberately without the userinfo. A proxy URL carries credentials, these
+// tables render dozens of rows without anyone reading them closely, and a
+// truncated password in a table cell is both useless and a secret on screen for
+// no reason. scheme://host:port identifies the node, which is the question the
+// column answers. The full address stays editable in the pool table above,
+// which is the one place it is needed.
 function proxyLabel(id) {
   if (!id) return "—";
   const node = proxiesState.find((n) => n.id === id);
-  return node ? node.url : id;
+  return maskProxyURL(node ? node.url : id);
+}
+
+function maskProxyURL(raw) {
+  if (!raw) return "—";
+  try {
+    const parsed = new URL(raw);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    // Not a parseable URL: show it as-is rather than hiding a node the operator
+    // needs to be able to find.
+    return raw;
+  }
 }
 
 function renderProbes(probes) {
@@ -1647,6 +1939,11 @@ async function loadStatus() {
 async function loadAll() {
   await loadStatus();
   await loadModelCatalog();
+  // Models before accounts. The account list triggers the first render, and an
+  // expanded account whose models have not landed yet shows "加载中…" -- on the
+  // first connect that was a permanent-looking state, because loadAll never
+  // fetched them at all and the 15-second refresh was the first thing that did.
+  await loadAllModels();
   await loadAccounts();   // the probe history and its filter name accounts
   await loadSettings();
   // A failing subsystem must not block the panel; each section reports its own
@@ -1690,7 +1987,7 @@ async function refresh() {
     const body = document.querySelector(`[data-account-body="${CSS.escape(authIndex)}"]`);
     if (!body) continue;
     const account = accountsState.find((a) => a.authIndex === authIndex);
-    renderModels(authIndex, body, account && account.blockedReason);
+    renderModels(authIndex, body, account && account.verdict);
   }
 }
 

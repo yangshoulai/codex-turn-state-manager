@@ -54,6 +54,45 @@ func NewMockHost(accounts ...Account) *MockHost {
 	return h
 }
 
+// SetAccountStatus replaces the reported status of one account.
+//
+// The point of the mock is to stand in for a CPA whose view of an account
+// changed between two reads -- the operator re-authorised it, it ran out of
+// quota, it was disabled -- which is a sequence no fixture can express
+// statically.
+func (h *MockHost) SetAccountStatus(authIndex, status string, unavailable bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.accounts {
+		if h.accounts[i].AuthIndex != authIndex {
+			continue
+		}
+		h.accounts[i].Status = status
+		h.accounts[i].Unavailable = unavailable
+		if !unavailable {
+			h.accounts[i].StatusMessage = ""
+			h.accounts[i].NextRetryAfter = time.Time{}
+		}
+		return
+	}
+}
+
+// RemoveAccount drops an account from the pool, as CPA does when an operator
+// deletes one.
+func (h *MockHost) RemoveAccount(authIndex string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.accounts {
+		if h.accounts[i].AuthIndex != authIndex {
+			continue
+		}
+		h.accounts = append(h.accounts[:i], h.accounts[i+1:]...)
+		delete(h.creds, authIndex)
+		delete(h.credentialErr, authIndex)
+		return
+	}
+}
+
 // AddAccount registers an account and a matching credential.
 func (h *MockHost) AddAccount(a Account) {
 	h.mu.Lock()

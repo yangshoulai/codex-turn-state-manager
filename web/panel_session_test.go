@@ -788,3 +788,219 @@ func stripWholeLineComments(src string) string {
 	}
 	return strings.Join(out, "\n")
 }
+
+// TestPanelDoesNotNestButtonsInTheAccountHeader guards a markup invariant that
+// is invisible until it is clicked.
+//
+// The account header used to be a single <button> wrapping the whole row,
+// which left nowhere to put the per-account 同步 and 调用历史 controls except
+// inside it. A button inside a button is invalid, and in practice activating
+// the inner one also fired the outer one -- so syncing an account collapsed it
+// at the same time.
+func TestPanelDoesNotNestButtonsInTheAccountHeader(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	// Three regions, in source order: the toggle button, the sibling actions,
+	// and the header that contains both.
+	toggleStart := strings.Index(src, "const toggle = el(\"button\"")
+	actionsStart := strings.Index(src, "const actions = el(\"div\", { class: \"row-actions\" }")
+	headStart := strings.Index(src, "const head = el(\"div\", { class: \"account-head\" }")
+	if toggleStart < 0 || actionsStart < 0 || headStart < 0 {
+		t.Fatal("the account header was not found; this guard is not reading the file")
+	}
+	if !(toggleStart < actionsStart && actionsStart < headStart) {
+		t.Fatal("the account header is not laid out as toggle, then actions, then container")
+	}
+
+	toggle := src[toggleStart:actionsStart]
+	if got := strings.Count(toggle, "el(\"button\""); got != 1 {
+		t.Errorf("the toggle region contains %d buttons, want exactly 1", got)
+	}
+	if strings.Contains(toggle, "syncAccount(") || strings.Contains(toggle, "showCallHistory(") {
+		t.Error("a row action is nested inside the toggle button")
+	}
+
+	actions := src[actionsStart:headStart]
+	if !strings.Contains(actions, "syncAccount(") {
+		t.Error("the account does not offer a per-account sync")
+	}
+	if !strings.Contains(actions, "showCallHistory(") {
+		t.Error("the account does not offer the call history")
+	}
+}
+
+// TestPanelSyncsModelsWithTheAccountButton pins that the one button does both
+// halves of "make this account current".
+//
+// Splitting it -- a modifier key, a second button -- would make the panel's
+// behaviour depend on something the operator cannot see. The model fetch is one
+// request against the account's own quota and happens only when pressed.
+func TestPanelSyncsModelsWithTheAccountButton(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "models: 1") {
+		t.Error("the per-account sync does not ask for a model refresh")
+	}
+	if !strings.Contains(src, "/accounts/sync?") {
+		t.Error("the per-account sync does not call the sync endpoint")
+	}
+}
+
+// TestPanelNeverRendersFullProxyURLsInHistory keeps credentials off the screen.
+//
+// A proxy URL carries its password, and the history tables render dozens of
+// rows nobody reads closely -- a truncated password there is both useless and a
+// secret in the page for no reason. scheme://host:port is what the column needs
+// to answer, and the full address stays editable in the pool table.
+func TestPanelNeverRendersFullProxyURLsInHistory(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	start := strings.Index(src, "function proxyLabel(")
+	if start < 0 {
+		t.Fatal("proxyLabel was not found")
+	}
+	end := strings.Index(src[start:], "function maskProxyURL(")
+	if end < 0 {
+		t.Fatal("proxyLabel does not delegate to maskProxyURL")
+	}
+	body := src[start : start+end]
+
+	if strings.Contains(body, "return node ? node.url") {
+		t.Error("proxyLabel returns the raw URL, credentials and all")
+	}
+	if !strings.Contains(body, "maskProxyURL(") {
+		t.Error("proxyLabel does not mask the address")
+	}
+}
+
+// TestPanelFillsTheHostPage guards the layout rule that the panel is a plugin
+// page, not a document.
+//
+// It was capped at 1080px and centred, which inside CPA's plugin page left a
+// third of a wide screen as dead margin while the account tables -- the densest
+// thing on the page -- scrolled horizontally instead.
+func TestPanelFillsTheHostPage(t *testing.T) {
+	css, err := ReadAsset("style.css")
+	if err != nil {
+		t.Fatalf("read style.css: %v", err)
+	}
+	sheet := stripCSSComments(string(css))
+
+	main := cssBlock(sheet, "main {")
+	if main == "" {
+		t.Fatal("the main rule was not found")
+	}
+	if strings.Contains(main, "max-width") {
+		t.Errorf("main caps its width:\n%s", main)
+	}
+	if strings.Contains(main, "margin: 0 auto") {
+		t.Errorf("main centres itself instead of filling the page:\n%s", main)
+	}
+}
+
+// cssBlock returns the body of the first rule whose selector line matches.
+func cssBlock(sheet, selector string) string {
+	start := strings.Index(sheet, selector)
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(sheet[start:], "}")
+	if end < 0 {
+		return ""
+	}
+	return sheet[start : start+end]
+}
+
+// TestPanelLoadsModelsBeforeTheAccounts guards the fix for the permanent
+// "加载中…".
+//
+// loadAll never fetched the model tables at all, so the first render of an
+// expanded account always showed the placeholder and only the 15-second refresh
+// replaced it. On first connect that reads as a panel that cannot load models.
+func TestPanelLoadsModelsBeforeTheAccounts(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	start := strings.Index(src, "async function loadAll()")
+	if start < 0 {
+		t.Fatal("loadAll was not found")
+	}
+	end := strings.Index(src[start:], "\n}")
+	if end < 0 {
+		t.Fatal("the end of loadAll was not found")
+	}
+	body := src[start : start+end]
+
+	models := strings.Index(body, "loadAllModels()")
+	accounts := strings.Index(body, "loadAccounts()")
+	if models < 0 {
+		t.Fatal("loadAll does not load the model tables")
+	}
+	if accounts < 0 {
+		t.Fatal("loadAll does not load the accounts")
+	}
+	if models > accounts {
+		t.Error("loadAll loads accounts before models, so the first render shows the placeholder")
+	}
+}
+
+// TestPanelDistinguishesACooldownFromAPausedAccount pins the label that caused
+// the most confusion in production.
+//
+// "已暂停探测" means probing has actually stopped, and only four states cause
+// that. CPA sets error/Unavailable/NextRetryAfter for a temporary quota or rate
+// limit, which the plugin deliberately keeps probing -- showing the paused label
+// for one made an account the operator had already refreshed look written off.
+func TestPanelDistinguishesACooldownFromAPausedAccount(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "verdict.blocked") {
+		t.Error("the panel does not branch on whether probing is actually blocked")
+	}
+	if !strings.Contains(src, "限流冷却") {
+		t.Error("a cooldown has no label of its own")
+	}
+	if !strings.Contains(src, "verdictPill(") {
+		t.Error("the verdict is not rendered")
+	}
+}
+
+// TestPanelOffersTheCallHistory keeps the new endpoint wired to a control.
+func TestPanelOffersTheCallHistory(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "/call-history?") {
+		t.Error("the panel never calls the call-history endpoint")
+	}
+	if !strings.Contains(src, "showCallHistory(") {
+		t.Error("no control opens the call history")
+	}
+	// Paging: the history is bounded by retention, not by a row count, so a
+	// page is mandatory rather than a nicety.
+	if !strings.Contains(src, "callPage.offset") {
+		t.Error("the call history has no pager")
+	}
+}

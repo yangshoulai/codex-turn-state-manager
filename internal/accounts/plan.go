@@ -126,3 +126,39 @@ type jwtError string
 func (e jwtError) Error() string { return string(e) }
 
 const errNotJWT = jwtError("accounts: token is not a JWT")
+
+// ParseAccountIDFromCredential extracts the ChatGPT account id a Codex request
+// has to name.
+//
+// The upstream model catalog is account-scoped and expects it in a
+// Chatgpt-Account-Id header. The auth document carries it as a top-level
+// "account_id"; the id_token's claim is the fallback, because the two are
+// written by different code paths in CPA and only one of them is always
+// present. An account whose id cannot be found still works -- the header is
+// optional -- so this returns "" rather than an error.
+func ParseAccountIDFromCredential(raw map[string]any) string {
+	if raw == nil {
+		return ""
+	}
+	if id, ok := raw["account_id"].(string); ok {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			return trimmed
+		}
+	}
+	token, _ := raw["id_token"].(string)
+	if token == "" {
+		return ""
+	}
+	claims, err := decodeJWTPayload(token)
+	if err != nil {
+		return ""
+	}
+	info, ok := claims[openAIAuthClaim].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if id, ok := info["chatgpt_account_id"].(string); ok {
+		return strings.TrimSpace(id)
+	}
+	return ""
+}
