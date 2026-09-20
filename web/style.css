@@ -381,15 +381,19 @@ input:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(-
   white-space: nowrap;
 }
 /* Widths are measured, not guessed. The columns nobody can afford to lose --
-   the outcome, and the three readings beside it -- are pinned to the widest
-   value they can actually hold ("PROBE_TIMEOUT_ALL_PROXIES" needs 214px);
-   account and proxy are left unset so they absorb whatever is left and are the
-   only ones that truncate. */
+   the outcome, the status beside it, and the two readings -- are pinned to the
+   widest value they can actually hold ("PROBE_TIMEOUT_ALL_PROXIES" needs
+   214px); account and proxy are left unset so they absorb whatever is left and
+   are the only ones that truncate.
+   These are positional, so inserting a column means renumbering every rule
+   below it -- which is why the HTTP column carries a comment naming itself. */
 #probes .table th:nth-child(1), #probes .table td:nth-child(1) { width: 74px; }
 #probes .table th:nth-child(3), #probes .table td:nth-child(3) { width: 140px; }
 #probes .table th:nth-child(5), #probes .table td:nth-child(5) { width: 214px; }
-#probes .table th:nth-child(6), #probes .table td:nth-child(6) { width: 52px; }
-#probes .table th:nth-child(7), #probes .table td:nth-child(7) { width: 80px; }
+/* HTTP: wide enough for the short "无响应" label and a three-digit status. */
+#probes .table th:nth-child(6), #probes .table td:nth-child(6) { width: 86px; }
+#probes .table th:nth-child(7), #probes .table td:nth-child(7) { width: 52px; }
+#probes .table th:nth-child(8), #probes .table td:nth-child(8) { width: 80px; }
 
 /* ---------- accounts ---------- */
 

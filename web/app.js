@@ -1779,6 +1779,34 @@ function maskProxyURL(raw) {
   }
 }
 
+// httpPill renders the upstream status, or a dash when no response arrived.
+//
+// The probe history used to record only the outcome, and UPSTREAM_ERROR -- the
+// catch-all for "upstream rejected this and it is nothing more specific" --
+// covers any 5xx plus a non-model 400/404. Those render identically without the
+// status, and what an operator does about a 400 and a 503 is different.
+function httpStatusCell(code, outcome) {
+  if (!code) {
+    // 0 means the request never got a response. Say which kind of nothing it
+    // was rather than showing "0", which reads like a status. The labels are
+    // deliberately terse -- the column is width-pinned so the readings beside
+    // it cannot be squeezed, and a longer phrase truncates. The full sentence
+    // is the tooltip.
+    const [short, full] = NO_RESPONSE[outcome] || ["无响应", "本次探测没有收到 HTTP 响应"];
+    return el("span", { class: "muted small", text: short, title: full });
+  }
+  const cls = code < 300 ? "pill-ok" : code < 500 ? "pill-warn" : "pill-bad";
+  return el("span", { class: "pill " + cls, text: String(code) });
+}
+
+// NO_RESPONSE maps a no-response outcome to a short label and its explanation.
+const NO_RESPONSE = {
+  NETWORK_ERROR: ["无响应", "无响应：连接代理或 TLS 失败，属于代理侧故障"],
+  PROBE_NO_PROXY_AVAILABLE: ["无响应", "无响应：该账号当前没有可用代理节点"],
+  PROBE_TIMEOUT_ALL_PROXIES: ["无响应", "无响应：本轮遍历在总超时内没有拿到结果"],
+  ABORTED: ["已中止", "已中止：探测进行中总开关被关闭，结果按设计丢弃"],
+};
+
 function renderProbes(probes) {
   const host = $("probes");
   if (!changed("probes", [probes, probeTotal, probeOffset, probeAccountFilter])) return;
@@ -1793,13 +1821,14 @@ function renderProbes(probes) {
       class: "pill " + (OUTCOME_PILL[p.result] || "pill-idle"),
       text: p.result,
     })),
+    el("td", null, httpStatusCell(p.statusCode, p.result)),
     el("td", { class: "num", text: p.stateLength || "—" }),
     el("td", { class: "num", text: p.latencyMs != null ? p.latencyMs + "ms" : "—" }),
   ]));
 
   host.append(table(
     [{ label: "时间" }, { label: "账号" }, { label: "模型" }, { label: "代理" },
-     { label: "结果" }, { label: "长度" }, { label: "耗时" }],
+     { label: "结果" }, { label: "HTTP" }, { label: "长度" }, { label: "耗时" }],
     rows, "该筛选下暂无探测记录"));
 
   // Paging, so "最近探测记录" is not limited to whatever fits on one screen.

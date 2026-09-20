@@ -8,6 +8,7 @@ import (
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/accounts"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/callhistory"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/probe"
 )
 
 // migrated opens a fresh database at the current schema.
@@ -283,5 +284,87 @@ func TestMigrate_V5TablesExist(t *testing.T) {
 		if err != nil {
 			t.Errorf("table %s is missing: %v", table, err)
 		}
+	}
+}
+
+// TestProbeStore_RecordsTheUpstreamStatus is the reason migration v6 exists.
+//
+// A probe row used to carry only the outcome, and UPSTREAM_ERROR -- the
+// catch-all for "upstream rejected this and it is nothing more specific" --
+// covers any 5xx plus a non-model 400/404. Without the status a 400 and a 503
+// render identically in the panel, and what an operator does about each is
+// different.
+func TestProbeStore_RecordsTheUpstreamStatus(t *testing.T) {
+	ctx := context.Background()
+	store := migrated(t).Probes()
+	at := time.Date(2026, 9, 20, 6, 0, 0, 0, time.UTC)
+
+	rows := []probe.HistoryEntry{
+		{AuthIndex: "a", Model: "m", ProxyID: "p1", Result: probe.OutcomeUpstreamError,
+			StatusCode: 400, LatencyMS: 2306, ProbedAt: at},
+		{AuthIndex: "a", Model: "m", ProxyID: "p2", Result: probe.OutcomeUpstreamError,
+			StatusCode: 503, LatencyMS: 120, ProbedAt: at.Add(time.Second)},
+		// No response at all: a network fault, an exhausted pool, or a timeout.
+		{AuthIndex: "a", Model: "m", ProxyID: "p3", Result: probe.OutcomeNetworkError,
+			StatusCode: 0, LatencyMS: 5000, ProbedAt: at.Add(2 * time.Second)},
+		{AuthIndex: "a", Model: "m", ProxyID: "p4", Result: probe.OutcomeSuccessTarget,
+			StatusCode: 200, StateLength: 292, ProbedAt: at.Add(3 * time.Second)},
+	}
+	for _, e := range rows {
+		if err := store.AppendProbe(ctx, e); err != nil {
+			t.Fatalf("AppendProbe: %v", err)
+		}
+	}
+
+	got, err := store.ListProbes(ctx, probe.ProbeQuery{})
+	if err != nil {
+		t.Fatalf("ListProbes: %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("rows = %d, want 4", len(got))
+	}
+
+	// Newest first, so the order above is reversed on the way out.
+	want := []int{200, 0, 503, 400}
+	for i, w := range want {
+		if got[i].StatusCode != w {
+			t.Errorf("row %d: StatusCode = %d, want %d (result %s)",
+				i, got[i].StatusCode, w, got[i].Result)
+		}
+	}
+}
+
+// TestMigrate_V6StatusColumnExists guards the schema itself.
+func TestMigrate_V6StatusColumnExists(t *testing.T) {
+	ctx := context.Background()
+	db := migrated(t)
+
+	rows, err := db.SQL().QueryContext(ctx, `PRAGMA table_info(probe_history)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if name == "status_code" {
+			found = true
+			// Existing rows must read back as 0 rather than NULL: they predate
+			// the column, and "no response recorded" is what 0 means.
+			if notNull != 1 {
+				t.Error("status_code is nullable; old rows would read back as NULL")
+			}
+		}
+	}
+	if !found {
+		t.Error("probe_history has no status_code column")
 	}
 }

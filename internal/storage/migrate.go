@@ -12,7 +12,7 @@ import (
 
 // CurrentSchemaVersion is the schema version this build expects. Bump it in
 // the same commit that appends a migration -- never edit a released migration.
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 6
 
 // Migration is one forward-only schema step.
 //
@@ -201,6 +201,30 @@ var migrations = []Migration{
 				ON call_history(auth_index, created_at DESC)`,
 			`CREATE INDEX IF NOT EXISTS idx_call_history_created
 				ON call_history(created_at)`,
+		},
+	},
+	{
+		Version: 6,
+		Name:    "probe_history_status_code",
+		Stmts: []string{
+			// The HTTP status the upstream answered with, so an outcome like
+			// UPSTREAM_ERROR stops being opaque.
+			//
+			// That outcome is the catch-all for "upstream rejected this and it
+			// is not a proxy fault, a rate limit, an auth failure or a model
+			// problem", which concretely means any 5xx plus a 400/404 whose body
+			// does not look model-related. Without the status the panel showed a
+			// 400, a 500 and a 503 identically -- and how you react to each of
+			// them is different.
+			//
+			// 0 means no HTTP response at all: a network fault, an exhausted
+			// pool, or a traversal that ran out of time.
+			//
+			// ADD COLUMN with a non-null default is safe here and does not need
+			// the create/copy/drop/rename dance: nothing is being dropped or
+			// retyped, and existing rows read back as 0, which is exactly what
+			// they are -- rows recorded before the column existed.
+			`ALTER TABLE probe_history ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }

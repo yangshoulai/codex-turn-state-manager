@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -1002,5 +1003,65 @@ func TestPanelOffersTheCallHistory(t *testing.T) {
 	// page is mandatory rather than a nicety.
 	if !strings.Contains(src, "callPage.offset") {
 		t.Error("the call history has no pager")
+	}
+}
+
+// TestPanelShowsTheProbeStatus keeps the new column wired to the data.
+//
+// The probe history recorded only the outcome until migration v6, and
+// UPSTREAM_ERROR covers any 5xx plus a non-model 400/404 -- so a 400 (the
+// request shape was rejected) and a 503 (upstream is unwell) rendered
+// identically, while the right response to each is different.
+func TestPanelShowsTheProbeStatus(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "p.statusCode") {
+		t.Error("the probe table does not render the recorded status")
+	}
+	if !strings.Contains(src, "httpStatusCell(") {
+		t.Error("no status renderer")
+	}
+	// 0 means no response arrived. Rendering it as "0" would read like a
+	// status code, so the zero case has to say what kind of nothing it was.
+	if !strings.Contains(src, "NO_RESPONSE") {
+		t.Error("the no-response case has no wording of its own")
+	}
+	// The labels sit in a width-pinned column, so they have to stay short: a
+	// long phrase truncates and takes the explanation with it. The full
+	// sentence belongs in the tooltip.
+	for _, long := range []string{"无响应（无可用代理）", "无响应（超时）", "无响应（网络）"} {
+		if strings.Contains(src, long) {
+			t.Errorf("label %q is too long for the pinned column; use the tooltip", long)
+		}
+	}
+}
+
+// TestStylesheetProbeColumnsAreNumberedForEight guards the positional column
+// widths.
+//
+// They are nth-child rules, so inserting a column silently re-points every rule
+// below it: the outcome column would have taken the HTTP width and the readings
+// would have shifted, with nothing failing until someone looked at the panel.
+func TestStylesheetProbeColumnsAreNumberedForEight(t *testing.T) {
+	css, err := ReadAsset("style.css")
+	if err != nil {
+		t.Fatalf("read style.css: %v", err)
+	}
+	sheet := stripCSSComments(string(css))
+
+	for _, n := range []int{1, 3, 5, 6, 7, 8} {
+		needle := fmt.Sprintf("#probes .table td:nth-child(%d)", n)
+		if !strings.Contains(sheet, needle) {
+			t.Errorf("no width rule for probe column %d", n)
+		}
+	}
+	// The table has eight columns; a rule for a ninth means the panel and the
+	// stylesheet have drifted apart.
+	if strings.Contains(sheet, "#probes .table td:nth-child(9)") {
+		t.Error("there is a width rule for a ninth probe column, but the table has eight")
 	}
 }

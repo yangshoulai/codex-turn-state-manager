@@ -1376,3 +1376,69 @@ func TestBuildProbeBody_CarriesNoOutputCap(t *testing.T) {
 		}
 	}
 }
+
+// TestExecutor_HistoryRecordsTheUpstreamStatus pins that each outcome carries
+// the status it was derived from out to probe_history.
+//
+// The executor is the only place that sees the response, so a status dropped
+// here is gone -- and it is the difference between an operator knowing upstream
+// answered 400 (the request shape was rejected) and 503 (upstream is unwell).
+func TestExecutor_HistoryRecordsTheUpstreamStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   int
+	}{
+		{"a target hit", http.StatusOK, "", http.StatusOK},
+		{"a rejected request shape", http.StatusBadRequest, `{"error":"bad request"}`, http.StatusBadRequest},
+		{"upstream unwell", http.StatusServiceUnavailable, "down", http.StatusServiceUnavailable},
+		{"a rate limit", http.StatusTooManyRequests, "", http.StatusTooManyRequests},
+		{"a rejected credential", http.StatusUnauthorized, "", http.StatusUnauthorized},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newExecHarness(t)
+			state := ""
+			if tc.status == http.StatusOK {
+				state = targetState()
+			}
+			h.addProxy(t, "p1", respondWith(tc.status, state, tc.body))
+
+			got := h.probe(t)
+			if got.StatusCode != tc.want {
+				t.Errorf("Result.StatusCode = %d, want %d", got.StatusCode, tc.want)
+			}
+
+			entries := h.history.all()
+			if len(entries) == 0 {
+				t.Fatal("no history row was written")
+			}
+			if last := entries[len(entries)-1]; last.StatusCode != tc.want {
+				t.Errorf("HistoryEntry.StatusCode = %d, want %d", last.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+// TestExecutor_HistoryStatusIsZeroWhenNoResponseArrived keeps "no response" from
+// being recorded as a status.
+func TestExecutor_HistoryStatusIsZeroWhenNoResponseArrived(t *testing.T) {
+	h := newExecHarness(t)
+	h.addDeadProxy(t, "dead")
+
+	got := h.probe(t)
+	if got.StatusCode != 0 {
+		t.Errorf("Result.StatusCode = %d, want 0 for a transport failure", got.StatusCode)
+	}
+	entries := h.history.all()
+	if len(entries) == 0 {
+		t.Fatal("no history row was written")
+	}
+	for _, e := range entries {
+		if e.StatusCode != 0 {
+			t.Errorf("HistoryEntry.StatusCode = %d, want 0", e.StatusCode)
+		}
+	}
+}

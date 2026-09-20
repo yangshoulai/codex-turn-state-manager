@@ -21,10 +21,11 @@ func (s *ProbeStore) AppendProbe(ctx context.Context, e probe.HistoryEntry) erro
 	return s.db.Write(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO probe_history
-				(auth_index, model, proxy_id, result, state_length, latency_ms, probed_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				(auth_index, model, proxy_id, result, state_length, latency_ms,
+				 status_code, probed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			e.AuthIndex, e.Model, nullable(e.ProxyID), string(e.Result),
-			nullInt(e.StateLength), e.LatencyMS, FormatTime(e.ProbedAt))
+			nullInt(e.StateLength), e.LatencyMS, e.StatusCode, FormatTime(e.ProbedAt))
 		if err != nil {
 			return fmt.Errorf("storage: append probe history: %w", err)
 		}
@@ -64,7 +65,8 @@ func (s *ProbeStore) ListProbes(ctx context.Context, q probe.ProbeQuery) ([]prob
 
 	rows, err := s.db.sql.QueryContext(ctx, `
 		SELECT id, auth_index, model, COALESCE(proxy_id, ''), result,
-		       COALESCE(state_length, 0), COALESCE(latency_ms, 0), probed_at
+		       COALESCE(state_length, 0), COALESCE(latency_ms, 0),
+		       COALESCE(status_code, 0), probed_at
 		FROM probe_history`+where+`
 		ORDER BY probed_at DESC, id DESC
 		LIMIT ? OFFSET ?`, args...)
@@ -113,7 +115,7 @@ func scanProbes(rows *sql.Rows) ([]probe.HistoryEntry, error) {
 			probedAt string
 		)
 		if err := rows.Scan(&e.ID, &e.AuthIndex, &e.Model, &e.ProxyID, &result,
-			&e.StateLength, &e.LatencyMS, &probedAt); err != nil {
+			&e.StateLength, &e.LatencyMS, &e.StatusCode, &probedAt); err != nil {
 			return nil, fmt.Errorf("storage: scan probe history: %w", err)
 		}
 		e.Result = probe.Outcome(result)

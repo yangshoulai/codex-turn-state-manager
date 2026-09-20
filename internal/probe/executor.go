@@ -19,14 +19,23 @@ import (
 
 // HistoryEntry is one row of probe_history -- one proxy attempt.
 type HistoryEntry struct {
-	ID          int64     `json:"id"`
-	AuthIndex   string    `json:"authIndex"`
-	Model       string    `json:"model"`
-	ProxyID     string    `json:"proxyId,omitempty"`
-	Result      Outcome   `json:"result"`
-	StateLength int       `json:"stateLength"`
-	LatencyMS   int       `json:"latencyMs"`
-	ProbedAt    time.Time `json:"probedAt"`
+	ID          int64   `json:"id"`
+	AuthIndex   string  `json:"authIndex"`
+	Model       string  `json:"model"`
+	ProxyID     string  `json:"proxyId,omitempty"`
+	Result      Outcome `json:"result"`
+	StateLength int     `json:"stateLength"`
+	LatencyMS   int     `json:"latencyMs"`
+	// StatusCode is the upstream HTTP status, or 0 when no response arrived --
+	// a network fault, an exhausted pool, or a traversal that ran out of time.
+	//
+	// It is what makes an outcome like UPSTREAM_ERROR actionable: that outcome
+	// is the catch-all for "upstream rejected this and it is not a proxy fault,
+	// a rate limit, an auth failure or a model problem", which concretely means
+	// any 5xx plus a 400/404 whose body does not read as model-related. A 400
+	// and a 503 were indistinguishable without it.
+	StatusCode int       `json:"statusCode"`
+	ProbedAt   time.Time `json:"probedAt"`
 }
 
 // ProbeQuery filters and pages probe history.
@@ -88,6 +97,9 @@ type Result struct {
 	// RetryAfter is the upstream's own hint, from a 429's Retry-After header,
 	// for how long to wait before asking again. Zero when none was sent.
 	RetryAfter time.Duration
+
+	// StatusCode is the upstream HTTP status, or 0 when no response arrived.
+	StatusCode int
 
 	// StateBlocks is the ciphertext block count read from the value, and
 	// StateIssued when the upstream minted it. Zero when the value had no
@@ -305,6 +317,7 @@ walk:
 		result.StateBlocks = attempt.StateBlocks
 		result.StateIssued = attempt.StateIssued
 		result.RetryAfter = attempt.RetryAfter
+		result.StatusCode = attempt.StatusCode
 		result.ProxiesTried++
 
 		e.record(runCtx, authIndex, model, attempt, started)
@@ -384,6 +397,7 @@ func (e *Executor) record(ctx context.Context, authIndex, model string, r Result
 		Result:      r.Outcome,
 		StateLength: r.StateLength,
 		LatencyMS:   int(latency.Milliseconds()),
+		StatusCode:  r.StatusCode,
 		ProbedAt:    e.now(),
 	}
 	if err := e.history.AppendProbe(ctx, entry); err != nil {
@@ -435,6 +449,8 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 
 	latency := e.now().Sub(started)
 
+	status := resp.StatusCode
+
 	switch resp.StatusCode {
 	case http.StatusOK:
 		value := headers.Get(resp.Header, headers.TurnState)
@@ -444,6 +460,7 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 			StateLength: len(value),
 			Latency:     latency,
 			Signals:     signals,
+			StatusCode:  status,
 		}
 		// The plan on this very response is the freshest evidence of what shape
 		// this account's values should have, and it arrives on the same
@@ -474,9 +491,10 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return Result{
-			Outcome: OutcomeAuthError,
-			Latency: latency,
-			Err:     fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
+			Outcome:    OutcomeAuthError,
+			Latency:    latency,
+			StatusCode: status,
+			Err:        fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
 		}
 
 	case http.StatusTooManyRequests:
@@ -484,30 +502,34 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 			Outcome:    OutcomeRateLimit,
 			Latency:    latency,
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			StatusCode: status,
 			Err:        fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
 		}
 
 	case http.StatusBadRequest, http.StatusNotFound:
 		if isModelUnsupported(resp) {
 			return Result{
-				Outcome: OutcomeModelUnsupported,
-				Latency: latency,
-				Err:     fmt.Errorf("probe: model %s is not usable by this account", model),
+				Outcome:    OutcomeModelUnsupported,
+				Latency:    latency,
+				StatusCode: status,
+				Err:        fmt.Errorf("probe: model %s is not usable by this account", model),
 			}
 		}
 		return Result{
-			Outcome: OutcomeUpstreamError,
-			Latency: latency,
-			Err:     fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
+			Outcome:    OutcomeUpstreamError,
+			Latency:    latency,
+			StatusCode: status,
+			Err:        fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
 		}
 
 	default:
 		// 5xx and anything unmapped. Not the proxy's fault, so no cooldown,
 		// but the traversal continues to the next node.
 		return Result{
-			Outcome: OutcomeUpstreamError,
-			Latency: latency,
-			Err:     fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
+			Outcome:    OutcomeUpstreamError,
+			Latency:    latency,
+			StatusCode: status,
+			Err:        fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
 		}
 	}
 }
