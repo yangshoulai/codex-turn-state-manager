@@ -78,3 +78,65 @@ func TestParseSignalsClampsPercent(t *testing.T) {
 		t.Errorf("negative percent = %v, want 0", got)
 	}
 }
+
+// TestExhaustedUntil names the moment an account's budget comes back.
+//
+// This is the fact the probe scheduler cannot get from a probe: an over-quota
+// request still answers 200 with a response header set, so nothing in the
+// probe's own result says the account is out of budget. Ordinary traffic
+// carries it, and CPA never exposes it.
+func TestExhaustedUntil(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	in5h := now.Add(5 * time.Hour)
+	in3d := now.Add(72 * time.Hour)
+	past := now.Add(-time.Hour)
+
+	pct := func(n int) *int { return &n }
+	at := func(t time.Time) *time.Time { return &t }
+
+	cases := []struct {
+		name string
+		sig  Signals
+		want time.Time
+	}{
+		{"no signals at all", Signals{}, time.Time{}},
+		{"under both windows", Signals{
+			PrimaryUsedPercent: pct(40), PrimaryResetAt: at(in5h),
+			SecondaryUsedPercent: pct(12), SecondaryResetAt: at(in3d),
+		}, time.Time{}},
+		{"exactly 100% counts as spent", Signals{
+			PrimaryUsedPercent: pct(100), PrimaryResetAt: at(in5h),
+		}, in5h},
+		{"short window spent", Signals{
+			PrimaryUsedPercent: pct(100), PrimaryResetAt: at(in5h),
+			SecondaryUsedPercent: pct(30), SecondaryResetAt: at(in3d),
+		}, in5h},
+		// Being under the weekly limit is no help while the 5-hour window is
+		// spent, so the later of the two resets is the one that matters.
+		{"both spent takes the later reset", Signals{
+			PrimaryUsedPercent: pct(100), PrimaryResetAt: at(in5h),
+			SecondaryUsedPercent: pct(100), SecondaryResetAt: at(in3d),
+		}, in3d},
+		// No stated reset means no better estimate than probing; blocking on
+		// it would park the account on the strength of a number nobody sent.
+		{"spent with no stated reset gives no deadline", Signals{
+			PrimaryUsedPercent: pct(100),
+		}, time.Time{}},
+		{"a reset already in the past has recovered", Signals{
+			PrimaryUsedPercent: pct(100), PrimaryResetAt: at(past),
+			SecondaryUsedPercent: pct(10), SecondaryResetAt: at(in3d),
+		}, time.Time{}},
+		{"99% is not 100%", Signals{
+			PrimaryUsedPercent: pct(99), PrimaryResetAt: at(in5h),
+		}, time.Time{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.sig.ExhaustedUntil(now)
+			if !got.Equal(tc.want) {
+				t.Errorf("ExhaustedUntil = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -47,10 +47,13 @@ const (
 //
 // AUTH_ERROR and MODEL_UNSUPPORTED are account- or model-level facts that no
 // other proxy can change, so retrying them across the pool just burns quota
-// (design doc 3.7.3, rule 2).
+// (design doc 3.7.3, rule 2). RATE_LIMIT is on the same list for the same
+// reason: the rate limit that matters -- the multi-hour usage window -- is a
+// property of the account, so the next node would be told 429 by the same
+// upstream for the same account.
 func (o Outcome) Terminal() bool {
 	switch o {
-	case OutcomeAuthError, OutcomeModelUnsupported, OutcomeAborted:
+	case OutcomeAuthError, OutcomeModelUnsupported, OutcomeAborted, OutcomeRateLimit:
 		return true
 	default:
 		return false
@@ -109,7 +112,12 @@ const (
 
 	// DefaultRetryAfter is used when upstream sends 429 without a usable
 	// Retry-After header.
-	DefaultRetryAfter = 5 * time.Minute
+	//
+	// Ten minutes, not the five it used to be: the header-less 429 is the
+	// multi-hour usage window rejecting the account, and probing it again
+	// sooner buys a second 429 at one billed request per attempt. When the
+	// header IS sent, it is honoured instead.
+	DefaultRetryAfter = 10 * time.Minute
 )
 
 // nonTargetDelay grows the retry interval with the length of the run.

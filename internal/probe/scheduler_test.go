@@ -789,3 +789,65 @@ func TestScan_KeepsProbingWhenTheRefreshFails(t *testing.T) {
 func boolPtr(b bool) *bool { return &b }
 
 func intPtr(n int) *int { return &n }
+
+// TestScheduler_HonoursTheUpstreamsRetryAfter is the regression test for a
+// wiring gap: Backoff had always known how to honour Retry-After, but nothing
+// ever populated the field, so every 429 waited the same fixed default while
+// the upstream was naming a much longer one.
+func TestScheduler_HonoursTheUpstreamsRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	h := newSchedHarness(t, []states.Pair{pair})
+
+	h.scheduler.SetProbeFunc(func(context.Context, string, string) Result {
+		return Result{Outcome: OutcomeRateLimit, RetryAfter: 45 * time.Minute}
+	})
+
+	at := h.clock.Now()
+	h.scheduler.Scan(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if next, ok := h.scheduler.NextProbeAt(pair); ok && next.After(at) {
+			if got := next.Sub(at); got != 45*time.Minute {
+				t.Fatalf("next probe in %s, want the upstream's 45m", got)
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("no next probe scheduled")
+}
+
+// TestScheduler_FallsBackWhenRetryAfterIsAbsent pins the other half: an
+// upstream that sends 429 without a header still gets a sensible wait, and one
+// that is not the old five minutes -- the header-less 429 is the multi-hour
+// usage window rejecting the account.
+func TestScheduler_FallsBackWhenRetryAfterIsAbsent(t *testing.T) {
+	ctx := context.Background()
+	pair := states.Pair{AuthIndex: "codex-auth-1", Model: "gpt-5-codex"}
+	h := newSchedHarness(t, []states.Pair{pair})
+
+	h.scheduler.SetProbeFunc(func(context.Context, string, string) Result {
+		return Result{Outcome: OutcomeRateLimit}
+	})
+
+	at := h.clock.Now()
+	h.scheduler.Scan(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if next, ok := h.scheduler.NextProbeAt(pair); ok && next.After(at) {
+			if got := next.Sub(at); got != DefaultRetryAfter {
+				t.Fatalf("next probe in %s, want the %s default", got, DefaultRetryAfter)
+			}
+			if DefaultRetryAfter < 10*time.Minute {
+				t.Errorf("DefaultRetryAfter = %s; a header-less 429 is a usage "+
+					"window, and retrying it in minutes buys the same 429 again", DefaultRetryAfter)
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("no next probe scheduled")
+}

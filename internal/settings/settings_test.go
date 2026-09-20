@@ -157,6 +157,13 @@ func TestDefaults_MatchDocumentedValues(t *testing.T) {
 		{"target_state_length", d.TargetStateLength, 292},
 		{"max_probe_duration", d.MaxProbeDuration, 90 * time.Second},
 		{"routing_strategy", d.RoutingStrategy, StrategyRespectCPAPriority},
+		// The cost knobs. Their defaults are the documented ones, so a change
+		// here is a change to how much a probe costs.
+		// 0 = walk the whole pool, which is the behaviour the knob was added
+		// to be able to change rather than the other way round. See
+		// ExecutorPolicy.MaxUnusable for why the default is the permissive one.
+		{"max_unusable_per_probe", d.MaxUnusablePerProbe, 0},
+		{"probe_max_output_tokens", d.ProbeMaxOutputTokens, 16},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -241,6 +248,10 @@ func TestManager_RejectsInvalidUpdates(t *testing.T) {
 		{"target length zero", Patch{TargetStateLength: intPtr(0)}},
 		{"probe duration too short", Patch{MaxProbeDuration: durPtr(time.Second)}},
 		{"unknown routing strategy", Patch{RoutingStrategy: strategyPtr("nonsense")}},
+		{"negative unusable cap", Patch{MaxUnusablePerProbe: intPtr(-1)}},
+		{"unusable cap above the ceiling", Patch{MaxUnusablePerProbe: intPtr(MaxUnusablePerProbeCeiling + 1)}},
+		{"negative output cap", Patch{ProbeMaxOutputTokens: intPtr(-1)}},
+		{"output cap above the ceiling", Patch{ProbeMaxOutputTokens: intPtr(MaxProbeOutputTokensCeiling + 1)}},
 	}
 
 	for _, tc := range cases {
@@ -379,4 +390,50 @@ func durPtr(v time.Duration) *time.Duration { return &v }
 func strategyPtr(v string) *RoutingStrategy {
 	s := RoutingStrategy(v)
 	return &s
+}
+
+// TestManager_ZeroMeansUncapped pins the two knobs whose zero is meaningful
+// rather than invalid: "walk the whole pool" and "do not send the parameter".
+//
+// They are the documented opt-out, so a validation rule that rejected zero
+// would silently remove the only way back to the previous behaviour.
+func TestManager_ZeroMeansUncapped(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newManager(t)
+
+	updated, err := m.Update(ctx, Patch{
+		MaxUnusablePerProbe:  intPtr(0),
+		ProbeMaxOutputTokens: intPtr(0),
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.MaxUnusablePerProbe != 0 || updated.ProbeMaxOutputTokens != 0 {
+		t.Fatalf("got %d / %d, want zeros",
+			updated.MaxUnusablePerProbe, updated.ProbeMaxOutputTokens)
+	}
+}
+
+// TestManager_CostKnobsSurviveARestart covers the persisted round trip: these
+// are the settings an operator tunes after seeing a bill, and having them reset
+// on restart would be worse than not offering them.
+func TestManager_CostKnobsSurviveARestart(t *testing.T) {
+	ctx := context.Background()
+	m, store := newManager(t)
+	if _, err := m.Update(ctx, Patch{
+		MaxUnusablePerProbe:  intPtr(4),
+		ProbeMaxOutputTokens: intPtr(64),
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	reloaded, err := NewManager(ctx, store, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	got := reloaded.Current()
+	if got.MaxUnusablePerProbe != 4 || got.ProbeMaxOutputTokens != 64 {
+		t.Errorf("after restart: %d / %d, want 4 / 64",
+			got.MaxUnusablePerProbe, got.ProbeMaxOutputTokens)
+	}
 }

@@ -308,7 +308,7 @@ func (h *execHarness) probe(t *testing.T) Result {
 // request shape (design doc 3.6, F-14)
 
 func TestBuildProbeBody_MatchesDesignDoc(t *testing.T) {
-	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow)
+	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow, 16)
 	if err != nil {
 		t.Fatalf("buildProbeBody: %v", err)
 	}
@@ -647,17 +647,85 @@ func TestExecutor_ModelUnsupportedAbortsTraversal(t *testing.T) {
 	}
 }
 
-func TestExecutor_RateLimitContinuesTraversal(t *testing.T) {
+// TestExecutor_RateLimitEndsTheTraversal pins that a 429 is account-level.
+//
+// It used to walk on to the next node. The rate limit that matters is the
+// multi-hour usage window, which is a property of the account: the next node
+// asks the same upstream about the same account, so it is told 429 too. Walking
+// therefore bought one billed rejection per remaining node, every round.
+func TestExecutor_RateLimitEndsTheTraversal(t *testing.T) {
 	h := newExecHarness(t)
 	h.addProxy(t, "p1", respondWith(http.StatusTooManyRequests, "", `{"error":"slow down"}`))
-	h.addProxy(t, "p2", respondWith(http.StatusOK, targetState(), ""))
+	p2 := h.addProxy(t, "p2", respondWith(http.StatusOK, targetState(), ""))
 
 	got := h.probe(t)
-	if !got.Succeeded() {
-		t.Fatalf("outcome = %s, want the walk to continue past a 429", got.Outcome)
+	if got.Outcome != OutcomeRateLimit {
+		t.Fatalf("outcome = %s, want %s", got.Outcome, OutcomeRateLimit)
 	}
-	if got.ProxiesTried != 2 {
-		t.Errorf("ProxiesTried = %d, want 2", got.ProxiesTried)
+	if got.ProxiesTried != 1 {
+		t.Errorf("ProxiesTried = %d, want 1: a 429 must not be retried across the pool", got.ProxiesTried)
+	}
+	if p2.count() != 0 {
+		t.Errorf("the next node was contacted %d times after a 429", p2.count())
+	}
+	// A 429 is not the node's fault either: benching it would drain the pool
+	// for a limit the account hit.
+	if rows := h.pool.CooldownsForProxy("p1"); len(rows) != 0 {
+		t.Errorf("a 429 benched the node for account %s; it must not", rows[0].AuthIndex)
+	}
+}
+
+// TestExecutor_RateLimitKeepsTheUpstreamsOwnRetryHint: the Backoff struct has
+// always known how to honour Retry-After, but nothing ever populated it, so
+// every 429 waited the same fixed default.
+func TestExecutor_RateLimitKeepsTheUpstreamsOwnRetryHint(t *testing.T) {
+	h := newExecHarness(t)
+	h.addProxy(t, "p1", func(_ int, w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "900")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	got := h.probe(t)
+	if got.Outcome != OutcomeRateLimit {
+		t.Fatalf("outcome = %s, want %s", got.Outcome, OutcomeRateLimit)
+	}
+	if got.RetryAfter != 15*time.Minute {
+		t.Errorf("RetryAfter = %s, want 15m from the header", got.RetryAfter)
+	}
+}
+
+// TestParseRetryAfter covers both HTTP spellings plus the cases that must fall
+// back to the caller's own default rather than erroring.
+func TestParseRetryAfter(t *testing.T) {
+	future := time.Now().Add(3 * time.Minute).UTC().Format(http.TimeFormat)
+	past := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+
+	cases := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{"absent", "", 0},
+		{"seconds", "600", 10 * time.Minute},
+		{"zero seconds", "0", 0},
+		{"negative", "-5", 0},
+		{"garbage", "soon", 0},
+		{"http-date in the future", future, 0}, // checked loosely below
+		{"http-date in the past", past, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseRetryAfter(tc.raw)
+			if tc.name == "http-date in the future" {
+				if got <= 0 || got > 3*time.Minute {
+					t.Fatalf("got %s, want a positive duration no larger than 3m", got)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Errorf("parseRetryAfter(%q) = %s, want %s", tc.raw, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1187,5 +1255,132 @@ func TestExecutor_FreshValueIsNotStale(t *testing.T) {
 
 	if got := h.probe(t); got.Outcome != OutcomeSuccessTarget {
 		t.Errorf("outcome = %s, want a fresh value accepted", got.Outcome)
+	}
+}
+
+// TestExecutor_UnusableCapStopsWalkingThePool covers the opt-in cost cap.
+//
+// The cap is off by default because the assumption behind it is unmeasured: see
+// ExecutorPolicy.MaxUnusable. This test pins only that the knob does what it
+// says once an operator turns it on.
+func TestExecutor_UnusableCapStopsWalkingThePool(t *testing.T) {
+	h := newExecHarness(t)
+	h.policy.MaxUnusable = 2
+	shaped := strings.Repeat("x", probeTargetLen+5)
+
+	seen := make([]*fakeProxy, 0, 4)
+	for _, id := range []string{"p1", "p2", "p3", "p4"} {
+		seen = append(seen, h.addProxy(t, id, respondWith(http.StatusOK, shaped, "")))
+	}
+
+	got := h.probe(t)
+	if got.Outcome != OutcomeSuccessNonTarget {
+		t.Fatalf("outcome = %s, want %s", got.Outcome, OutcomeSuccessNonTarget)
+	}
+	if got.ProxiesTried != 2 {
+		t.Errorf("ProxiesTried = %d, want the cap of 2", got.ProxiesTried)
+	}
+	contacted := 0
+	for _, fp := range seen {
+		if fp.count() > 0 {
+			contacted++
+		}
+	}
+	if contacted != 2 {
+		t.Errorf("%d of 4 nodes were contacted, want 2", contacted)
+	}
+}
+
+// TestExecutor_UnusableCapZeroWalksEverything pins the opt-out: 0 means the
+// previous behaviour, so an operator who wants the whole pool tried can have it.
+func TestExecutor_UnusableCapZeroWalksEverything(t *testing.T) {
+	h := newExecHarness(t)
+	h.policy.MaxUnusable = 0
+	shaped := strings.Repeat("x", probeTargetLen+5)
+
+	for _, id := range []string{"p1", "p2", "p3", "p4"} {
+		h.addProxy(t, id, respondWith(http.StatusOK, shaped, ""))
+	}
+
+	got := h.probe(t)
+	if got.ProxiesTried != 4 {
+		t.Errorf("ProxiesTried = %d, want the whole pool of 4", got.ProxiesTried)
+	}
+}
+
+// TestExecutor_UnusableCapDoesNotStopAtargetHitAfterIt: the cap counts misses,
+// not attempts, so a node that finally yields the shape still ends the round
+// successfully.
+func TestExecutor_UnusableCapDoesNotStopATargetHit(t *testing.T) {
+	h := newExecHarness(t)
+	h.policy.MaxUnusable = 3
+	shaped := strings.Repeat("x", probeTargetLen+5)
+
+	h.addProxy(t, "p1", respondWith(http.StatusOK, shaped, ""))
+	h.addProxy(t, "p2", respondWith(http.StatusOK, shaped, ""))
+	h.addProxy(t, "p3", respondWith(http.StatusOK, targetState(), ""))
+
+	got := h.probe(t)
+	if !got.Succeeded() {
+		t.Fatalf("outcome = %s, want a hit before the cap is reached", got.Outcome)
+	}
+	if got.ProxiesTried != 3 {
+		t.Errorf("ProxiesTried = %d, want 3", got.ProxiesTried)
+	}
+}
+
+// TestExecutor_UnusableCapDoesNotBenchHealthyNodes: a 200 that could not be
+// bound is a stale value, and the node did nothing wrong delivering it.
+func TestExecutor_UnusableCapDoesNotBenchHealthyNodes(t *testing.T) {
+	h := newExecHarness(t)
+	h.policy.MaxUnusable = 2
+	h.policy.TTL = time.Minute
+
+	// Values of the right shape whose envelope says they were minted long ago.
+	stale := envelopeTokenAt(t, 10, time.Now().Add(-14*24*time.Hour))
+	h.addProxy(t, "p1", respondWith(http.StatusOK, stale, ""))
+	h.addProxy(t, "p2", respondWith(http.StatusOK, stale, ""))
+
+	got := h.probe(t)
+	if got.Outcome != OutcomeSuccessStale {
+		t.Fatalf("outcome = %s, want %s", got.Outcome, OutcomeSuccessStale)
+	}
+	for _, id := range []string{"p1", "p2"} {
+		if rows := h.pool.CooldownsForProxy(id); len(rows) != 0 {
+			t.Errorf("a stale value benched %s; the node delivered what upstream minted", id)
+		}
+	}
+}
+
+// TestBuildProbeBody_CarriesTheOutputCap pins that upstream generation is
+// bounded, which is the difference between a probe costing a few hundred tokens
+// and costing a full reasoning turn.
+func TestBuildProbeBody_CarriesTheOutputCap(t *testing.T) {
+	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow, 16)
+	if err != nil {
+		t.Fatalf("buildProbeBody: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("probe body is not valid JSON: %v", err)
+	}
+	if body["max_output_tokens"] != float64(16) {
+		t.Errorf("max_output_tokens = %v, want 16", body["max_output_tokens"])
+	}
+}
+
+// TestBuildProbeBody_OmitsTheOutputCapWhenZero: a deployment whose model rejects
+// the parameter must be able to leave it out rather than be unable to probe.
+func TestBuildProbeBody_OmitsTheOutputCapWhenZero(t *testing.T) {
+	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow, 0)
+	if err != nil {
+		t.Fatalf("buildProbeBody: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("probe body is not valid JSON: %v", err)
+	}
+	if _, present := body["max_output_tokens"]; present {
+		t.Errorf("max_output_tokens is present as %v, want the field omitted", body["max_output_tokens"])
 	}
 }

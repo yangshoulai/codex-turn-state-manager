@@ -32,6 +32,10 @@ const (
 	// VerdictCooldown means CPA has the account in a temporary cooldown --
 	// quota exhaustion or a rate limit. Probing continues.
 	VerdictCooldown VerdictKind = "cooldown"
+	// VerdictQuota means a usage window is exhausted with a known reset time,
+	// so a probe is guaranteed a 429 until then. Unlike a generic cooldown,
+	// this one blocks: there is nothing to discover by asking early.
+	VerdictQuota VerdictKind = "quota"
 )
 
 // Verdict is the account-level answer to "may this be probed, and why".
@@ -54,18 +58,32 @@ type Verdict struct {
 // A probe is not a user request. It is one cheap, direct call whose entire
 // purpose is to find out what the account does right now -- so the only states
 // worth refusing to probe are the ones a probe cannot possibly succeed from:
-// the account is gone, switched off, or its credentials are rejected.
+// the account is gone, switched off, its credentials are rejected, or a usage
+// window is exhausted until a moment CPA can name.
 var blockedKinds = map[VerdictKind]bool{
 	VerdictDeleted:    true,
 	VerdictDisabled:   true,
 	VerdictAuth:       true,
 	VerdictPending:    true,
 	VerdictRefreshing: true,
+	// See the quota branch in Judge.
+	VerdictQuota: true,
 
 	// Explicit, and load-bearing: these are the cases the plugin deliberately
 	// keeps probing.
 	VerdictOK:       false,
 	VerdictCooldown: false,
+}
+
+// quotaMarkers are the substrings in CPA's own status message that identify a
+// usage-window rejection, as opposed to some other transient error. Matched
+// case-insensitively.
+var quotaMarkers = []string{
+	"usage limit",
+	"usage_limit",
+	"quota",
+	"rate limit",
+	"limit reached",
 }
 
 // authFailureMarkers are the substrings in CPA's own status message that mean
@@ -121,6 +139,31 @@ func Judge(a Account, known bool, now time.Time) Verdict {
 		return verdict(VerdictAuth, "账号凭证被上游拒绝："+msg)
 	}
 
+	// A usage window that is exhausted until a known moment is the one
+	// "come back later" that is not worth probing.
+	//
+	// This is the case that cost an operator a whole 5h window: a probe returns
+	// 200 with a response header set even when the account is over its limit,
+	// so nothing in the probe's own result says "stop asking". Two sources name
+	// the fact, and both are free. CPA reports it as a cooldown with a stated
+	// retry time; ordinary traffic reports it as a rate-limit window at 100%,
+	// which CPA never exposes to plugins.
+	//
+	// A cooldown with NO stated retry time is left to the cooldown branch
+	// below, because then there is no better estimate than probing.
+	if a.NextRetryAfter != nil && now.Before(*a.NextRetryAfter) &&
+		matchesAny(a.StatusMessage, quotaMarkers) {
+		return verdict(VerdictQuota,
+			"额度已用尽："+strings.TrimSpace(a.StatusMessage)+
+				"，将在 "+a.NextRetryAfter.Local().Format("15:04:05")+" 恢复")
+	}
+	if a.Quota != nil {
+		if until := a.Quota.ExhaustedUntil(now); until.After(now) {
+			return verdict(VerdictQuota,
+				"上游报告的额度窗口已用尽，恢复于 "+until.Local().Format("15:04:05"))
+		}
+	}
+
 	// Everything left is a "come back later" condition, and probing is how the
 	// plugin finds out whether later has arrived. Say which one it is, so the
 	// panel explains the state instead of hiding it.
@@ -143,6 +186,17 @@ func Judge(a Account, known bool, now time.Time) Verdict {
 		return verdict(VerdictCooldown, reason)
 	}
 	return verdict(VerdictOK, "")
+}
+
+// matchesAny reports whether text contains any of the markers, ignoring case.
+func matchesAny(text string, markers []string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func verdict(kind VerdictKind, reason string) Verdict {

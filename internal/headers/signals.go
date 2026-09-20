@@ -137,3 +137,39 @@ func timestamp(raw string) *time.Time {
 	}
 	return nil
 }
+
+// ExhaustedUntil reports the moment the account's spent budget is known to come
+// back, or the zero time when no window is known to be spent until then.
+//
+// A window at 100% is the upstream saying "not until this resets", which is
+// exactly the fact the probe scheduler needs and cannot obtain from a probe: an
+// over-quota probe still answers 200, so nothing in its own result says the
+// account is out of budget. The latest reset among the spent windows is the one
+// that matters -- being under the weekly limit is no help while the 5-hour
+// window is spent.
+//
+// Only a window with a stated *future* reset counts. One whose reset has
+// already passed has recovered, and one with no reset at all gives no better
+// estimate than probing does -- blocking on that would park the account
+// indefinitely on the strength of a number nobody supplied.
+func (s Signals) ExhaustedUntil(now time.Time) time.Time {
+	var latest time.Time
+	for _, w := range []struct {
+		used  *int
+		reset *time.Time
+	}{
+		{s.PrimaryUsedPercent, s.PrimaryResetAt},
+		{s.SecondaryUsedPercent, s.SecondaryResetAt},
+	} {
+		if w.used == nil || *w.used < 100 {
+			continue
+		}
+		if w.reset == nil || !w.reset.After(now) {
+			continue
+		}
+		if w.reset.After(latest) {
+			latest = *w.reset
+		}
+	}
+	return latest
+}

@@ -253,6 +253,8 @@ type settingsDTO struct {
 	MaxProxiesPerProbe       int    `json:"maxProxiesPerProbe"`
 	NonTargetBackoffCapMin   int    `json:"nonTargetBackoffCapMin"`
 	CallHistoryRetentionH    int    `json:"callHistoryRetentionHours"`
+	MaxUnusablePerProbe      int    `json:"maxUnusablePerProbe"`
+	ProbeMaxOutputTokens     int    `json:"probeMaxOutputTokens"`
 }
 
 func toSettingsDTO(v *settings.Values) settingsDTO {
@@ -273,6 +275,8 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		MaxProxiesPerProbe:       v.MaxProxiesPerProbe,
 		NonTargetBackoffCapMin:   int(v.NonTargetBackoffCap / time.Minute),
 		CallHistoryRetentionH:    int(v.CallHistoryRetention / time.Hour),
+		MaxUnusablePerProbe:      v.MaxUnusablePerProbe,
+		ProbeMaxOutputTokens:     v.ProbeMaxOutputTokens,
 	}
 }
 
@@ -298,6 +302,8 @@ type settingsPatchDTO struct {
 	MaxProxiesPerProbe       *int    `json:"maxProxiesPerProbe"`
 	NonTargetBackoffCapMin   *int    `json:"nonTargetBackoffCapMin"`
 	CallHistoryRetentionH    *int    `json:"callHistoryRetentionHours"`
+	MaxUnusablePerProbe      *int    `json:"maxUnusablePerProbe"`
+	ProbeMaxOutputTokens     *int    `json:"probeMaxOutputTokens"`
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -337,6 +343,8 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	patch.MaxProxiesPerProbe = dto.MaxProxiesPerProbe
 	patch.NonTargetBackoffCapMin = dto.NonTargetBackoffCapMin
+	patch.MaxUnusablePerProbe = dto.MaxUnusablePerProbe
+	patch.ProbeMaxOutputTokens = dto.ProbeMaxOutputTokens
 	if dto.CallHistoryRetentionH != nil {
 		d := time.Duration(*dto.CallHistoryRetentionH) * time.Hour
 		patch.CallHistoryRetention = &d

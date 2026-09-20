@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,6 +85,10 @@ type Result struct {
 	// for the plan at all, since the credential's own claim is often absent.
 	Signals headers.Signals
 
+	// RetryAfter is the upstream's own hint, from a 429's Retry-After header,
+	// for how long to wait before asking again. Zero when none was sent.
+	RetryAfter time.Duration
+
 	// StateBlocks is the ciphertext block count read from the value, and
 	// StateIssued when the upstream minted it. Zero when the value had no
 	// readable envelope, which is also when the length comparison decided the
@@ -121,6 +126,35 @@ type ExecutorPolicy struct {
 	// MaxProxies caps one traversal. Zero means no cap, which is what the
 	// tests that predate the setting rely on.
 	MaxProxies int
+	// MaxUnusable caps how many 200-but-unbindable answers -- wrong shape, or
+	// the right shape minted too long ago -- one traversal collects before
+	// ending the round. Zero means no cap, and zero is the default.
+	//
+	// This is a COST knob, and it encodes an assumption that has NOT been
+	// measured: that after a couple of nodes have returned the same unusable
+	// answer, the rest of the pool would return it too. What argues for the
+	// assumption is that the block count is read from the value's own envelope
+	// -- a version byte, an issue timestamp and ciphertext -- and nothing in it
+	// can encode the request's egress path; what is observed to correlate with
+	// the block count is the account's plan tier, not the node.
+	//
+	// What argues against it, and is why the default is 0: a server may still
+	// *choose* a different answer for an exit IP it dislikes, so "the envelope
+	// does not carry the IP" is not "the IP cannot change the answer". The
+	// original design assumed the opposite of this knob -- a wrong-shaped answer
+	// benches that node for the pair -- and the operator's own report points the
+	// same way. Raising it trades a real chance of finding a working node for a
+	// bounded number of requests, and that trade is the operator's to make, not
+	// one to make for them on an unmeasured hypothesis.
+	//
+	// To settle it from existing data: probe_history records state_length per
+	// (pair, proxy). The same pair returning the same wrong length across
+	// several nodes at the same time supports the assumption; different lengths
+	// refute it.
+	MaxUnusable int
+	// MaxOutputTokens bounds upstream generation per probe; see
+	// probeRequest.MaxOutputTokens. Zero omits the field.
+	MaxOutputTokens int
 }
 
 // Executor probes one (authIndex, model) pair, walking the proxy pool until it
@@ -225,7 +259,13 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 	defer cancel()
 
 	result := Result{Outcome: OutcomeNoProxyAvailable}
+	// Unusable counts 200s the plugin could not bind. See
+	// ExecutorPolicy.MaxUnusable for why the pool is not walked on them.
+	unusable := 0
 
+	// Labelled because the cap below has to end the round from inside a switch:
+	// a bare break there would leave the switch and walk on to the next node.
+walk:
 	for _, node := range available {
 		if maxProxies > 0 && result.ProxiesTried >= maxProxies {
 			// The round is over. Report the last attempt's outcome rather than
@@ -267,6 +307,7 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 		result.Err = attempt.Err
 		result.StateBlocks = attempt.StateBlocks
 		result.StateIssued = attempt.StateIssued
+		result.RetryAfter = attempt.RetryAfter
 		result.ProxiesTried++
 
 		e.record(runCtx, authIndex, model, attempt, started)
@@ -283,14 +324,29 @@ func (e *Executor) probe(ctx context.Context, authIndex, model string, maxProxie
 			result.Latency = e.now().Sub(started)
 			return result
 
-		case attempt.Outcome.ProxyFault(), attempt.Outcome == OutcomeSuccessNonTarget:
-			// Two different reasons to prefer another node next time. A proxy
-			// fault is the node's problem. A non-target length is not a fault at
-			// all -- the request succeeded -- but this node is not yielding what
-			// the pair needs, so it steps aside for the rest of the ladder. The
-			// upstream errors that must not evict a node (400/401/403/429) are
-			// Terminal, and returned above.
+		case attempt.Outcome.ProxyFault():
+			// A proxy fault is the node's problem; bench it for this account.
+			// The upstream errors that must not evict a node (400/401/403/429)
+			// are Terminal, and returned above.
 			e.coolDown(runCtx, authIndex, node.ID)
+			continue
+
+		case attempt.Outcome == OutcomeSuccessNonTarget, attempt.Outcome == OutcomeSuccessStale:
+			// A 200 the plugin could not bind. The node did nothing wrong --
+			// what was wrong is the shape or the age of the answer, and both
+			// are decided upstream -- so only a wrong shape steps the node
+			// aside, and only for this account.
+			if attempt.Outcome == OutcomeSuccessNonTarget {
+				e.coolDown(runCtx, authIndex, node.ID)
+			}
+			unusable++
+			if policy.MaxUnusable > 0 && unusable >= policy.MaxUnusable {
+				// The pool has already answered this question MaxUnusable
+				// times with the same "not what this pair needs". Walking the
+				// rest would re-buy the answer at one request per node, and
+				// the requests are the expensive part.
+				break walk
+			}
 		}
 	}
 
@@ -358,7 +414,7 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 	}
 
 	effort := e.models.MinReasoning(model)
-	req, err := newProbeHTTPRequest(ctx, e.baseURL, cred.AccessToken, model, effort)
+	req, err := newProbeHTTPRequest(ctx, e.baseURL, cred.AccessToken, model, effort, policy.MaxOutputTokens)
 	if err != nil {
 		return Result{Outcome: OutcomeNetworkError, Err: err, Latency: e.now().Sub(started)}
 	}
@@ -428,9 +484,10 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 
 	case http.StatusTooManyRequests:
 		return Result{
-			Outcome: OutcomeRateLimit,
-			Latency: latency,
-			Err:     fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
+			Outcome:    OutcomeRateLimit,
+			Latency:    latency,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			Err:        fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
 		}
 
 	case http.StatusBadRequest, http.StatusNotFound:
@@ -456,6 +513,29 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 			Err:     fmt.Errorf("probe: upstream returned %d", resp.StatusCode),
 		}
 	}
+}
+
+// parseRetryAfter reads a Retry-After header, which HTTP allows as either
+// delay-seconds or an HTTP-date. Zero when absent or unparseable -- the caller
+// falls back to its own default, so a malformed header must not become an
+// error.
+func parseRetryAfter(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		if d := time.Until(at); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // isModelUnsupported sniffs the error body for a model-capability failure.

@@ -34,6 +34,13 @@ type probeRequest struct {
 	Tools     []any          `json:"tools"`
 	Input     []probeInput   `json:"input"`
 	Reasoning probeReasoning `json:"reasoning"`
+	// MaxOutputTokens bounds what upstream generates for the turn. A probe's
+	// only output is the response headers, read before the body is abandoned --
+	// but upstream bills the generation whether anyone reads it, and a
+	// reasoning model answering "." can spend more on thinking than the whole
+	// rest of the request costs. Zero omits the field entirely, which is how a
+	// deployment opts out if a model rejects the cap.
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 }
 
 type probeInput struct {
@@ -50,12 +57,15 @@ type probeReasoning struct {
 	Effort string `json:"effort"`
 }
 
-// buildProbeBody renders the probe payload for a model.
-func buildProbeBody(model string, effort models.ReasoningEffort) ([]byte, error) {
+// buildProbeBody renders the probe payload for a model. maxOutputTokens <= 0
+// leaves the cap out of the request.
+func buildProbeBody(model string, effort models.ReasoningEffort, maxOutputTokens int) ([]byte, error) {
 	body := probeRequest{
 		Model:  model,
 		Stream: true,
 		Store:  false,
+		// The Responses API documents 16 as the minimum it accepts.
+		MaxOutputTokens: maxOutputTokens,
 		// Never nil: an omitted "tools" key makes some upstream versions fall
 		// back to a default toolset.
 		Tools: []any{},
@@ -72,8 +82,8 @@ func buildProbeBody(model string, effort models.ReasoningEffort) ([]byte, error)
 }
 
 // newProbeHTTPRequest builds the outbound probe request.
-func newProbeHTTPRequest(ctx context.Context, baseURL, accessToken, model string, effort models.ReasoningEffort) (*http.Request, error) {
-	body, err := buildProbeBody(model, effort)
+func newProbeHTTPRequest(ctx context.Context, baseURL, accessToken, model string, effort models.ReasoningEffort, maxOutputTokens int) (*http.Request, error) {
+	body, err := buildProbeBody(model, effort, maxOutputTokens)
 	if err != nil {
 		return nil, fmt.Errorf("probe: build body: %w", err)
 	}

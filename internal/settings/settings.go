@@ -34,6 +34,8 @@ const (
 	KeyMaxProxiesPerProbe     = "max_proxies_per_probe"
 	KeyNonTargetBackoffCapMin = "non_target_backoff_cap_min"
 	KeyCallHistoryRetentionH  = "call_history_retention_hours"
+	KeyMaxUnusablePerProbe    = "max_unusable_per_probe"
+	KeyProbeMaxOutputTokens   = "probe_max_output_tokens"
 )
 
 // RoutingStrategy selects how the credential scheduler picks among candidates.
@@ -98,6 +100,24 @@ type Values struct {
 	// at all, and the upstream may start yielding the right shape at any time.
 	NonTargetBackoffCap time.Duration
 
+	// MaxUnusablePerProbe caps how many 200-but-unbindable answers -- wrong
+	// shape, or the right shape minted too long ago -- one traversal collects
+	// before ending the round. Zero, the default, walks the whole pool.
+	//
+	// A cost knob built on an unmeasured assumption; see
+	// probe.ExecutorPolicy.MaxUnusable for what supports it, what argues against
+	// it, and how to settle it from probe_history.
+	MaxUnusablePerProbe int
+
+	// ProbeMaxOutputTokens bounds what upstream generates for one probe.
+	//
+	// A probe's only output is the response headers, but the billed generation
+	// is whatever upstream decides to produce, and a reasoning model answering
+	// "." can spend far more thinking than the rest of the request costs. 16 is
+	// the minimum the Responses API documents. Zero omits the field, for a
+	// model that rejects it.
+	ProbeMaxOutputTokens int
+
 	// CallHistoryRetention bounds how long one intercepted request is kept.
 	//
 	// Capped at a day on purpose. A call row carries three full turn-state
@@ -127,6 +147,8 @@ func Defaults() Values {
 		MaxProxiesPerProbe:       10,
 		NonTargetBackoffCap:      30 * time.Minute,
 		CallHistoryRetention:     24 * time.Hour,
+		MaxUnusablePerProbe:      0,
+		ProbeMaxOutputTokens:     16,
 	}
 }
 
@@ -150,6 +172,9 @@ const (
 	// Call history is bounded by design: see Values.CallHistoryRetention.
 	MinCallHistoryRetention = time.Hour
 	MaxCallHistoryRetention = 24 * time.Hour
+	// Zero is legal and means "walk the whole pool" / "do not cap generation".
+	MaxUnusablePerProbeCeiling  = 100
+	MaxProbeOutputTokensCeiling = 4096
 )
 
 // Store persists settings. Implemented by storage.SettingsStore.
@@ -252,6 +277,8 @@ type Patch struct {
 	MaxProxiesPerProbe       *int
 	NonTargetBackoffCapMin   *int
 	CallHistoryRetention     *time.Duration
+	MaxUnusablePerProbe      *int
+	ProbeMaxOutputTokens     *int
 }
 
 // Update applies a patch, validates it, persists it and publishes a new
@@ -310,6 +337,12 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	if p.CallHistoryRetention != nil {
 		next.CallHistoryRetention = *p.CallHistoryRetention
 	}
+	if p.MaxUnusablePerProbe != nil {
+		next.MaxUnusablePerProbe = *p.MaxUnusablePerProbe
+	}
+	if p.ProbeMaxOutputTokens != nil {
+		next.ProbeMaxOutputTokens = *p.ProbeMaxOutputTokens
+	}
 
 	if err := next.Validate(); err != nil {
 		return nil, err
@@ -359,6 +392,14 @@ func (v *Values) Validate() error {
 		return fmt.Errorf("settings: non_target_backoff_cap_min must be between %s and %s, got %s",
 			MinNonTargetBackoffCap, MaxNonTargetBackoffCap, v.NonTargetBackoffCap)
 	}
+	if v.MaxUnusablePerProbe < 0 || v.MaxUnusablePerProbe > MaxUnusablePerProbeCeiling {
+		return fmt.Errorf("settings: max_unusable_per_probe must be between 0 and %d, got %d",
+			MaxUnusablePerProbeCeiling, v.MaxUnusablePerProbe)
+	}
+	if v.ProbeMaxOutputTokens < 0 || v.ProbeMaxOutputTokens > MaxProbeOutputTokensCeiling {
+		return fmt.Errorf("settings: probe_max_output_tokens must be between 0 and %d, got %d",
+			MaxProbeOutputTokensCeiling, v.ProbeMaxOutputTokens)
+	}
 	if v.CallHistoryRetention < MinCallHistoryRetention || v.CallHistoryRetention > MaxCallHistoryRetention {
 		return fmt.Errorf("settings: call_history_retention_hours must be between %s and %s, got %s",
 			MinCallHistoryRetention, MaxCallHistoryRetention, v.CallHistoryRetention)
@@ -395,6 +436,8 @@ func encode(v Values) (map[string]string, error) {
 		KeyMaxProxiesPerProbe:     strconv.Itoa(v.MaxProxiesPerProbe),
 		KeyNonTargetBackoffCapMin: strconv.Itoa(int(v.NonTargetBackoffCap / time.Minute)),
 		KeyCallHistoryRetentionH:  strconv.Itoa(int(v.CallHistoryRetention / time.Hour)),
+		KeyMaxUnusablePerProbe:    strconv.Itoa(v.MaxUnusablePerProbe),
+		KeyProbeMaxOutputTokens:   strconv.Itoa(v.ProbeMaxOutputTokens),
 	}, nil
 }
 
@@ -481,6 +524,8 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	intAt(KeyMaxProxiesPerProbe, &v.MaxProxiesPerProbe)
 	minsAt(KeyNonTargetBackoffCapMin, &v.NonTargetBackoffCap)
 	hoursAt(KeyCallHistoryRetentionH, &v.CallHistoryRetention)
+	intAt(KeyMaxUnusablePerProbe, &v.MaxUnusablePerProbe)
+	intAt(KeyProbeMaxOutputTokens, &v.ProbeMaxOutputTokens)
 
 	if s, ok := raw[KeyAccountRoutingStrategy]; ok && strings.TrimSpace(s) != "" {
 		strategy, err := ParseRoutingStrategy(strings.TrimSpace(s))

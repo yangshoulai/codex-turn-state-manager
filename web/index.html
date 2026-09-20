@@ -141,6 +141,14 @@
           <input type="number" id="s-nontargetcap" min="5" max="1440">
           <span class="field-hint">默认 30。连续拿不到目标长度的 pair，重试间隔从 2–5 分钟逐步翻倍到此上限，避免一直消耗代理</span>
         </label>
+        <label>单轮最多「拿不到」次数
+          <input type="number" id="s-maxunusable" min="0" max="100">
+          <span class="field-hint">默认 0，即遍历完整池（旧行为）。填 2 表示一轮里累计遇到两次「响应正常但拿不到可用 State」（形状不对、或值太旧）就结束本轮，省下剩下的节点请求。注意这是个<b>未经验证的假设</b>：它假设多个节点会给出同一个答案。信封里确实没有能编码出口 IP 的字段（只有版本号、签发时间和密文），但上游仍可能因为 IP 信誉选择不同的回复，所以默认不动。可用「最近探测记录」里的长度列自查：同一个 pair 在相近时间经不同节点返回相同长度 → 支持该假设；返回不同长度 → 推翻它</span>
+        </label>
+        <label>探测输出上限（token）
+          <input type="number" id="s-maxtokens" min="0" max="4096">
+          <span class="field-hint">默认 16（Responses API 允许的最小值）。探测只读响应头，但上游按实际生成的 token 计费，推理模型回答一个「.」可能消耗远超请求本身的额度。填 0 是不发送该字段</span>
+        </label>
         <label>调用记录保留（小时）
           <input type="number" id="s-callretention" min="1" max="24">
           <span class="field-hint">默认 24，上限也是 24。每个请求记一行（请求携带的 State、注入值、HTTP 状态、响应 State），一条记录含三个 State 值，所以按流量增长</span>

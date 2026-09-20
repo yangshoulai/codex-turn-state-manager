@@ -36,7 +36,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 1b | **P0 — 与 CPA v7.3.7 对齐** | 读 CPA 源码核对接口，修正 correlation、候选身份、优先级分档、路由注册、资源路由等设计偏差 | 设计文档与真实 ABI 一致 | ✅ |
 | 2 | **P0 — 账号同步** | AccountRegistry：定时同步 CPA Codex 账号，逐账号手动同步，按账号拉取并持久化模型清单 | 面板可展示账号列表，可手动刷新单个账号的状态与模型 | ✅ |
 | 3 | **P0 — 代理池** | ProxyPool：节点增删改、健康状态、冷却排序、`last_used_at` 持久化 | 代理池可管理，选择顺序按冷却时间 | ✅ |
-| 4 | **P0 — 探测引擎** | ProbeScheduler + TimeWindowManager + ProbeExecutor（含遍历所有代理直到命中目标），探测并发数默认 2 且可配置 | 可对指定 `(账号, 模型)` 发起定时探测 | ✅ |
+| 4 | **P0 — 探测引擎** | ProbeScheduler + TimeWindowManager + ProbeExecutor（遍历有成本上限：`max_unusable_per_probe` 默认 2，0 为遍历全池），探测并发数默认 2 且可配置 | 可对指定 `(账号, 模型)` 发起定时探测 | ✅ |
 | 5 | **P0 — 请求拦截** | CorrelationManager + RequestStateInjector + ResponseStateCollector | 请求头替换与响应头反向绑定全链路打通 | 🔄 |
 | 6 | **P0 — 全局开关** | 定时探测开关 + 反向绑定开关，独立控制，状态持久化 | 两个开关可独立启停 | ✅ |
 | 7 | **P0 — 绑定管理** | 绑定删除 + 历史记录 + Management API | 面板可删除绑定并查看历史 | ✅ |
@@ -44,6 +44,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 9 | **P1 — 管理面板** | ResourceUI：前端面板覆盖全部运行时行为——开关与参数、时间窗口、代理池、账号与模型（含套餐/额度徽章、探测判定与探测开关）、逐账号同步、绑定删除与历史弹窗、调用历史弹窗（分页）、探测记录（账号过滤 + 分页） | 可视化操作全部功能 | 🔄 |
 | 10 | **P1 — 自愈与退避** | State 失败自动失效、探测退避策略、被动续期 | 系统具备自愈能力 | ✅ |
 | 11 | **P2 — 可观测性** | 探测历史查询、代理健康统计、State 状态可视化、逐请求调用历史（请求携带值 / 注入值 / HTTP 状态 / 响应值，24 小时） | 运维面板完善 | 🔄 |
+| 12 | **P1 — 探测成本** | 探测请求带 `max_output_tokens`（默认 16）；429 终止本轮遍历并沿用上游 `Retry-After`（缺省 10 分钟）；可选的非目标封顶 `max_unusable_per_probe`（默认 0 = 不封顶）；额度耗尽（CPA 冷却带重试时间，或流量上报的 100% 窗口）停止探测 | 探测不再是额度消耗的主体 | 🔄 |
 
 ### 状态判定口径
 
@@ -77,6 +78,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 5 | **请求注入已在真实流量上验证**：经 CPA 的请求确实带上了注入的头，`unresolvedAuth` 与 `noBinding` 均为 0。**反向绑定在这条路径上不生效**——实测响应到达插件时有 28 个响应头，其中没有 `X-Codex-Turn-State`；响应头 map 非空、插件读取无误，是上游不在这条链路返回它。已按运维决定接受为已知限制（它是降低探测频率的优化，非核心能力）。详见设计文档 §10.12。**注意**：接受该限制意味着本项的验收标准「请求头替换与响应头反向绑定全链路打通」中后一半永远不会满足，因此维持 🔄——除非把验收标准改成「注入闭环 + 反向绑定为可选优化」。 |
 | 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行；`state_first` 的「跨优先级档挑选持有 State 的账号」需要**至少两个账号**才能体现，当前环境只有一个。 |
 | 9 | 路由已改为查询参数形式并全部注册；Management API 与面板静态资源均已在真实 CPA v7.3.7 中验证可达；**面板交互已在浏览器中实测**（账号过滤、探测记录分页与账号过滤、绑定历史弹窗 ESC 关闭、模型列表自动加载、标题栏计数）。本轮又实测了逐账号「同步」按钮、调用历史弹窗（分页、HTTP 状态配色、State 三列各自的空值文案）、绑定历史弹窗（代理列脱敏、行高一致、无横向溢出）与面板占满宿主页面（1600px 视口下 `main` 宽 1585px）。仍列 🔄 有两个原因：一是本表口径把依赖浏览器渲染的项排除在 ✅ 之外，二是 `GET /models` 端点（`listModels`）是全仓唯一 0% 覆盖率的端点，`app.Catalog`、`models.parseCatalog` 也随之未测。 |
+| 12 | 代码与测试完成：`buildProbeBody` 的 `max_output_tokens` 有「带值 / 为 0 时省略字段」两条测试；`OutcomeRateLimit.Terminal()`、`parseRetryAfter`（秒数与 HTTP-date 两种写法 + 缺失/非法回退）、以及「429 后不再联系下一个节点」各有测试；`max_unusable_per_probe` 的封顶、为 0 时遍历全池、以及「封顶不阻止后续命中」各有测试；`Signals.ExhaustedUntil` 与 `Judge` 的额度分支（CPA 报的带重试时间的冷却 / 流量报的 100% 窗口 / 无重试时间的冷却不阻塞）各有测试。**仍列 🔄 是因为本项的验收标准是一个成本断言，而成本只能靠真实流量测量**：这些改动应当把每次探测的计费从「上游决定」压到 16 token，并让 429 与额度耗尽的账号不再被反复计费，但**没有在真实账号上量过前后对比**。对照组是运维的观察：6 个节点、未发送任何业务请求、一轮探测即吃掉整个 5h 窗口。<br><br>其中「非目标封顶」默认 **0（不封顶）**，因为它的前提是一条未验证的假设——见 `ExecutorPolicy.MaxUnusable` 与设计文档 §3.7.3。要判定它：`probe_history` 按 (pair, proxy) 记了 `state_length`，同一 pair 在相近时间经不同节点返回相同长度则假设成立，返回不同长度则被推翻。 |
 | 11 | API 侧（探测历史查询、代理健康统计、请求管道计数、上游套餐与额度）已完成并在真实实例中验证：实测一次真实请求后 `plan` 由 `X-Codex-Plan-Type` 填入 `free`，`lastHeaderInit` 里能看到 `X-Codex-Primary/Secondary-Used-Percent` 等额度头。注意这些值**只在进程处理过真实请求后才有**——重启后 `plan` 为空是正常现象，不是缺陷（§10.10）。调用历史链路有端到端测试（注入 → 响应 → 完成三步驱动出一条完整记录，含三个 State 值与状态码），总开关关闭时不写任何行；`call_history` 的往返、分页、按龄清理、按账号清除均有测试。**尚未在真实流量中观察过**，因此仍为 🔄。 |
 
 ### 关于第 0 项
@@ -252,7 +254,7 @@ Four runtime capabilities, all gated by one master switch:
 
 | Capability | What it does |
 |---|---|
-| Probe | Actively harvests state through the proxy pool on a schedule |
+| Probe | Actively harvests state through the proxy pool on a schedule, under an output-token cap and a per-round request budget |
 | Inject | Rewrites `X-Codex-Turn-State` on outbound requests |
 | Capture | Harvests state from ordinary traffic responses |
 | Route | Prefers accounts that hold a usable binding |

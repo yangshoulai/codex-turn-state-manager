@@ -145,12 +145,33 @@ Trying another proxy cannot fix them, so abort the traversal immediately.
 
 Probes go **directly to the upstream Codex endpoint**, not through CPA's
 `/v1/responses` (CPA's host HTTP API cannot carry a per-request proxy). Probes
-use the cheapest reasoning level the model accepts, an empty tool list, and a
-one-character input, to minimise token burn (`F-14`). The reasoning floor comes
-from `models.Registry` — never hardcode it.
+use the cheapest reasoning level the model accepts, an empty tool list, a
+one-character input and a `max_output_tokens` cap, to minimise token burn
+(`F-14`). The reasoning floor comes from `models.Registry` — never hardcode it,
+and never hardcode the output cap either; it is `probe_max_output_tokens`.
+
+The output cap is the one that dominates the bill. A probe only reads response
+headers, but upstream charges for what it generates, and a reasoning model
+answering "." will think before it answers.
 
 Read the response headers, and if the state matches the target length, bind and
 **close the body immediately**. Do not wait for the SSE stream to finish.
+
+A round walks the whole pool by default, and `max_unusable_per_probe` (default
+**0**) can cut it short once a pair has collected that many 200-but-unbindable
+answers. The default is the permissive one on purpose: the cap rests on an
+**unmeasured** assumption that further nodes would return the same unusable
+answer. What supports it is that the block count comes from the value's own
+envelope — version byte, issue timestamp, ciphertext — and nothing in it can
+encode the request's egress path; what argues against it is that a server may
+still choose a different answer for an exit IP it dislikes. Do not raise this
+default on reasoning alone; probe_history records `state_length` per (pair,
+proxy), which is the measurement that would settle it.
+
+A 429 is different, and does end the round outright: the limit that matters is
+the multi-hour usage window, which is a property of the account, so the next node
+asks the same upstream about the same account. Neither a 429 nor an unusable
+answer should bench a node by default — see the cooldown rules in §2.7.
 
 ### 2.9 Backoff is per-outcome, and scanning is not probing
 
@@ -164,9 +185,25 @@ A non-target-length result must never cause a one-minute re-probe loop.
 | `PROBE_NO_PROXY_AVAILABLE` | `now + 5 min` |
 | `PROBE_TIMEOUT_ALL_PROXIES` | `now + 5 min` |
 | `NETWORK_ERROR` | `now + 2 min`; node cooldown `1m → 2m → 5m → 10m` |
-| `RATE_LIMIT` | honour `Retry-After` |
+| `RATE_LIMIT` | honour `Retry-After`, else 10 min |
 | `AUTH_ERROR` | `now + 30 min` |
 | `MODEL_UNSUPPORTED` | `now + 30 min` or auto-disable |
+
+### 2.9b An exhausted quota is the one "come back later" that stops probing
+
+A probe of an over-quota account still answers 200 with a response header, so
+**nothing in a probe's own result says the account is out of budget**. Left
+alone, the plugin keeps probing every few minutes and bills each attempt until
+the window resets. Two free sources state the fact, and `accounts.Judge` reads
+both: CPA's `next_retry_after` with a quota-ish `status_message`, and the
+`X-Codex-Primary/Secondary-Used-Percent` windows ordinary traffic reports (which
+CPA never exposes to plugins).
+
+Only a window with a stated **future** reset counts. A reset already in the past
+has recovered, and a spent window with no reset at all gives no better estimate
+than probing — blocking on it parks the account on the strength of a number
+nobody sent. A cooldown with no retry time stays a `cooldown` verdict and keeps
+probing.
 
 ### 2.10 Self-healing only applies to state the plugin injected
 

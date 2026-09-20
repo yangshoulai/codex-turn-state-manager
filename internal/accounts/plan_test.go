@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yangshoulai/codex-turn-state-manager/internal/headers"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 )
 
@@ -249,5 +250,85 @@ func TestJudgeSurfacesTheProviderMessage(t *testing.T) {
 	}
 	if got.Blocked {
 		t.Error("a quota cooldown must not stop probing")
+	}
+}
+
+// TestJudge_QuotaWithAKnownResetStopsProbing is the fix for the case that cost
+// an operator a whole 5h window.
+//
+// A probe of an over-quota account still answers 200 with a response header set,
+// so nothing in the probe's own result says "stop asking" -- the plugin kept
+// probing every few minutes and billed each attempt. The fact was available from
+// two free sources; this pins both.
+func TestJudge_QuotaWithAKnownResetStopsProbing(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(3 * time.Hour)
+	pct := 100
+
+	spent := &headers.Signals{PrimaryUsedPercent: &pct, PrimaryResetAt: &resetAt}
+
+	cases := []struct {
+		name     string
+		account  Account
+		wantKind VerdictKind
+	}{
+		{
+			name: "CPA reports an exhausted window with a retry time",
+			account: Account{
+				Status:         hostapi.AccountStatusError,
+				Unavailable:    true,
+				StatusMessage:  "usage limit reached",
+				NextRetryAfter: &resetAt,
+			},
+			wantKind: VerdictQuota,
+		},
+		{
+			name:     "traffic reported a spent rate-limit window",
+			account:  Account{Status: hostapi.AccountStatusActive, Quota: spent},
+			wantKind: VerdictQuota,
+		},
+		{
+			// A cooldown with no stated retry time is a different thing: there
+			// is no better estimate than probing, so it must not block.
+			name: "a quota cooldown with no retry time still probes",
+			account: Account{
+				Status: hostapi.AccountStatusError, Unavailable: true,
+				StatusMessage: "usage limit reached",
+			},
+			wantKind: VerdictCooldown,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Judge(tc.account, true, now)
+			if got.Kind != tc.wantKind {
+				t.Fatalf("Kind = %q (%q), want %q", got.Kind, got.Reason, tc.wantKind)
+			}
+			wantBlocked := blockedKinds[tc.wantKind]
+			if got.Blocked != wantBlocked {
+				t.Errorf("Blocked = %v, want %v", got.Blocked, wantBlocked)
+			}
+			if got.Reason == "" {
+				t.Error("no reason; the panel has nothing to show")
+			}
+		})
+	}
+}
+
+// TestJudge_AnExhaustedWindowDoesNotOutliveItsReset: the block has to clear by
+// itself, or the account that a quota verdict parked would never be probed
+// again.
+func TestJudge_AnExhaustedWindowDoesNotOutliveItsReset(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(-time.Minute)
+	pct := 100
+	acc := Account{
+		Status: hostapi.AccountStatusActive,
+		Quota:  &headers.Signals{PrimaryUsedPercent: &pct, PrimaryResetAt: &resetAt},
+	}
+
+	if got := Judge(acc, true, now); got.Blocked {
+		t.Fatalf("still blocked after the reset: %+v", got)
 	}
 }
