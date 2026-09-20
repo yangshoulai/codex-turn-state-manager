@@ -213,6 +213,37 @@ than probing — blocking on it parks the account on the strength of a number
 nobody sent. A cooldown with no retry time stays a `cooldown` verdict and keeps
 probing.
 
+### 2.9c CPA never clears its cooldown markers, and never reads them alone
+
+One 503 sets `unavailable=true`, `status=error`, `next_retry_after` and a
+`status_message`. **Nothing sweeps them.** `clearCooldownStateForAuth` runs only
+for accounts with cooldown tracking disabled or disabled outright, and it does
+not touch `status`; `status` returns to `active` only on a successful token
+refresh or an explicit quota reset in CPA's UI.
+
+What CPA actually uses is a pure function of the flags and the clock:
+
+```
+availabilityBlock(unavailable, quotaExceeded, nextRetryAfter, nextRecoverAt, now)
+```
+
+The selector calls it (`selector.go:854/872/882`) and so does the management
+view, via `CooldownSnapshotForAuth`, which emits a cooldown only while
+`blocked && next.After(now)`. In that function **a flag whose recovery times have
+all passed means available** — which is why CPA's own panel shows nothing for an
+account the plugin was showing as `error`.
+
+So the raw `unavailable` flag is not current state. `accounts.Judge` mirrors that
+function: a flag with a **future** recovery time is a live `cooldown`; a flag
+whose recovery time has passed is `stale` — still probed, labelled as a leftover,
+with the reason saying how the marker actually clears (token refresh, or quota
+reset in CPA). The one deliberate divergence is a flag with **no** recovery time
+at all: CPA blocks, the plugin probes, because a probe is one cheap request and
+the only thing that makes the state known.
+
+Do not "simplify" this back to reading `unavailable` directly. It has been tried,
+and the visible result was a healthy account reported as broken.
+
 ### 2.10 Self-healing only applies to state the plugin injected
 
 `3.12`: invalidate a binding and allow one retry-without-injected-state **only**

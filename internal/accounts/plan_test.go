@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/headers"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
@@ -203,13 +204,31 @@ func TestJudge(t *testing.T) {
 		// a rate-limited account.
 		{"quota exhausted", Account{Status: hostapi.AccountStatusActive, Unavailable: true,
 			StatusMessage: "account quota exhausted"}, true, false, VerdictCooldown},
-		{"cooling down", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &later}, true, false, VerdictCooldown},
-		{"cooldown elapsed", Account{Status: hostapi.AccountStatusActive, NextRetryAfter: &past}, true, false, VerdictOK},
+		{"cooling down", Account{Status: hostapi.AccountStatusActive, Unavailable: true,
+			NextRetryAfter: &later}, true, false, VerdictCooldown},
+		// CPA's own selector ignores NextRetryAfter when neither flag is set
+		// (availabilityBlock returns "not blocked" for !unavailable &&
+		// !quotaExceeded before it looks at any timestamp), so this mirrors it
+		// rather than inventing a stricter rule.
+		{"a recovery time with no flag is not a cooldown", Account{
+			Status: hostapi.AccountStatusActive, NextRetryAfter: &later,
+		}, true, false, VerdictOK},
 		{"error status with no auth marker", Account{Status: hostapi.AccountStatusError}, true, false, VerdictCooldown},
 		{"429 in the message", Account{Status: hostapi.AccountStatusError,
 			StatusMessage: "upstream returned 429"}, true, false, VerdictCooldown},
 		{"503 in the message", Account{Status: hostapi.AccountStatusError,
 			StatusMessage: "upstream returned 503"}, true, false, VerdictCooldown},
+
+		// The flag is set and its recovery time has passed. CPA's selector
+		// already treats the account as available and simply has not cleared
+		// the marker, so the panel must not present it as a live fault.
+		{"a cooldown whose recovery time has passed is stale, not live", Account{
+			Status: hostapi.AccountStatusError, Unavailable: true,
+			StatusMessage: "upstream returned 503", NextRetryAfter: &past,
+		}, true, false, VerdictStale},
+		{"an error status whose recovery time has passed is stale too", Account{
+			Status: hostapi.AccountStatusError, NextRetryAfter: &past,
+		}, true, false, VerdictStale},
 
 		{"unknown status", Account{Status: hostapi.AccountStatusUnknown}, true, false, VerdictOK},
 		{"empty status", Account{}, true, false, VerdictOK},
@@ -330,5 +349,152 @@ func TestJudge_AnExhaustedWindowDoesNotOutliveItsReset(t *testing.T) {
 
 	if got := Judge(acc, true, now); got.Blocked {
 		t.Fatalf("still blocked after the reset: %+v", got)
+	}
+}
+
+// TestSummariseStatusMessage unwraps the error body CPA copies into
+// status_message.
+//
+// For a 503 the envelope holds one usable line: code server_is_overloaded,
+// message "Our servers are currently overloaded...". Pasting the raw JSON into
+// the panel's notice box buries it, and the operator reads punctuation instead
+// of the reason.
+func TestSummariseStatusMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain text is passed through", "usage limit reached", "usage limit reached"},
+		{
+			name: "an openai error envelope",
+			raw: `{"error":{"type":"service_unavailable_error","code":"server_is_overloaded",` +
+				`"message":"Our servers are currently overloaded. Please try again later.",` +
+				`"param":null},"sequence_number":2}`,
+			want: "server_is_overloaded：Our servers are currently overloaded. Please try again later.",
+		},
+		{
+			name: "error as a bare string",
+			raw:  `{"error":"rate limit exceeded"}`,
+			want: "rate limit exceeded",
+		},
+		{
+			name: "top-level code and message",
+			raw:  `{"code":"insufficient_quota","message":"You exceeded your current quota"}`,
+			want: "insufficient_quota：You exceeded your current quota",
+		},
+		{
+			name: "code with no message",
+			raw:  `{"error":{"code":"server_error"}}`,
+			want: "server_error",
+		},
+		{
+			name: "message with no code",
+			raw:  `{"error":{"message":"something went wrong"}}`,
+			want: "something went wrong",
+		},
+		{
+			// Recognised as JSON but with nothing we model: better the raw text
+			// than an empty string, which would render as no reason at all.
+			name: "unrecognised json falls back to the raw text",
+			raw:  `{"foo":"bar","baz":1}`,
+			want: `{"foo":"bar","baz":1}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := summariseStatusMessage(tc.raw); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSummariseStatusMessage_BoundsWhatReachesThePanel: the field is rendered
+// in a notice box, and nothing enforces that an upstream error body is short.
+func TestSummariseStatusMessage_BoundsWhatReachesThePanel(t *testing.T) {
+	long := strings.Repeat("x", 2000)
+	got := summariseStatusMessage(long)
+	if len(got) > maxStatusMessage+len("…") {
+		t.Errorf("length = %d, want at most %d", len(got), maxStatusMessage)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Error("no ellipsis on a truncated message")
+	}
+
+	// And it must not cut a multi-byte character in half, which would render
+	// as a replacement character.
+	cjk := summariseStatusMessage(strings.Repeat("错", 400))
+	if !utf8.ValidString(cjk) {
+		t.Error("truncation produced invalid UTF-8")
+	}
+}
+
+// TestJudge_CarriesTheRawMessageForATooltip: the panel shows the summary and
+// keeps the original one hover away.
+func TestJudge_CarriesTheRawMessageForATooltip(t *testing.T) {
+	now := time.Date(2026, 9, 20, 17, 0, 0, 0, time.UTC)
+	raw := `{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded."}}`
+	acc := Account{
+		Status:        hostapi.AccountStatusError,
+		Unavailable:   true,
+		StatusMessage: raw,
+	}
+
+	got := Judge(acc, true, now)
+	if strings.Contains(got.Reason, "{") {
+		t.Errorf("Reason still carries JSON: %q", got.Reason)
+	}
+	if !strings.Contains(got.Reason, "server_is_overloaded") {
+		t.Errorf("Reason = %q, want the upstream code", got.Reason)
+	}
+	if got.Detail != raw {
+		t.Errorf("Detail = %q, want the verbatim message", got.Detail)
+	}
+}
+
+// TestJudge_ExpiredCooldownSaysWhyItIsStale: the operator has to be able to
+// learn the rule from the panel, because the alternative is reading it as a
+// broken account -- which is what happened.
+func TestJudge_ExpiredCooldownSaysWhyItIsStale(t *testing.T) {
+	now := time.Date(2026, 9, 20, 17, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+	acc := Account{
+		Status: hostapi.AccountStatusError, Unavailable: true,
+		StatusMessage: "upstream returned 503", NextRetryAfter: &past,
+	}
+
+	got := Judge(acc, true, now)
+	if got.Blocked {
+		t.Fatal("an expired cooldown must not block probing")
+	}
+	// Both halves have to be there: that the marker is a leftover, and what the
+	// account was originally cooled down for. Without the second the operator
+	// has to hover to learn it was a 503.
+	for _, want := range []string{"已过期", "令牌刷新", "重置额度", "upstream returned 503"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("Reason = %q, want it to mention %q", got.Reason, want)
+		}
+	}
+}
+
+// TestJudge_StaleReasonWithoutAStatusMessage covers the account CPA cooled down
+// without leaving an explanation. The reason must not end up with an empty
+// parenthesis.
+func TestJudge_StaleReasonWithoutAStatusMessage(t *testing.T) {
+	now := time.Date(2026, 9, 20, 17, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+
+	got := Judge(Account{Status: hostapi.AccountStatusError, NextRetryAfter: &past}, true, now)
+	if got.Kind != VerdictStale {
+		t.Fatalf("Kind = %q, want %q", got.Kind, VerdictStale)
+	}
+	if strings.Contains(got.Reason, "（）") || strings.Contains(got.Reason, "（，") {
+		t.Errorf("Reason has an empty cause: %q", got.Reason)
+	}
+	if got.Detail != "" {
+		t.Errorf("Detail = %q, want empty when CPA sent no message", got.Detail)
 	}
 }

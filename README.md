@@ -144,6 +144,12 @@ make run ARGS="-accounts 8 -listen 127.0.0.1:9000"
 
 `ARGS` is appended after the defaults, so it can override any of them.
 
+`-stale-account` seeds the first mock account with the leftovers CPA leaves after an
+expired cooldown — `unavailable=true`, `status=error` and a past `next_retry_after` — which
+is the shape that once made the panel report a healthy account as broken. It is off by
+default: a harness that starts with an account in `error` invites a false bug report from
+whoever next opens it.
+
 ## Build
 
 ```bash

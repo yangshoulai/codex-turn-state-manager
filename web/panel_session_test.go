@@ -1065,3 +1065,53 @@ func TestStylesheetProbeColumnsAreNumberedForEight(t *testing.T) {
 		t.Error("there is a width rule for a ninth probe column, but the table has eight")
 	}
 }
+
+// TestPanelDistinguishesAStaleMarkerFromALiveCooldown is the regression test
+// for the defect that made an account look broken.
+//
+// CPA sets Unavailable/Status once and never clears them itself -- its own
+// selector derives availability from the flags plus the clock instead -- so an
+// account whose cooldown expired reads as `error` until a token refresh or an
+// explicit quota reset. The panel presented that raw marker as a live fault,
+// and it was reported exactly that way: "this account is fine, why does the
+// panel say error".
+func TestPanelDistinguishesAStaleMarkerFromALiveCooldown(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "stale") {
+		t.Error("the panel does not know about a stale verdict")
+	}
+	if !strings.Contains(src, "CPA 标记已过期") {
+		t.Error("a stale marker has no label of its own")
+	}
+	// The raw CPA status pill stays, because it is the host's field -- but the
+	// tooltip has to say why it no longer means what it looks like.
+	if !strings.Contains(src, "STATUS_TITLE") {
+		t.Error("the raw status pill carries no explanation")
+	}
+	if !strings.Contains(src, "令牌刷新") {
+		t.Error("the explanation does not say how the marker actually clears")
+	}
+}
+
+// TestPanelKeepsTheRawStatusMessageForATooltip: the reason is summarised so the
+// JSON envelope stops burying the point, and the verbatim text stays one hover
+// away as the evidence behind it.
+func TestPanelKeepsTheRawStatusMessageForATooltip(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "verdict.detail") {
+		t.Error("the panel ignores the verbatim message")
+	}
+	if !strings.Contains(src, "verdictTitle(") {
+		t.Error("no title builder for the verdict")
+	}
+}

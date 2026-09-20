@@ -1,8 +1,10 @@
 package accounts
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yangshoulai/codex-turn-state-manager/internal/hostapi"
 )
@@ -36,12 +38,23 @@ const (
 	// so a probe is guaranteed a 429 until then. Unlike a generic cooldown,
 	// this one blocks: there is nothing to discover by asking early.
 	VerdictQuota VerdictKind = "quota"
+	// VerdictStale means CPA is still carrying markers that no longer describe
+	// the account -- a cooldown whose recovery time has passed, or an error
+	// status with nothing behind it. Probing continues, and the panel says the
+	// marker is leftover rather than presenting it as a live fault.
+	VerdictStale VerdictKind = "stale"
 )
 
 // Verdict is the account-level answer to "may this be probed, and why".
 type Verdict struct {
-	Kind   VerdictKind `json:"kind"`
-	Reason string      `json:"reason,omitempty"`
+	Kind VerdictKind `json:"kind"`
+	// Reason is the human-readable explanation. When CPA's own message is a
+	// JSON error body it is summarised here rather than pasted: the envelope
+	// buries the one line that matters.
+	Reason string `json:"reason,omitempty"`
+	// Detail is CPA's message verbatim, for a tooltip. Empty when there was
+	// none, and identical to Reason when there was nothing to summarise.
+	Detail string `json:"detail,omitempty"`
 	// Blocked reports whether probing must stop. It is derived from Kind by
 	// BlockedKinds and is carried explicitly so no caller re-derives the rule.
 	Blocked bool `json:"blocked"`
@@ -73,6 +86,7 @@ var blockedKinds = map[VerdictKind]bool{
 	// keeps probing.
 	VerdictOK:       false,
 	VerdictCooldown: false,
+	VerdictStale:    false,
 }
 
 // quotaMarkers are the substrings in CPA's own status message that identify a
@@ -165,27 +179,167 @@ func Judge(a Account, known bool, now time.Time) Verdict {
 	}
 
 	// Everything left is a "come back later" condition, and probing is how the
-	// plugin finds out whether later has arrived. Say which one it is, so the
-	// panel explains the state instead of hiding it.
-	reason := ""
+	// plugin finds out whether later has arrived.
+	//
+	// The distinction that matters here is between a cooldown that is still
+	// running and a marker CPA simply has not cleared. CPA never resets
+	// Unavailable/Status by itself -- the flags are set once and stay set --
+	// and it never consults them alone: its own selector decides availability
+	// with availabilityBlock(unavailable, quotaExceeded, nextRetryAfter,
+	// nextRecoverAt, now), a pure function of the flags and the clock, where a
+	// flag with all recovery times in the past means AVAILABLE
+	// (sdk/cliproxy/auth/selector.go).
+	//
+	// That is why CPA's own panel shows nothing for an account whose cooldown
+	// expired while the plugin showed "error": the plugin was reading the raw
+	// flag, and CPA was deriving. The rule below is CPA's, mirrored so the two
+	// agree.
+	//
+	// One deliberate divergence: CPA treats "flagged with no recovery time at
+	// all" as blocked, and this does not. CPA's rule answers "should a user's
+	// request be routed here"; this one answers "should we probe". A probe is
+	// one cheap request and is the only thing that makes the state known, so
+	// refusing it on a marker with no deadline would park the account on the
+	// strength of a number nobody supplied.
+	recovery := a.NextRetryAfter
+	flagged := a.Unavailable || a.Status == hostapi.AccountStatusError
+
 	switch {
-	case a.Unavailable:
-		reason = strings.TrimSpace(a.StatusMessage)
-		if reason == "" {
-			reason = "上游暂时不可用（如已达额度上限）"
+	case flagged && recovery != nil && now.Before(*recovery):
+		return verdictWithDetail(VerdictCooldown,
+			"CPA 冷却中，可重试于 "+recovery.Local().Format("15:04:05"),
+			strings.TrimSpace(a.StatusMessage))
+
+	case flagged && recovery == nil:
+		msg := strings.TrimSpace(a.StatusMessage)
+		if msg == "" {
+			msg = "CPA 未给出恢复时间"
 		}
-	case a.NextRetryAfter != nil && now.Before(*a.NextRetryAfter):
-		reason = "CPA 冷却中，可重试于 " + a.NextRetryAfter.Local().Format("15:04:05")
-	case a.Status == hostapi.AccountStatusError:
-		reason = strings.TrimSpace(a.StatusMessage)
-		if reason == "" {
-			reason = "账号处于临时错误状态"
+		return verdictWithDetail(VerdictCooldown,
+			"账号暂时不可用（CPA 未给出恢复时间）："+summariseStatusMessage(msg),
+			msg)
+
+	case flagged:
+		// The flag is set and its recovery time has passed. CPA's selector
+		// already treats this account as available -- it just has not cleared
+		// the marker, and will not until a successful token refresh or an
+		// explicit quota reset.
+		//
+		// The reason names both halves on purpose: what the account was cooled
+		// down for (otherwise the operator has to hover to find out it was a
+		// 503) and the fact that the marker is now a leftover.
+		detail := strings.TrimSpace(a.StatusMessage)
+		at := recovery.Local().Format("15:04:05")
+		cause := ""
+		if summary := summariseStatusMessage(detail); summary != "" {
+			cause = "（" + summary + "，恢复时间 " + at + " 已过）"
+		} else {
+			cause = "（恢复时间 " + at + " 已过）"
 		}
-	}
-	if reason != "" {
-		return verdict(VerdictCooldown, reason)
+		return verdictWithDetail(VerdictStale,
+			"CPA 的冷却标记已过期"+cause+
+				"：CPA 的选择器已把这个账号视为可用，插件仍在探测；"+
+				"该标记要等一次成功的令牌刷新，或在 CPA 里手动重置额度，才会被清掉",
+			detail)
 	}
 	return verdict(VerdictOK, "")
+}
+
+// summariseStatusMessage renders CPA's status message for the panel.
+//
+// CPA copies the upstream error body into this field verbatim, so what arrives
+// is often a single line of JSON -- for a 503, the envelope buries the one part
+// that says anything:
+//
+//	{"error":{"type":"service_unavailable_error","code":"server_is_overloaded",
+//	 "message":"Our servers are currently overloaded. Please try again later."}}
+//
+// Recognising that shape and pulling out the code and message is the difference
+// between the operator reading "server_is_overloaded：Our servers are currently
+// overloaded" and reading a wall of punctuation. Anything unrecognised is
+// returned as-is, only bounded in length.
+func summariseStatusMessage(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// Only pay for parsing when it looks like JSON.
+	if strings.HasPrefix(raw, "{") {
+		if summary := summariseJSONStatus(raw); summary != "" {
+			return summary
+		}
+	}
+	return truncateMessage(raw)
+}
+
+type apiErrorBody struct {
+	Error struct {
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Message string `json:"message"`
+	Detail  string `json:"detail"`
+	// Envelope fields some endpoints use instead of "error".
+	Code string `json:"code"`
+	Type string `json:"type"`
+}
+
+func summariseJSONStatus(raw string) string {
+	var body apiErrorBody
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		// "error" as a bare string, or any shape we do not model. Fall back
+		// rather than guessing at the structure.
+		var loose map[string]any
+		if err2 := json.Unmarshal([]byte(raw), &loose); err2 != nil {
+			return ""
+		}
+		if s, ok := loose["error"].(string); ok && strings.TrimSpace(s) != "" {
+			return truncateMessage(strings.TrimSpace(s))
+		}
+		return ""
+	}
+
+	label := firstNonEmpty(body.Error.Code, body.Error.Type, body.Code, body.Type)
+	message := firstNonEmpty(body.Error.Message, body.Message, body.Detail)
+
+	switch {
+	case label != "" && message != "":
+		return truncateMessage(label + "：" + message)
+	case label != "":
+		return truncateMessage(label)
+	case message != "":
+		return truncateMessage(message)
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if t := strings.TrimSpace(v); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// maxStatusMessage bounds what reaches the panel. An upstream error body is
+// usually one line, but nothing enforces that and the field is rendered in a
+// notice box.
+const maxStatusMessage = 300
+
+func truncateMessage(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxStatusMessage {
+		return s
+	}
+	// Cut on a rune boundary: the message may be CJK, and half a rune renders
+	// as a replacement character.
+	cut := maxStatusMessage
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // matchesAny reports whether text contains any of the markers, ignoring case.
@@ -201,6 +355,15 @@ func matchesAny(text string, markers []string) bool {
 
 func verdict(kind VerdictKind, reason string) Verdict {
 	return Verdict{Kind: kind, Reason: reason, Blocked: blockedKinds[kind]}
+}
+
+// verdictWithDetail is verdict plus the untruncated source text.
+func verdictWithDetail(kind VerdictKind, reason, detail string) Verdict {
+	v := verdict(kind, reason)
+	if detail != reason {
+		v.Detail = detail
+	}
+	return v
 }
 
 // authFailureCode reports which rejected-credential signal a status message

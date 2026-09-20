@@ -77,6 +77,31 @@ func (h *MockHost) SetAccountStatus(authIndex, status string, unavailable bool) 
 	}
 }
 
+// MarkCooldownExpired reproduces the state CPA leaves behind after a cooldown
+// has run its course.
+//
+// CPA never clears these fields itself: one 503 writes unavailable=true,
+// status=error, next_retry_after and a status_message, and nothing sweeps them
+// -- a successful token refresh or an explicit quota reset is the only way out.
+// Meanwhile CPA's own selector derives availability from the flags plus the
+// clock, so this account reads as available to CPA while still carrying every
+// marker of a fault. Reproducing that shape is the only way to test that the
+// plugin does not present it as a live one.
+func (h *MockHost) MarkCooldownExpired(authIndex, message string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.accounts {
+		if h.accounts[i].AuthIndex != authIndex {
+			continue
+		}
+		h.accounts[i].Status = AccountStatusError
+		h.accounts[i].Unavailable = true
+		h.accounts[i].StatusMessage = message
+		h.accounts[i].NextRetryAfter = time.Now().Add(-time.Hour)
+		return
+	}
+}
+
 // RemoveAccount drops an account from the pool, as CPA does when an operator
 // deletes one.
 func (h *MockHost) RemoveAccount(authIndex string) {

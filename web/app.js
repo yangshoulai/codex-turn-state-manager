@@ -419,6 +419,10 @@ const VERDICT_PILL = {
   auth: ["pill-bad", "凭证被拒"],
   pending: ["pill-warn", "等待外部操作"],
   refreshing: ["pill-warn", "刷新凭证中"],
+  // A marker CPA has not cleared. Neutral on purpose: it describes a leftover,
+  // not a fault, and colouring it would send the operator chasing an account
+  // that CPA's own selector already treats as available.
+  stale: ["pill-idle", "CPA 标记已过期"],
 };
 
 function verdictPill(verdict) {
@@ -426,12 +430,22 @@ function verdictPill(verdict) {
   if (verdict.kind === "cooldown") {
     return el("span", {
       class: "pill pill-idle",
-      title: verdict.reason || "CPA 侧的临时状态，插件仍会探测",
+      title: verdictTitle(verdict, "CPA 侧的临时状态，插件仍会探测"),
       text: "限流冷却",
     });
   }
   const [cls, label] = VERDICT_PILL[verdict.kind] || ["pill-warn", verdict.kind];
-  return el("span", { class: "pill " + cls, title: verdict.reason || "", text: label });
+  return el("span", { class: "pill " + cls, title: verdictTitle(verdict, ""), text: label });
+}
+
+// verdictTitle prefers the verbatim message for a tooltip, and falls back to the
+// summary. CPA copies the upstream error body into status_message, so the
+// summary is the readable line and the raw text is the evidence behind it.
+function verdictTitle(verdict, fallback) {
+  const detail = (verdict.detail || "").trim();
+  const reason = (verdict.reason || "").trim();
+  if (detail && reason && detail !== reason) return reason + "\n\n原始信息：" + detail;
+  return detail || reason || fallback;
 }
 
 // verdictNotice explains a verdict in words under the account's model table,
@@ -444,14 +458,32 @@ function verdictNotice(verdict) {
       el("span", { text: verdict.reason }),
     ]);
   }
+  if (verdict.kind === "stale") {
+    // Spelled out rather than summarised: the first version of this panel read
+    // CPA's raw marker as a live fault, and an operator who has just been
+    // misled needs the rule, not another label.
+    return el("p", { class: "notice", title: verdictTitle(verdict, "") }, [
+      el("strong", { text: "仍在探测。" }),
+      el("span", { text: verdict.reason }),
+    ]);
+  }
   if (verdict.kind === "cooldown") {
-    return el("p", { class: "notice" }, [
+    return el("p", { class: "notice", title: verdictTitle(verdict, "") }, [
       el("strong", { text: "仍在探测。" }),
       el("span", { text: verdict.reason + " —— CPA 侧的临时状态，探测就是确认它是否已经恢复的方式。" }),
     ]);
   }
   return null;
 }
+
+// STATUS_TITLE explains the raw CPA status when the verdict says it is a
+// leftover. The pill still shows what CPA reports -- that is the host's field
+// and hiding it would be its own kind of lie -- but the tooltip says why it no
+// longer means what it looks like.
+const STATUS_TITLE = {
+  stale: "这是 CPA 账号记录里的遗留标记：CPA 不会自己清除它，它的选择器也已经把这个账号视为可用。"
+    + "下一次成功的令牌刷新，或在 CPA 里手动重置该账号额度，才会把它清掉。",
+};
 
 const STATUS_PILL = {
   fresh: ["pill-ok", "有效"],
@@ -970,7 +1002,11 @@ function renderAccounts() {
             })
           : null,
         quotaBadge(account.quota),
-        el("span", { class: "pill " + statusClass, text: account.status || "unknown" }),
+        el("span", {
+          class: "pill " + statusClass,
+          text: account.status || "unknown",
+          title: STATUS_TITLE[(verdict && verdict.kind) || ""] || "",
+        }),
         verdictPill(verdict),
       ]),
       el("span", { class: "chevron", "aria-hidden": "true" }),

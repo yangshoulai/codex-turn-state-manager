@@ -1490,3 +1490,59 @@ func TestApp_ForgetsAnAccountCPADropped(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestApp_ExpiredCooldownIsNotPresentedAsAFault is the end-to-end version of
+// the defect that was reported from production: "this account is fine, why does
+// the panel say error".
+//
+// CPA leaves unavailable=true and status=error set forever after a 503 -- only a
+// token refresh or an explicit quota reset clears them -- and derives
+// availability from those flags plus the clock instead. Reading the flag alone
+// is what made the plugin disagree with CPA's own panel.
+func TestApp_ExpiredCooldownIsNotPresentedAsAFault(t *testing.T) {
+	ctx := context.Background()
+	host := mockHost(1)
+	a := newTestApp(t, host)
+	a.Start()
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts: %v", err)
+	}
+
+	host.MarkCooldownExpired("codex-auth-1", `{"error":{"code":"server_is_overloaded",`+
+		`"message":"Our servers are currently overloaded. Please try again later."}}`)
+	if _, err := a.SyncAccounts(ctx); err != nil {
+		t.Fatalf("SyncAccounts after cooldown: %v", err)
+	}
+
+	views := a.Accounts().AllWithVerdict(time.Now())
+	if len(views) != 1 {
+		t.Fatalf("views = %d, want 1", len(views))
+	}
+	v := views[0]
+
+	if v.Verdict.Kind != accounts.VerdictStale {
+		t.Errorf("Kind = %q (%q), want %q", v.Verdict.Kind, v.Verdict.Reason, accounts.VerdictStale)
+	}
+	if v.Verdict.Blocked {
+		t.Error("an expired cooldown must not stop probing")
+	}
+	// The summary is what the panel renders, so the JSON envelope must not
+	// survive into it.
+	if strings.Contains(v.Verdict.Reason, "{") {
+		t.Errorf("Reason still carries JSON: %q", v.Verdict.Reason)
+	}
+	if !strings.Contains(v.Verdict.Reason, "server_is_overloaded") {
+		t.Errorf("Reason = %q, want the upstream code", v.Verdict.Reason)
+	}
+	if !strings.Contains(v.Verdict.Detail, "Our servers are currently overloaded") {
+		t.Errorf("Detail = %q, want the verbatim message", v.Verdict.Detail)
+	}
+	// And the account is still a probe target, which is the whole point: the
+	// label was wrong, not the behaviour.
+	if err := a.Accounts().SetProbeEnabled(ctx, "codex-auth-1", "gpt-5.5", true); err != nil {
+		t.Fatalf("SetProbeEnabled: %v", err)
+	}
+	if got := a.Accounts().EnabledPairs(); len(got) != 1 {
+		t.Errorf("EnabledPairs = %v, want the account to stay probeable", got)
+	}
+}

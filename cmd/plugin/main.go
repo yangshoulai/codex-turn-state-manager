@@ -34,6 +34,9 @@ func main() {
 		upstream  = flag.String("upstream", "", "override the upstream base URL")
 		manageKey = flag.String("management-key", "devkey", "expected management key")
 		logLevel  = flag.String("log-level", "debug", "debug|info|warn|error")
+		staleAcct = flag.Bool("stale-account", false,
+			"mark the first mock account with the leftovers CPA leaves after an expired cooldown "+
+				"(unavailable=true, status=error, past next_retry_after)")
 	)
 	flag.Parse()
 
@@ -58,6 +61,19 @@ func main() {
 			Label:     labelFor(i),
 			Status:    hostapi.AccountStatusActive,
 			Priority:  10 - i,
+		})
+	}
+	// Opt-in, not the default. The state is worth being able to see -- it is
+	// what production reported as "the account is fine, why does the panel say
+	// error" -- but a harness that starts with an account in `error` invites a
+	// false bug report from whoever next opens it.
+	if *staleAcct && *accounts > 0 {
+		host.MarkCooldownExpired(authIndexFor(0),
+			`{"error":{"type":"service_unavailable_error","code":"server_is_overloaded",`+
+				`"message":"Our servers are currently overloaded. Please try again later.",`+
+				`"param":null},"sequence_number":2}`)
+		logf(hostapi.LogInfo, "harness: account seeded with an expired cooldown marker", map[string]any{
+			"authIndex": authIndexFor(0), "flag": "-stale-account",
 		})
 	}
 
