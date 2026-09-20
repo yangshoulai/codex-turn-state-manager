@@ -199,7 +199,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 				MaxProbeDuration:  v.MaxProbeDuration,
 				MaxProxies:        v.MaxProxiesPerProbe,
 				MaxUnusable:       v.MaxUnusablePerProbe,
-				MaxOutputTokens:   v.ProbeMaxOutputTokens,
 			}
 		},
 		BaseURL: cfg.UpstreamBaseURL,

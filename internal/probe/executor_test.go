@@ -308,7 +308,7 @@ func (h *execHarness) probe(t *testing.T) Result {
 // request shape (design doc 3.6, F-14)
 
 func TestBuildProbeBody_MatchesDesignDoc(t *testing.T) {
-	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow, 16)
+	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow)
 	if err != nil {
 		t.Fatalf("buildProbeBody: %v", err)
 	}
@@ -1352,11 +1352,17 @@ func TestExecutor_UnusableCapDoesNotBenchHealthyNodes(t *testing.T) {
 	}
 }
 
-// TestBuildProbeBody_CarriesTheOutputCap pins that upstream generation is
-// bounded, which is the difference between a probe costing a few hundred tokens
-// and costing a full reasoning turn.
-func TestBuildProbeBody_CarriesTheOutputCap(t *testing.T) {
-	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow, 16)
+// TestBuildProbeBody_CarriesNoOutputCap pins the ABSENCE of max_output_tokens.
+//
+// It exists because adding that field is the obvious-looking optimisation and it
+// does not work. The Codex CLI's own ResponsesApiRequest -- the body this
+// endpoint was built for -- has no such field, and CPA's Codex executor never
+// sends one either. Sending it makes upstream answer 400 with no state header,
+// which the probe classifies as UPSTREAM_ERROR, so the pair silently stops
+// binding. The public OpenAI Responses API does document the parameter, and
+// that is the trap this test is here to keep shut.
+func TestBuildProbeBody_CarriesNoOutputCap(t *testing.T) {
+	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow)
 	if err != nil {
 		t.Fatalf("buildProbeBody: %v", err)
 	}
@@ -1364,23 +1370,9 @@ func TestBuildProbeBody_CarriesTheOutputCap(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("probe body is not valid JSON: %v", err)
 	}
-	if body["max_output_tokens"] != float64(16) {
-		t.Errorf("max_output_tokens = %v, want 16", body["max_output_tokens"])
-	}
-}
-
-// TestBuildProbeBody_OmitsTheOutputCapWhenZero: a deployment whose model rejects
-// the parameter must be able to leave it out rather than be unable to probe.
-func TestBuildProbeBody_OmitsTheOutputCapWhenZero(t *testing.T) {
-	raw, err := buildProbeBody("gpt-5-codex", models.EffortLow, 0)
-	if err != nil {
-		t.Fatalf("buildProbeBody: %v", err)
-	}
-	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil {
-		t.Fatalf("probe body is not valid JSON: %v", err)
-	}
-	if _, present := body["max_output_tokens"]; present {
-		t.Errorf("max_output_tokens is present as %v, want the field omitted", body["max_output_tokens"])
+	for _, field := range []string{"max_output_tokens", "max_tokens", "max_completion_tokens"} {
+		if v, present := body[field]; present {
+			t.Errorf("%s is present as %v; this endpoint does not accept it", field, v)
+		}
 	}
 }

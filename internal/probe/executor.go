@@ -152,9 +152,6 @@ type ExecutorPolicy struct {
 	// several nodes at the same time supports the assumption; different lengths
 	// refute it.
 	MaxUnusable int
-	// MaxOutputTokens bounds upstream generation per probe; see
-	// probeRequest.MaxOutputTokens. Zero omits the field.
-	MaxOutputTokens int
 }
 
 // Executor probes one (authIndex, model) pair, walking the proxy pool until it
@@ -414,7 +411,7 @@ func (e *Executor) attempt(ctx context.Context, node proxies.Node, authIndex, mo
 	}
 
 	effort := e.models.MinReasoning(model)
-	req, err := newProbeHTTPRequest(ctx, e.baseURL, cred.AccessToken, model, effort, policy.MaxOutputTokens)
+	req, err := newProbeHTTPRequest(ctx, e.baseURL, cred.AccessToken, model, effort)
 	if err != nil {
 		return Result{Outcome: OutcomeNetworkError, Err: err, Latency: e.now().Sub(started)}
 	}

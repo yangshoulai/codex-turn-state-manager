@@ -145,14 +145,22 @@ Trying another proxy cannot fix them, so abort the traversal immediately.
 
 Probes go **directly to the upstream Codex endpoint**, not through CPA's
 `/v1/responses` (CPA's host HTTP API cannot carry a per-request proxy). Probes
-use the cheapest reasoning level the model accepts, an empty tool list, a
-one-character input and a `max_output_tokens` cap, to minimise token burn
-(`F-14`). The reasoning floor comes from `models.Registry` — never hardcode it,
-and never hardcode the output cap either; it is `probe_max_output_tokens`.
+use the cheapest reasoning level the model accepts, an empty tool list and a
+one-character input, to minimise token burn (`F-14`). The reasoning floor comes
+from `models.Registry` — never hardcode it.
 
-The output cap is the one that dominates the bill. A probe only reads response
-headers, but upstream charges for what it generates, and a reasoning model
-answering "." will think before it answers.
+**Do not add `max_output_tokens` to the probe body.** It looks like the obvious
+way to cap what a probe costs, and this endpoint does not accept it: the Codex
+CLI's own `ResponsesApiRequest` has no such field, CPA's Codex executor never
+sends one, and a probe that sends it gets a 400 with no state header — which
+surfaces as `UPSTREAM_ERROR` and silently stops the pair binding. The public
+OpenAI Responses API does document the parameter; this is the Codex CLI's
+private endpoint, and assuming it mirrors the public one is how that mistake was
+made. Nothing else caps generation either: the levers the endpoint does support
+(the cheapest accepted reasoning effort, and verbosity, which already defaults
+to its lowest value) are already at their floor. A probe's per-request cost is
+therefore not reducible by request shape — only the number of probes is, which
+is what the backoff and the traversal caps are for.
 
 Read the response headers, and if the state matches the target length, bind and
 **close the body immediately**. Do not wait for the SSE stream to finish.
