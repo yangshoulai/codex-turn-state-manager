@@ -45,6 +45,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 10 | **P1 — 自愈与退避** | State 失败自动失效、探测退避策略、被动续期 | 系统具备自愈能力 | ✅ |
 | 11 | **P2 — 可观测性** | 探测历史查询（含上游 HTTP 状态码）、代理健康统计、State 状态可视化、逐请求调用历史（请求携带值 / 注入值 / HTTP 状态 / 响应值，24 小时） | 运维面板完善 | 🔄 |
 | 12 | **P1 — 探测成本** | 429 终止本轮遍历并沿用上游 `Retry-After`（缺省 10 分钟）；可选的非目标封顶 `max_unusable_per_probe`（默认 0 = 不封顶）；额度耗尽（CPA 冷却带重试时间，或流量上报的 100% 窗口）停止探测 | 探测不再是额度消耗的主体 | 🔄 |
+| 13 | **P1 — 时区转换** | 可选开关 + IANA 目标时区（保存时校验）：改写请求体中的 `<timezone>` / `<current_date>` / `"timezone"` / `"timezone_offset_min"`；逐字节改写，无标记即原样返回；空或非法目标不转换 | 可让模型认为调用方在另一个时区 | 🔄 |
 
 ### 状态判定口径
 
@@ -79,6 +80,7 @@ working rules live in [`AGENTS.md`](./AGENTS.md).
 | 8 | 已确认 `AuthID` + `Handled: true` 可用，候选身份经 `auth.ID` → `auth_index` 映射，优先级分档由插件自己算。剩余缺口是真实环境验证，随 #0 一并进行；`state_first` 的「跨优先级档挑选持有 State 的账号」需要**至少两个账号**才能体现，当前环境只有一个。 |
 | 9 | 路由已改为查询参数形式并全部注册；Management API 与面板静态资源均已在真实 CPA v7.3.7 中验证可达；**面板交互已在浏览器中实测**（账号过滤、探测记录分页与账号过滤、绑定历史弹窗 ESC 关闭、模型列表自动加载、标题栏计数）。本轮又实测了逐账号「同步」按钮、调用历史弹窗（分页、HTTP 状态配色、State 三列各自的空值文案）、绑定历史弹窗（代理列脱敏、行高一致、无横向溢出）与面板占满宿主页面（1600px 视口下 `main` 宽 1585px）。仍列 🔄 有两个原因：一是本表口径把依赖浏览器渲染的项排除在 ✅ 之外，二是 `GET /models` 端点（`listModels`）是全仓唯一 0% 覆盖率的端点，`app.Catalog`、`models.parseCatalog` 也随之未测。 |
 | 12 | 代码与测试完成：`buildProbeBody` 的 `max_output_tokens` 有「带值 / 为 0 时省略字段」两条测试；`OutcomeRateLimit.Terminal()`、`parseRetryAfter`（秒数与 HTTP-date 两种写法 + 缺失/非法回退）、以及「429 后不再联系下一个节点」各有测试；`max_unusable_per_probe` 的封顶、为 0 时遍历全池、以及「封顶不阻止后续命中」各有测试；`Signals.ExhaustedUntil` 与 `Judge` 的额度分支（CPA 报的带重试时间的冷却 / 流量报的 100% 窗口 / 无重试时间的冷却不阻塞）各有测试。**仍列 🔄 是因为本项的验收标准是一个成本断言，而成本只能靠真实流量测量**：这些改动应当把每次探测的计费从「上游决定」压到 16 token，并让 429 与额度耗尽的账号不再被反复计费，但**没有在真实账号上量过前后对比**。对照组是运维的观察：6 个节点、未发送任何业务请求、一轮探测即吃掉整个 5h 窗口。<br><br>其中「非目标封顶」默认 **0（不封顶）**，因为它的前提是一条未验证的假设——见 `ExecutorPolicy.MaxUnusable` 与设计文档 §3.7.3。要判定它：`probe_history` 按 (pair, proxy) 记了 `state_length`，同一 pair 在相近时间经不同节点返回相同长度则假设成立，返回不同长度则被推翻。 |
+| 13 | 代码与测试完成：`internal/timezone` 的改写覆盖标签、日期、JSON 字段、`timezone_offset_min`（含负号与「不是时区的同名值不动」）、未闭合标签不动、已是目标值只计数不改写、无标记时**逐字节且同一切片**返回、进程 TZ 不影响结果、超大报文的前置检查短路；`ParseTarget` 的校验矩阵（IANA / UTC / 空 / 非 IANA / 裸偏移）；settings 的「写时拒绝、读时容错」；app 层「关闭不改写 / 空目标不改写 / 有效目标改写且日期跟着走 / 总开关拦截 / 正文散文里的 `<timezone>` 不动」；以及 ABI 层「body 能回传」与「没变就不回传 body」。**仍列 🔄 是因为真正的验收标准——模型是否因此认为调用方在别的时区——只能靠真实流量判定**，而本机没有上游出口，也无从确认用户客户端是否发送该标记（这正是 `/status` 那几个计数器的用途：`noMarker` 一栏会直接回答这个问题）。面板交互已在浏览器中实测：开关联动禁用输入框、非法值被拒并原样显示错误、计数器出现在顶栏。 |
 | 11 | API 侧（探测历史查询、代理健康统计、请求管道计数、上游套餐与额度）已完成并在真实实例中验证：实测一次真实请求后 `plan` 由 `X-Codex-Plan-Type` 填入 `free`，`lastHeaderInit` 里能看到 `X-Codex-Primary/Secondary-Used-Percent` 等额度头。注意这些值**只在进程处理过真实请求后才有**——重启后 `plan` 为空是正常现象，不是缺陷（§10.10）。调用历史链路有端到端测试（注入 → 响应 → 完成三步驱动出一条完整记录，含三个 State 值与状态码），总开关关闭时不写任何行；`call_history` 的往返、分页、按龄清理、按账号清除均有测试。**尚未在真实流量中观察过**，因此仍为 🔄。 |
 
 ### 关于第 0 项
@@ -265,8 +267,9 @@ Four runtime capabilities, all gated by one master switch:
 | Capture | Harvests state from ordinary traffic responses |
 | Route | Prefers accounts that hold a usable binding |
 | Log | Records one row per intercepted request: what it carried, what was injected, what upstream answered, how it ended |
+| Timezone | Optional, off by default: rewrites the timezone a request declares about its caller |
 
-With the master switch off, all five are bypassed and the plugin is a no-op on the
+With the master switch off, all six are bypassed and the plugin is a no-op on the
 request path.
 
 The log is the one capability with no sub-switch of its own. It answers "what did the

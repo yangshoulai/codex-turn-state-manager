@@ -808,3 +808,107 @@ func TestServeResourceStampsThePanelVersion(t *testing.T) {
 		t.Error("ReadAsset returned rewritten bytes; the rewriting must live in ServedAsset")
 	}
 }
+
+// TestRequestInterceptCarriesTheBodyBack is the ABI-level check for the one
+// thing the timezone feature cannot work without: the host sends the payload
+// and honours a replacement.
+//
+// The adapter is the only place CPA's types are translated, so a body dropped
+// here is a body the rest of the plugin never sees -- and the failure is silent,
+// because a request with no rewrite is indistinguishable from a request with
+// nothing to rewrite.
+func TestRequestInterceptCarriesTheBodyBack(t *testing.T) {
+	p := newTestPlugin(t, authListCaller())
+
+	// Turn timezone conversion on through the plugin's own settings surface, so
+	// this test exercises the whole path rather than a shortcut.
+	settingsRaw, err := json.Marshal(map[string]any{
+		"timezoneConversionEnabled": true,
+		"timezoneTarget":            "Asia/Tokyo",
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	envelope, err := json.Marshal(map[string]any{
+		"Method": http.MethodPut,
+		"Path":   version.ManagementBasePath + "/settings",
+		"Body":   settingsRaw,
+	})
+	if err != nil {
+		t.Fatalf("marshal management request: %v", err)
+	}
+	mgmtResp, err := p.Handle(pluginabi.MethodManagementHandle, envelope)
+	if err != nil {
+		t.Fatalf("put settings: %v", err)
+	}
+	var putResult struct {
+		StatusCode int    `json:"StatusCode"`
+		Body       []byte `json:"Body"`
+	}
+	if err := json.Unmarshal(resultOf(t, mgmtResp), &putResult); err != nil {
+		t.Fatalf("decode management response: %v", err)
+	}
+	if putResult.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /settings = %d: %s", putResult.StatusCode, putResult.Body)
+	}
+
+	body := `{"input":[{"type":"message","role":"user","content":[{"type":"input_text",` +
+		`"text":"<environment_context>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"}]}]}`
+	raw, err := json.Marshal(map[string]any{
+		"RequestID": "req-body",
+		"Model":     "gpt-5.5",
+		"Headers":   map[string][]string{},
+		"Body":      []byte(body),
+		"Metadata":  map[string]any{"selected_auth_index": "codex-auth-1"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp, err := p.Handle(pluginabi.MethodRequestInterceptAfter, raw)
+	if err != nil {
+		t.Fatalf("request.intercept_after: %v", err)
+	}
+	var out pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(resultOf(t, resp), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(out.Body) == 0 {
+		t.Fatal("no replacement body was sent back")
+	}
+	got := string(out.Body)
+	if !strings.Contains(got, "<timezone>Asia/Tokyo</timezone>") {
+		t.Errorf("zone not rewritten:\n%s", got)
+	}
+	if strings.Contains(got, "Asia/Shanghai") {
+		t.Errorf("the original zone survived:\n%s", got)
+	}
+}
+
+// TestRequestInterceptSendsNoBodyWhenNothingChanged: re-sending an identical
+// payload would make the host re-read and re-translate a whole conversation on
+// every request.
+func TestRequestInterceptSendsNoBodyWhenNothingChanged(t *testing.T) {
+	p := newTestPlugin(t, authListCaller())
+
+	body := `{"input":[{"type":"input_text","text":"hello"}]}`
+	raw, _ := json.Marshal(map[string]any{
+		"RequestID": "req-plain",
+		"Model":     "gpt-5.5",
+		"Headers":   map[string][]string{},
+		"Body":      []byte(body),
+	})
+
+	resp, err := p.Handle(pluginabi.MethodRequestInterceptAfter, raw)
+	if err != nil {
+		t.Fatalf("request.intercept_after: %v", err)
+	}
+	var out pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(resultOf(t, resp), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Body) != 0 {
+		t.Errorf("sent back a body of %d bytes when nothing changed", len(out.Body))
+	}
+}

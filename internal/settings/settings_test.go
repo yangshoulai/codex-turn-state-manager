@@ -424,3 +424,92 @@ func TestManager_CostKnobsSurviveARestart(t *testing.T) {
 		t.Errorf("after restart: %d, want 4", got.MaxUnusablePerProbe)
 	}
 }
+
+// TestManager_RejectsAnUnloadableTimezone pins validation happening on write.
+//
+// A target the process cannot load is a configuration mistake, and the operator
+// should hear about it while they are looking at the field rather than
+// discovering later that conversion silently did nothing.
+func TestManager_RejectsAnUnloadableTimezone(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newManager(t)
+
+	for _, bad := range []string{"Beijing", "+08:00", "Mars/Olympus", "Asia/"} {
+		if _, err := m.Update(ctx, Patch{TimezoneTarget: strPtr(bad)}); err == nil {
+			t.Errorf("Update accepted the timezone %q", bad)
+		}
+	}
+
+	// And a valid one is accepted, including the empty "convert nothing".
+	for _, good := range []string{"Asia/Shanghai", "America/New_York", "UTC", ""} {
+		if _, err := m.Update(ctx, Patch{TimezoneTarget: strPtr(good)}); err != nil {
+			t.Errorf("Update rejected the timezone %q: %v", good, err)
+		}
+	}
+}
+
+// TestManager_TimezoneDefaultsToOff: this edits the user's own payload, so it
+// must take a deliberate act to turn on.
+func TestManager_TimezoneDefaultsToOff(t *testing.T) {
+	d := Defaults()
+	if d.TimezoneConversionEnabled {
+		t.Error("timezone conversion is on by default")
+	}
+	if d.TimezoneTarget != "" {
+		t.Errorf("default target = %q, want empty", d.TimezoneTarget)
+	}
+}
+
+func TestManager_TimezoneSettingsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	m, store := newManager(t)
+
+	if _, err := m.Update(ctx, Patch{
+		TimezoneEnabled: boolPtr(true),
+		TimezoneTarget:  strPtr("  Asia/Shanghai  "),
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	// Trimmed on write, so the stored value and the one compared at request
+	// time cannot differ by whitespace.
+	if got := m.Current().TimezoneTarget; got != "Asia/Shanghai" {
+		t.Errorf("target = %q, want it trimmed", got)
+	}
+
+	reloaded, err := NewManager(ctx, store, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	got := reloaded.Current()
+	if !got.TimezoneConversionEnabled || got.TimezoneTarget != "Asia/Shanghai" {
+		t.Errorf("after restart: enabled=%v target=%q", got.TimezoneConversionEnabled, got.TimezoneTarget)
+	}
+}
+
+// TestNewManager_ToleratesAnUnloadablePersistedTimezone: a database holding a
+// zone this build cannot load must degrade to "no conversion" rather than
+// refuse to boot (NF-04).
+func TestNewManager_ToleratesAnUnloadablePersistedTimezone(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeStore{
+		values: map[string]string{
+			KeyTimezoneEnabled: "true",
+			KeyTimezoneTarget:  "Mars/Olympus",
+		},
+		failOn: map[string]bool{},
+	}
+
+	m, err := NewManager(ctx, store, nil)
+	if err != nil {
+		t.Fatalf("NewManager refused to start: %v", err)
+	}
+	// The value is carried through so the panel can show what is wrong; it is
+	// the request path that refuses to act on it.
+	if got := m.Current().TimezoneTarget; got != "Mars/Olympus" {
+		t.Errorf("target = %q, want it preserved for the operator to fix", got)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func boolPtr(b bool) *bool { return &b }

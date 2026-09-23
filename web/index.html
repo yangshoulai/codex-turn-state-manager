@@ -95,6 +95,21 @@
 
       <div class="switch-row">
         <label class="switch">
+          <input type="checkbox" id="s-timezone">
+          <span class="slider"></span>
+        </label>
+        <div class="switch-text">
+          <strong>时区转换</strong>
+          <span class="muted">改写请求里客户端声明的时区（环境上下文的 <code>&lt;timezone&gt;</code> 与 <code>&lt;current_date&gt;</code>）。关闭时请求体一个字节都不会动</span>
+          <div class="switch-field">
+            <input id="s-timezone-target" type="text" placeholder="Asia/Shanghai" autocomplete="off" spellcheck="false" aria-label="目标时区">
+            <span class="muted small" id="s-timezone-note"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="switch-row">
+        <label class="switch">
           <input type="checkbox" id="s-routing">
           <span class="slider"></span>
         </label>

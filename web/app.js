@@ -143,6 +143,8 @@ const DEFAULTS = {
   nonTargetBackoffCapMin: 30,
   callHistoryRetentionHours: 24,
   maxUnusablePerProbe: 0,
+  timezoneConversionEnabled: false,
+  timezoneTarget: "",
   routingStrategy: "respect_cpa_priority",
 };
 
@@ -752,6 +754,14 @@ function fillSettingsForm(values) {
   $("s-nontargetcap").value = values.nonTargetBackoffCapMin;
   $("s-callretention").value = values.callHistoryRetentionHours;
   $("s-maxunusable").value = values.maxUnusablePerProbe;
+  $("s-timezone").checked = values.timezoneConversionEnabled;
+  $("s-timezone-target").value = values.timezoneTarget || "";
+  // The field is only reachable once the switch is on, which is what the
+  // operator asked for and also stops a target being typed and forgotten.
+  $("s-timezone-target").disabled = !values.timezoneConversionEnabled;
+  $("s-timezone-note").textContent = values.timezoneConversionEnabled
+    ? "留空或填错时区即不转换。填错会在保存时被拒绝。"
+    : "关闭时请求体不会被修改。";
   $("s-scan").value = values.scanIntervalSec;
   $("s-concurrency").value = values.probeConcurrency;
   $("s-ttl").value = values.stateTtlMin;
@@ -797,6 +807,17 @@ on("restore-defaults", "click", () => {
   toast("已填入默认值，点「保存配置」生效");
 });
 
+// The timezone field follows its switch, so the two can never disagree about
+// whether conversion is on.
+on("s-timezone", "change", () => {
+  const on = $("s-timezone").checked;
+  $("s-timezone-target").disabled = !on;
+  $("s-timezone-note").textContent = on
+    ? "留空或填错时区即不转换。填错会在保存时被拒绝。"
+    : "关闭时请求体不会被修改。";
+  if (on) $("s-timezone-target").focus();
+});
+
 on("s-global", "change", () => {
   const on = $("s-global").checked;
   $("s-probe").disabled = !on;
@@ -821,6 +842,8 @@ on("save-settings", "click", async () => {
     nonTargetBackoffCapMin: Number($("s-nontargetcap").value),
     callHistoryRetentionHours: Number($("s-callretention").value),
     maxUnusablePerProbe: Number($("s-maxunusable").value),
+    timezoneConversionEnabled: $("s-timezone").checked,
+    timezoneTarget: $("s-timezone-target").value.trim(),
     routingStrategy: strategy ? strategy.value : undefined,
   };
   try {
@@ -1982,6 +2005,20 @@ async function loadStatus() {
   }
   if (p.invalidated) parts.push(`自愈 ${p.invalidated}`);
   if (p.skipStale) parts.push(`过期值 ${p.skipStale}`);
+
+  // Timezone conversion, when it is on. A rewrite edits a payload and leaves
+  // nothing else behind, so without these an enabled-but-inert feature is
+  // indistinguishable from a broken one -- and "no marker" is a real answer:
+  // this traffic does not declare a timezone to rewrite.
+  const tz = status.timezone || {};
+  if (tz.disabled || tz.seen || tz.noMarker || tz.matched) {
+    const bits = [];
+    if (tz.changed) bits.push(`已改写 ${tz.changed}`);
+    if (tz.same) bits.push(`已是目标 ${tz.same}`);
+    if (tz.noMarker) bits.push(`无标记 ${tz.noMarker}`);
+    if (tz.disabled) bits.push(`未启用 ${tz.disabled}`);
+    if (bits.length) parts.push(`时区 ${bits.join("/")}`);
+  }
 
   // Whether the scan loop is alive. A stalled loop looks exactly like an idle
   // one from every other number on this page -- pairs overdue, no new rows --

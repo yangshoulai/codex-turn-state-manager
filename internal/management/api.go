@@ -40,6 +40,7 @@ type Service interface {
 
 	Catalog() *models.Catalog
 	PipelineStats() intercept.StatsSnapshot
+	TimezoneStats() intercept.TimezoneSnapshot
 	CallHistory() callhistory.Store
 	CallRecorder() *callhistory.Recorder
 
@@ -222,6 +223,12 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		// the plugin has ever actually injected, which a header rewrite
 		// otherwise leaves no trace of.
 		"pipeline": a.svc.PipelineStats(),
+		// Whether the timezone rewrite is firing. It edits a payload and leaves
+		// nothing else behind, and whether a given client puts a timezone in the
+		// request is not something the plugin can assume -- so a feature that
+		// does nothing looks exactly like a feature that is broken, and these
+		// counters are the difference.
+		"timezone": a.svc.TimezoneStats(),
 		// Whether the call log is keeping up. A recorder whose writer has fallen
 		// behind shows a history with holes in it, and the operator would have no
 		// way to tell that from a quiet proxy.
@@ -254,6 +261,8 @@ type settingsDTO struct {
 	NonTargetBackoffCapMin   int    `json:"nonTargetBackoffCapMin"`
 	CallHistoryRetentionH    int    `json:"callHistoryRetentionHours"`
 	MaxUnusablePerProbe      int    `json:"maxUnusablePerProbe"`
+	TimezoneEnabled          bool   `json:"timezoneConversionEnabled"`
+	TimezoneTarget           string `json:"timezoneTarget"`
 }
 
 func toSettingsDTO(v *settings.Values) settingsDTO {
@@ -275,6 +284,8 @@ func toSettingsDTO(v *settings.Values) settingsDTO {
 		NonTargetBackoffCapMin:   int(v.NonTargetBackoffCap / time.Minute),
 		CallHistoryRetentionH:    int(v.CallHistoryRetention / time.Hour),
 		MaxUnusablePerProbe:      v.MaxUnusablePerProbe,
+		TimezoneEnabled:          v.TimezoneConversionEnabled,
+		TimezoneTarget:           v.TimezoneTarget,
 	}
 }
 
@@ -301,6 +312,8 @@ type settingsPatchDTO struct {
 	NonTargetBackoffCapMin   *int    `json:"nonTargetBackoffCapMin"`
 	CallHistoryRetentionH    *int    `json:"callHistoryRetentionHours"`
 	MaxUnusablePerProbe      *int    `json:"maxUnusablePerProbe"`
+	TimezoneEnabled          *bool   `json:"timezoneConversionEnabled"`
+	TimezoneTarget           *string `json:"timezoneTarget"`
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +354,8 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	patch.MaxProxiesPerProbe = dto.MaxProxiesPerProbe
 	patch.NonTargetBackoffCapMin = dto.NonTargetBackoffCapMin
 	patch.MaxUnusablePerProbe = dto.MaxUnusablePerProbe
+	patch.TimezoneEnabled = dto.TimezoneEnabled
+	patch.TimezoneTarget = dto.TimezoneTarget
 	if dto.CallHistoryRetentionH != nil {
 		d := time.Duration(*dto.CallHistoryRetentionH) * time.Hour
 		patch.CallHistoryRetention = &d

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/yangshoulai/codex-turn-state-manager/internal/timezone"
 )
 
 // Setting keys as persisted in the settings table.
@@ -35,6 +37,8 @@ const (
 	KeyNonTargetBackoffCapMin = "non_target_backoff_cap_min"
 	KeyCallHistoryRetentionH  = "call_history_retention_hours"
 	KeyMaxUnusablePerProbe    = "max_unusable_per_probe"
+	KeyTimezoneEnabled        = "timezone_conversion_enabled"
+	KeyTimezoneTarget         = "timezone_target"
 )
 
 // RoutingStrategy selects how the credential scheduler picks among candidates.
@@ -108,6 +112,20 @@ type Values struct {
 	// it, and how to settle it from probe_history.
 	MaxUnusablePerProbe int
 
+	// TimezoneConversionEnabled turns on rewriting the timezone a request
+	// declares about its caller. Off by default: it edits the user's own
+	// payload, which is a bigger step than rewriting a header.
+	TimezoneConversionEnabled bool
+
+	// TimezoneTarget is the IANA zone to rewrite to, e.g. "Asia/Shanghai".
+	//
+	// Empty is a legal value and means "convert nothing" rather than "use the
+	// host's zone": the requirement is that an enabled switch with no usable
+	// target does nothing at all, and an empty string is the most likely way to
+	// arrive there. Validation happens on write; an unloadable name is rejected
+	// there rather than silently ignored at request time.
+	TimezoneTarget string
+
 	// CallHistoryRetention bounds how long one intercepted request is kept.
 	//
 	// Capped at a day on purpose. A call row carries three full turn-state
@@ -138,6 +156,10 @@ func Defaults() Values {
 		NonTargetBackoffCap:      30 * time.Minute,
 		CallHistoryRetention:     24 * time.Hour,
 		MaxUnusablePerProbe:      0,
+
+		// Off, with no target. Both have to be set before anything is rewritten.
+		TimezoneConversionEnabled: false,
+		TimezoneTarget:            "",
 	}
 }
 
@@ -266,6 +288,8 @@ type Patch struct {
 	NonTargetBackoffCapMin   *int
 	CallHistoryRetention     *time.Duration
 	MaxUnusablePerProbe      *int
+	TimezoneEnabled          *bool
+	TimezoneTarget           *string
 }
 
 // Update applies a patch, validates it, persists it and publishes a new
@@ -327,7 +351,23 @@ func (m *Manager) Update(ctx context.Context, p Patch) (*Values, error) {
 	if p.MaxUnusablePerProbe != nil {
 		next.MaxUnusablePerProbe = *p.MaxUnusablePerProbe
 	}
+	if p.TimezoneEnabled != nil {
+		next.TimezoneConversionEnabled = *p.TimezoneEnabled
+	}
+	if p.TimezoneTarget != nil {
+		next.TimezoneTarget = strings.TrimSpace(*p.TimezoneTarget)
+	}
 
+	// Deliberately NOT part of Validate. Validate is the gate decode uses to
+	// decide whether a persisted snapshot is usable, and failing it reinstates
+	// every default -- so one unloadable timezone in the database would silently
+	// reset the whole configuration. A target that cannot be loaded is not in
+	// that class: the request path already treats it as "convert nothing", so
+	// reading one is harmless and writing one is what deserves a refusal, here,
+	// while the operator is looking at the field.
+	if _, err := timezone.ParseTarget(next.TimezoneTarget); err != nil {
+		return nil, err
+	}
 	if err := next.Validate(); err != nil {
 		return nil, err
 	}
@@ -417,6 +457,8 @@ func encode(v Values) (map[string]string, error) {
 		KeyNonTargetBackoffCapMin: strconv.Itoa(int(v.NonTargetBackoffCap / time.Minute)),
 		KeyCallHistoryRetentionH:  strconv.Itoa(int(v.CallHistoryRetention / time.Hour)),
 		KeyMaxUnusablePerProbe:    strconv.Itoa(v.MaxUnusablePerProbe),
+		KeyTimezoneEnabled:        strconv.FormatBool(v.TimezoneConversionEnabled),
+		KeyTimezoneTarget:         v.TimezoneTarget,
 	}, nil
 }
 
@@ -475,6 +517,18 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 		}
 		*dst = time.Duration(n) * time.Hour
 	}
+	strAt := func(key string, dst *string) {
+		s, ok := raw[key]
+		if !ok {
+			return
+		}
+		// Deliberately not validated here. decode runs at startup, and a
+		// database holding a zone this build cannot load must degrade to "no
+		// conversion" (which is what an unloadable target means at request
+		// time) rather than refuse to boot. Validate refuses it on the next
+		// write.
+		*dst = strings.TrimSpace(s)
+	}
 	minsAt := func(key string, dst *time.Duration) {
 		s, ok := raw[key]
 		if !ok {
@@ -504,6 +558,8 @@ func decode(raw map[string]string, base Values) (Values, []string) {
 	minsAt(KeyNonTargetBackoffCapMin, &v.NonTargetBackoffCap)
 	hoursAt(KeyCallHistoryRetentionH, &v.CallHistoryRetention)
 	intAt(KeyMaxUnusablePerProbe, &v.MaxUnusablePerProbe)
+	boolAt(KeyTimezoneEnabled, &v.TimezoneConversionEnabled)
+	strAt(KeyTimezoneTarget, &v.TimezoneTarget)
 
 	if s, ok := raw[KeyAccountRoutingStrategy]; ok && strings.TrimSpace(s) != "" {
 		strategy, err := ParseRoutingStrategy(strings.TrimSpace(s))

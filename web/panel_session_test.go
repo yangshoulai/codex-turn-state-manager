@@ -1115,3 +1115,63 @@ func TestPanelKeepsTheRawStatusMessageForATooltip(t *testing.T) {
 		t.Error("no title builder for the verdict")
 	}
 }
+
+// TestPanelTimezoneFieldFollowsItsSwitch pins the coupling the request asked
+// for: the timezone input is disabled until conversion is switched on.
+func TestPanelTimezoneFieldFollowsItsSwitch(t *testing.T) {
+	html, err := ReadAsset("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	markup := string(html)
+	for _, id := range []string{"s-timezone", "s-timezone-target"} {
+		if !strings.Contains(markup, `id="`+id+`"`) {
+			t.Errorf("the panel has no #%s", id)
+		}
+	}
+
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	// Set on render and re-evaluated on change, so the two can never disagree.
+	if !strings.Contains(src, `$("s-timezone-target").disabled = !values.timezoneConversionEnabled`) {
+		t.Error("the field is not disabled from the loaded settings")
+	}
+	if !strings.Contains(src, `on("s-timezone", "change"`) {
+		t.Error("toggling the switch does not update the field")
+	}
+	if !strings.Contains(src, "timezoneTarget") {
+		t.Error("the target is not read or written by the panel")
+	}
+}
+
+// TestPanelReportsWhetherTimezoneConversionFires.
+//
+// The rewrite edits a payload and leaves nothing else behind, and whether a
+// client puts a timezone in the request is not something the plugin can assume.
+// Without counters, an enabled feature that never matches is indistinguishable
+// from a broken one -- which is the failure mode that matters here.
+func TestPanelReportsWhetherTimezoneConversionFires(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "status.timezone") {
+		t.Error("the panel ignores the timezone counters")
+	}
+	for _, field := range []string{"tz.changed", "tz.noMarker", "tz.disabled", "tz.same"} {
+		if !strings.Contains(src, field) {
+			t.Errorf("the panel does not report %s", field)
+		}
+	}
+	// "no marker" has to be visible on its own: it is the answer to "why does
+	// nothing happen", and lumping it in with the others hides that.
+	if !strings.Contains(src, "无标记") {
+		t.Error("the no-marker count has no wording")
+	}
+}

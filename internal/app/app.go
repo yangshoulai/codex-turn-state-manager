@@ -25,6 +25,7 @@ import (
 	"github.com/yangshoulai/codex-turn-state-manager/internal/settings"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/states"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/storage"
+	"github.com/yangshoulai/codex-turn-state-manager/internal/timezone"
 	"github.com/yangshoulai/codex-turn-state-manager/internal/version"
 )
 
@@ -59,11 +60,15 @@ type App struct {
 
 	// modelFetcher reads an account's own model catalog from upstream.
 	modelFetcher *models.AccountFetcher
+	// tzRewriter rewrites the timezone a request declares. Reused across
+	// requests: it holds only the target zone and a clock.
+	tzRewriter *timezone.Rewriter
 	// calls records one row per intercepted request.
 	calls *callhistory.Recorder
 
 	corr      *intercept.CorrelationManager
 	stats     *intercept.Stats
+	tzStats   *intercept.TimezoneStats
 	injector  *intercept.Injector
 	collector *intercept.Collector
 	router    *routing.Scheduler
@@ -152,6 +157,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	// only it is allowed to reach the host (NF-06).
 	a.modelFetcher = models.NewAccountFetcher(cfg.UpstreamBaseURL)
 	a.accounts.SetModelFetcher(a)
+	a.tzRewriter = timezone.New()
 
 	a.states = states.NewRegistry(db.Bindings(), db.Bindings(), a)
 	if err := a.states.Load(ctx); err != nil {
@@ -216,10 +222,13 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 
 	a.corr = intercept.NewCorrelationManager(intercept.DefaultCorrelationTTL)
 	a.stats = &intercept.Stats{}
+	a.tzStats = &intercept.TimezoneStats{}
 	a.calls = callhistory.New(callhistory.Config{Settings: a.settings, Store: db.Calls()})
 	a.injector = intercept.NewInjector(intercept.InjectorConfig{
 		Settings: a.settings, States: a.states, Corr: a.corr, Log: logf, Stats: a.stats,
-		Calls: a.calls,
+		Calls:         a.calls,
+		Clock:         a.rewriteClock,
+		TimezoneStats: a.tzStats,
 	})
 	a.collector = intercept.NewCollector(intercept.CollectorConfig{
 		Settings: a.settings, States: a.states, Plans: a.accounts,
@@ -430,6 +439,32 @@ func (a *App) ReadPlan(ctx context.Context, authIndex string) (accounts.Plan, er
 	}
 	return accounts.ParsePlanFromCredential(cred.Raw), nil
 }
+
+// rewriteClock implements intercept.ClockRewriter.
+//
+// The target is resolved from the live settings snapshot on every call, so
+// changing the zone in the panel applies to the next request with no restart.
+// Any failure to load it degrades to "rewrite nothing" rather than to an error:
+// a configured zone this process cannot load is a reason to leave the request
+// alone, never a reason to fail it.
+//
+// One rewriter is reused across requests, and it carries no target of its own --
+// the location travels as an argument -- so concurrent requests cannot see each
+// other's configuration.
+func (a *App) rewriteClock(body []byte) intercept.ClockResult {
+	loc, err := timezone.ParseTarget(a.settings.Current().TimezoneTarget)
+	if err != nil || loc == nil {
+		return intercept.ClockResult{Body: body}
+	}
+	out, res := a.tzRewriter.Rewrite(body, loc)
+	if !res.Changed {
+		return intercept.ClockResult{Body: body, From: res.From, Ran: true}
+	}
+	return intercept.ClockResult{Body: out, From: res.From, Ran: true}
+}
+
+// TimezoneStats exposes the timezone counters.
+func (a *App) TimezoneStats() intercept.TimezoneSnapshot { return a.tzStats.Snapshot() }
 
 // States returns the binding registry.
 func (a *App) States() *states.Registry { return a.states }

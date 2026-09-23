@@ -12,6 +12,7 @@
 package pluginabi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -302,6 +303,23 @@ func (p *Plugin) handleRequestInterceptBefore(request []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.RequestInterceptResponse{})
 }
 
+// sameBody reports whether two payloads are the same bytes.
+//
+// Pointer equality first: the interceptor returns the body it was handed when
+// it changed nothing, and that is the overwhelmingly common case.
+func sameBody(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	if &a[0] == &b[0] {
+		return true
+	}
+	return bytes.Equal(a, b)
+}
+
 func (p *Plugin) handleRequestIntercept(request []byte) ([]byte, error) {
 	a := p.current()
 	if a == nil {
@@ -326,7 +344,16 @@ func (p *Plugin) handleRequestIntercept(request []byte) ([]byte, error) {
 		hdrs = http.Header{}
 	}
 
-	decision := a.InjectState(&hostapi.InterceptedRequest{
+	// The request goes in as a pointer, and the body is read back off it
+	// afterwards -- not from a local copy.
+	//
+	// Headers are a map, so mutating one propagates through the value the
+	// interceptor was handed. A slice is not: assigning a new one to a struct
+	// field changes that field, and a caller holding the old local still holds
+	// the old bytes. Reading the field back is what makes the replacement
+	// reach the host, and getting this wrong is silent -- the request simply
+	// goes out unmodified.
+	ireq := &hostapi.InterceptedRequest{
 		Stage:     hostapi.StageAfterAuth,
 		RequestID: req.RequestID,
 		TraceID:   req.TraceID,
@@ -335,13 +362,21 @@ func (p *Plugin) handleRequestIntercept(request []byte) ([]byte, error) {
 		AuthID:    authID,
 		AuthIndex: authIndex,
 		Headers:   hdrs,
-	})
+		Body:      req.Body,
+	}
+	decision := a.InjectState(ireq)
 
 	// Only send back the header this plugin owns, and only when it was set.
 	// Returning the whole header map would echo the request back at the host.
 	resp := pluginapi.RequestInterceptResponse{}
 	if decision.Action == intercept.ActionInjected {
 		resp.Headers = http.Header{headers.TurnState: []string{hdrs.Get(headers.TurnState)}}
+	}
+	// A body is sent back only when it actually differs. Re-sending an identical
+	// payload would make the host re-read and re-translate a conversation for
+	// nothing, on every request.
+	if len(ireq.Body) > 0 && !sameBody(ireq.Body, req.Body) {
+		resp.Body = ireq.Body
 	}
 	return okEnvelope(resp)
 }

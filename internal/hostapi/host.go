@@ -163,6 +163,15 @@ type InterceptedRequest struct {
 	// ClearHeaders names headers to delete outright, before Headers is applied.
 	// This is how a header is removed -- there is no nil-value convention.
 	ClearHeaders []string
+
+	// Body is the request payload as it currently stands, after the host has
+	// translated it to the upstream format. It is mutable in the same way
+	// Headers is: assigning a different slice replaces the body, and leaving it
+	// alone sends the original.
+	//
+	// Empty before credential selection, because the host has not yet chosen
+	// which upstream format to translate into.
+	Body []byte
 }
 
 // Completion is the terminal state of an intercepted request.

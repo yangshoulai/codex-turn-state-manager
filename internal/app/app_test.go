@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1545,4 +1546,148 @@ func TestApp_ExpiredCooldownIsNotPresentedAsAFault(t *testing.T) {
 	if got := a.Accounts().EnabledPairs(); len(got) != 1 {
 		t.Errorf("EnabledPairs = %v, want the account to stay probeable", got)
 	}
+}
+
+// TestApp_RewritesTheTimezoneOnTheRequestPath drives the whole way through the
+// app: settings, the live snapshot, the injector, and the body the adapter
+// would send back.
+func TestApp_RewritesTheTimezoneOnTheRequestPath(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+
+	body := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text",` +
+		`"text":"<environment_context>\n  <timezone>Asia/Shanghai</timezone>\n` +
+		`  <current_date>2026-09-20</current_date>\n</environment_context>"}]}]}`)
+
+	request := func() *hostapi.InterceptedRequest {
+		return &hostapi.InterceptedRequest{
+			Stage: hostapi.StageAfterAuth, RequestID: "req-tz",
+			Model: "gpt-5.5", AuthIndex: "codex-auth-1",
+			Headers: http.Header{},
+			Body:    append([]byte(nil), body...),
+		}
+	}
+
+	// Off by default: the body must come back untouched.
+	req := request()
+	a.InjectState(req)
+	if !bytes.Equal(req.Body, body) {
+		t.Fatalf("a request was rewritten while disabled:\n%s", req.Body)
+	}
+	if got := a.TimezoneStats().Disabled; got != 1 {
+		t.Errorf("disabled count = %d, want 1", got)
+	}
+
+	// Enabled, but with no target: still nothing, which is the requirement.
+	if _, err := a.Settings().Update(ctx, settings.Patch{
+		TimezoneEnabled: boolPtr(true),
+	}); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	req = request()
+	a.InjectState(req)
+	if !bytes.Equal(req.Body, body) {
+		t.Fatalf("a request was rewritten with no target configured:\n%s", req.Body)
+	}
+
+	// Enabled with a target: rewritten.
+	if _, err := a.Settings().Update(ctx, settings.Patch{
+		TimezoneTarget: strPtr("Asia/Tokyo"),
+	}); err != nil {
+		t.Fatalf("set target: %v", err)
+	}
+	req = request()
+	a.InjectState(req)
+	if bytes.Equal(req.Body, body) {
+		t.Fatal("the body was not rewritten")
+	}
+	got := string(req.Body)
+	if !strings.Contains(got, "<timezone>Asia/Tokyo</timezone>") {
+		t.Errorf("zone not rewritten:\n%s", got)
+	}
+	// The date is rewritten too, to today's date in the target zone. Shanghai
+	// and Tokyo are close enough that it lands on the same day, so the check is
+	// against the clock rather than against a fixed string.
+	tokyoToday := time.Now().In(mustLoad(t, "Asia/Tokyo")).Format("2006-01-02")
+	if !strings.Contains(got, "<current_date>"+tokyoToday+"</current_date>") {
+		t.Errorf("date not rewritten to the target zone's today:\n%s", got)
+	}
+	if strings.Contains(got, "2026-09-20") {
+		t.Errorf("the fixture's original date survived:\n%s", got)
+	}
+
+	stats := a.TimezoneStats()
+	if stats.Matched != 1 || stats.Changed != 1 {
+		t.Errorf("counters = %+v, want matched and changed to each be 1", stats)
+	}
+
+	// A body with no marker is counted separately, which is the answer to "why
+	// does nothing happen".
+	plain := request()
+	plain.Body = []byte(`{"input":[{"type":"input_text","text":"hello"}]}`)
+	a.InjectState(plain)
+	if got := a.TimezoneStats().NoMarker; got != 1 {
+		t.Errorf("noMarker = %d, want 1", got)
+	}
+}
+
+// TestApp_TimezoneIsGatedByTheMasterSwitch: it is a request-path intervention,
+// so the master switch has to stop it like the others.
+func TestApp_TimezoneIsGatedByTheMasterSwitch(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.Settings().Update(ctx, settings.Patch{
+		TimezoneEnabled: boolPtr(true),
+		TimezoneTarget:  strPtr("Asia/Tokyo"),
+		GlobalEnabled:   boolPtr(false),
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	body := []byte(`<timezone>Asia/Shanghai</timezone>`)
+	req := &hostapi.InterceptedRequest{
+		Stage: hostapi.StageAfterAuth, RequestID: "req-off",
+		Headers: http.Header{}, Body: append([]byte(nil), body...),
+	}
+	a.InjectState(req)
+	if !bytes.Equal(req.Body, body) {
+		t.Errorf("the master switch did not stop the rewrite:\n%s", req.Body)
+	}
+}
+
+// TestApp_InstructionsAreUntouchedWhenTheMarkerIsAbsent: the rewrite is
+// byte-level and anchored, so a conversation that merely mentions a timezone
+// must survive unchanged.
+func TestApp_InstructionsAreUntouchedWhenTheMarkerIsAbsent(t *testing.T) {
+	ctx := context.Background()
+	a := newTestApp(t, mockHost(1))
+	if _, err := a.Settings().Update(ctx, settings.Patch{
+		TimezoneEnabled: boolPtr(true),
+		TimezoneTarget:  strPtr("Asia/Tokyo"),
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// "<timezone>" appears in prose inside the user's own message, not as a
+	// marker with a closing tag.
+	prose := []byte(`{"input":[{"type":"input_text","text":"explain the <timezone> tag"}]}`)
+	req := &hostapi.InterceptedRequest{
+		Stage: hostapi.StageAfterAuth, RequestID: "req-prose",
+		Headers: http.Header{}, Body: append([]byte(nil), prose...),
+	}
+	a.InjectState(req)
+	if !bytes.Equal(req.Body, prose) {
+		t.Errorf("prose was rewritten:\n%s", req.Body)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func mustLoad(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatalf("LoadLocation %s: %v", name, err)
+	}
+	return loc
 }

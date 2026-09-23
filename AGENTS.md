@@ -244,6 +244,42 @@ the only thing that makes the state known.
 Do not "simplify" this back to reading `unavailable` directly. It has been tried,
 and the visible result was a healthy account reported as broken.
 
+### 2.9d The timezone rewrite is the only thing that edits a request body
+
+Off by default, behind the master switch, and behind its own switch. It replaces
+the timezone a request declares about its caller — `<timezone>` and
+`<current_date>` in the Codex environment context, plus a defensive `"timezone"`
+/ `"timezone_offset_min"` JSON field. `timezone_offset_min` is NOT part of this
+API (it belongs to the ChatGPT web backend); it is handled only so a client that
+passes it through does not end up with a stale offset beside a rewritten zone.
+
+Four rules, all of them load-bearing:
+
+- **Byte-level and anchored. Never unmarshal and re-marshal.** The payload is an
+  opaque conversation; a round trip through a Go struct rewrites key order,
+  escaping and unknown fields in a request we were only asked to change one value
+  in.
+- **No marker means return the input slice, not a copy.** The caller uses
+  identity to decide whether to send a replacement body at all.
+- **An opening tag with no closing tag is left alone.** That is a shape we do not
+  understand, and guessing where the value ends can damage a request.
+- **The date travels with the zone.** Rewriting one without the other can tell
+  the model it is in New York on a date New York has not reached, and the date is
+  the half it will actually use.
+
+An enabled switch with an empty or unloadable target converts nothing and fails
+nothing. Validation lives in `Update`, **not** in `Values.Validate`: Validate is
+the gate `decode` uses to decide whether a persisted snapshot is usable, and
+failing it reinstates every default — so one bad timezone in the database would
+silently reset the whole configuration.
+
+**The body must be read back off the struct, not from a local.** `Headers` is a
+map and propagates through the value the interceptor was handed; a `[]byte` does
+not. Assigning a new slice to the struct field changes that field, and a caller
+holding the old local still holds the old bytes — a silent failure, because the
+request simply goes out unmodified and looks identical to one with nothing to
+rewrite. There is an ABI-level test for it; do not "simplify" the read-back away.
+
 ### 2.10 Self-healing only applies to state the plugin injected
 
 `3.12`: invalidate a binding and allow one retry-without-injected-state **only**

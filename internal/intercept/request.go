@@ -21,9 +21,36 @@ type Injector struct {
 	corr     *CorrelationManager
 	logf     func(hostapi.LogLevel, string, map[string]any)
 	stats    *Stats
+
 	// calls records one row per request. Optional.
 	calls CallRecorder
+	// clock rewrites the timezone a request declares about its caller. Optional:
+	// without it no request is touched for that reason.
+	clock ClockRewriter
+	// tzStats receives the timezone counters. Never nil after construction.
+	tzStats *TimezoneStats
 }
+
+// ClockResult is what one timezone rewrite attempt did.
+type ClockResult struct {
+	// Body is what to send. Identical to the input when nothing changed.
+	Body []byte
+	// From is the zone the request declared, empty when it declared none.
+	From string
+	// Ran reports whether the attempt was made at all. False means the
+	// configuration named no usable target, which is a different fact from
+	// "this request carried no timezone" and has to be counted separately: an
+	// operator told "no marker" would go looking at their client when the
+	// problem is the field they left empty.
+	Ran bool
+}
+
+// ClockRewriter replaces the timezone markers in a request payload.
+//
+// A function rather than an interface, matching the other optional hooks here.
+// It must return the input slice untouched when it changes nothing, so the
+// caller can tell whether to send a replacement body.
+type ClockRewriter func(body []byte) ClockResult
 
 // CallRecorder receives the request-side half of the call history.
 //
@@ -45,12 +72,19 @@ type InjectorConfig struct {
 	Stats    *Stats
 	// Calls receives what each request carried and what was injected into it.
 	Calls CallRecorder
+	// Clock rewrites the timezone a request declares. Optional.
+	Clock ClockRewriter
+	// TimezoneStats receives the timezone counters. Optional.
+	TimezoneStats *TimezoneStats
 }
 
 // NewInjector builds an injector.
 func NewInjector(cfg InjectorConfig) *Injector {
 	if cfg.Stats == nil {
 		cfg.Stats = &Stats{}
+	}
+	if cfg.TimezoneStats == nil {
+		cfg.TimezoneStats = &TimezoneStats{}
 	}
 	return &Injector{
 		settings: cfg.Settings,
@@ -59,6 +93,8 @@ func NewInjector(cfg InjectorConfig) *Injector {
 		logf:     cfg.Log,
 		stats:    cfg.Stats,
 		calls:    cfg.Calls,
+		clock:    cfg.Clock,
+		tzStats:  cfg.TimezoneStats,
 	}
 }
 
@@ -77,12 +113,19 @@ const (
 	ActionUnresolvedAuth = "unresolved_auth"
 )
 
-// Inject applies bound state to a request at the after-auth stage.
+// Inject applies bound state to a request at the after-auth stage, and rewrites
+// the timezone it declares.
 //
 // The returned ClearHeaders is always empty: the plugin never has an internal
 // marker to strip, because it never injected one.
 func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 	caps := i.settings.Current().Capabilities()
+
+	// Before anything that can return early. Turn-state injection is conditional
+	// on a binding existing; the timezone rewrite is not conditional on anything
+	// this function decides, and a request with no binding is still a request
+	// whose timezone the operator asked to convert.
+	i.rewriteTimezone(req)
 
 	if req.RequestID != "" {
 		i.corr.Sweep()
@@ -140,6 +183,45 @@ func (i *Injector) Inject(req *hostapi.InterceptedRequest) Decision {
 	})
 
 	return Decision{Action: ActionInjected, AuthIndex: req.AuthIndex, StateLen: binding.StateLength}
+}
+
+// rewriteTimezone replaces the timezone the request declares about its caller.
+//
+// Behind the master switch and its own setting, and it does nothing at all when
+// the configured target is empty or cannot be loaded -- an enabled switch with
+// no usable target must not convert anything, and must not fail the request
+// either.
+func (i *Injector) rewriteTimezone(req *hostapi.InterceptedRequest) {
+	if i.clock == nil || len(req.Body) == 0 {
+		return
+	}
+	// One snapshot for the whole decision, like every other capability.
+	values := i.settings.Current()
+	if !values.Capabilities().Enabled || !values.TimezoneConversionEnabled {
+		i.tzStats.RecordDisabled()
+		return
+	}
+	result := i.clock(req.Body)
+	if !result.Ran {
+		// Enabled, but no usable target. Counted apart from "no marker",
+		// because the two point at different things to fix.
+		i.tzStats.RecordDisabled()
+		return
+	}
+	changed := len(result.Body) > 0 && &result.Body[0] != &req.Body[0]
+	if changed {
+		req.Body = result.Body
+	}
+	i.tzStats.Record(result.From != "", changed)
+	if !changed {
+		return
+	}
+	i.log(hostapi.LogDebug, "rewrote the timezone a request declared", map[string]any{
+		"requestId": req.RequestID,
+		"model":     req.Model,
+		"from":      result.From,
+		"to":        values.TimezoneTarget,
+	})
 }
 
 // Correlation exposes the manager, for the response side and diagnostics.
