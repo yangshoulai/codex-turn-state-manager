@@ -1998,6 +1998,8 @@ async function loadStatus() {
   const node = $("pipeline");
   if (!node) return;
   const parts = [];
+  // Tooltip lines, accumulated as each counter is rendered.
+  const notes = [];
   if (p.requestsSeen) parts.push(`请求 ${p.requestsSeen}`);
   if (p.injected) parts.push(`注入 ${p.injected}`);
   if (p.captured || p.capturedReused) {
@@ -2018,6 +2020,25 @@ async function loadStatus() {
     if (tz.noMarker) bits.push(`无标记 ${tz.noMarker}`);
     if (tz.disabled) bits.push(`未启用 ${tz.disabled}`);
     if (bits.length) parts.push(`时区 ${bits.join("/")}`);
+
+    if (tz.noMarker) {
+      // The counter that needs explaining. "No marker" is not a fault: the
+      // environment context is added by the client, not by CPA, so a request
+      // from anything but the Codex CLI has no timezone to rewrite unless that
+      // client sends one itself.
+      notes.push("时区·无标记 " + tz.noMarker + "：这些请求带着非空请求体到达，但里面没有可识别的时区" +
+        "（<timezone> / <current_date> / \"timezone\" / \"timezone_offset_min\"）。" +
+        "环境上下文由客户端添加，CPA 不会加——用 Codex CLI 之外的客户端测试时，请求里本来就没有时区可改。");
+    }
+    if (tz.disabled) {
+      notes.push("时区·未启用 " + tz.disabled + "：这些请求被跳过，因为开关没开，或开关开了但目标时区为空／无法加载。");
+    }
+    if (tz.changed) {
+      notes.push("时区·已改写 " + tz.changed + "：请求体里的时区字段被替换为目标时区，日期一并改写。");
+    }
+    if (tz.same) {
+      notes.push("时区·已是目标 " + tz.same + "：请求里带时区，且已经是目标值，因此没有改动。");
+    }
   }
 
   // Whether the scan loop is alive. A stalled loop looks exactly like an idle
@@ -2031,14 +2052,22 @@ async function loadStatus() {
     // Three intervals of silence is well past a slow tick and into "stuck".
     if (age > interval * 3) {
       node.classList.add("pipeline-stale");
-      node.title = `扫描循环已停止 ${age} 秒（间隔 ${interval} 秒）。探测不会进行；重启 CPA 可恢复。`;
+      notes.push(`扫描循环已停止 ${age} 秒（间隔 ${interval} 秒）。探测不会进行；重启 CPA 可恢复。`);
     }
   }
-  if (p.unresolvedAuth) parts.push(`账号未知 ${p.unresolvedAuth}`);
+  if (p.unresolvedAuth) {
+    parts.push(`账号未知 ${p.unresolvedAuth}`);
+    notes.push("账号未知：请求到达了注入阶段，但宿主没有公布选中的账号，无法查绑定。");
+  }
+
+  // Built up rather than assigned last. The version before this set one generic
+  // sentence at the end, which silently overwrote the scan-stalled warning a few
+  // lines above -- the most valuable tooltip in the bar never survived.
   node.textContent = parts.length ? parts.join(" · ") : "";
-  node.title = parts.length
-    ? "本进程累计：请求到达注入阶段 / 实际注入 / 从流量捕获 / 自愈失效 / 账号无法识别"
-    : "本进程尚未处理任何请求；请求经 CPA 转发后这里会出现计数";
+  notes.unshift("本进程累计：" + (parts.length
+    ? "请求到达注入阶段 / 实际注入 / 从流量捕获 / 自愈失效 / 账号无法识别"
+    : "尚无计数"));
+  node.title = notes.join("\n\n");
 }
 
 async function loadAll() {

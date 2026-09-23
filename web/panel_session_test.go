@@ -1175,3 +1175,48 @@ func TestPanelReportsWhetherTimezoneConversionFires(t *testing.T) {
 		t.Error("the no-marker count has no wording")
 	}
 }
+
+// TestPanelPipelineTooltipSurvivesTheCounters guards a bug that had been hiding
+// in plain sight: the counters line assigned one generic tooltip at the end of
+// the function, which overwrote the scan-stalled warning set a few lines above.
+// The most useful tooltip in the bar never survived, and nothing failed.
+func TestPanelPipelineTooltipSurvivesTheCounters(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if strings.Contains(src, `node.title = parts.length`) {
+		t.Error("the tooltip is still assigned in one place at the end, which discards earlier ones")
+	}
+	if !strings.Contains(src, "notes.push(") || !strings.Contains(src, "notes.join(") {
+		t.Error("the tooltip is not accumulated")
+	}
+	// The scan-stalled warning has to be part of that accumulation.
+	if !strings.Contains(src, "扫描循环已停止") {
+		t.Error("the scan-stalled warning is gone")
+	}
+}
+
+// TestPanelExplainsWhatNoMarkerMeans: the counter exists to answer "why does
+// nothing happen", and reading it should not require asking the author.
+func TestPanelExplainsWhatNoMarkerMeans(t *testing.T) {
+	js, err := ReadAsset("app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	src := stripWholeLineComments(string(js))
+
+	if !strings.Contains(src, "时区·无标记") {
+		t.Error("the no-marker counter has no explanation")
+	}
+	// The point that is easy to get wrong, and that the operator needs: the
+	// marker is put there by the client, not by CPA.
+	if !strings.Contains(src, "CPA 不会加") {
+		t.Error("the explanation does not say who adds the environment context")
+	}
+	if !strings.Contains(src, "时区·未启用") {
+		t.Error("the disabled counter has no explanation")
+	}
+}
