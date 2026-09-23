@@ -388,3 +388,94 @@ func TestRewrite_IsCheapWhenThereIsNoMarker(t *testing.T) {
 		t.Error("the body was copied; the pre-check did not short-circuit")
 	}
 }
+
+// TestRewrite_LeavesTheSameZoneNameElsewhereAlone is the safety property that
+// separates this from a global string replace.
+//
+// A user talking about where they are, or quoting a log, puts the zone name in
+// their own message. Rewriting that would edit the conversation, not the
+// metadata -- and a bytes.ReplaceAll would do it silently, because the string is
+// identical. Every substitution here is anchored: inside a specific tag, or as
+// the value of a specific key.
+func TestRewrite_LeavesTheSameZoneNameElsewhereAlone(t *testing.T) {
+	f := at(t, "2026-09-23T02:00:00Z")
+
+	body := []byte(`{"timezone":"Asia/Shanghai","timezone_offset_min":-480,` +
+		`"input":[{"type":"input_text","text":"<environment_context>\n` +
+		`  <timezone>Asia/Shanghai</timezone>\n` +
+		`  <current_date>2026-09-23</current_date>\n</environment_context>"},` +
+		`{"type":"input_text","text":"我人在 Asia/Shanghai，这段别动"}]}`)
+
+	out, res := f.rewrite(body)
+	if !res.Changed {
+		t.Fatal("nothing was rewritten")
+	}
+	got := string(out)
+
+	// The prose survives verbatim, including the zone name it mentions.
+	if !strings.Contains(got, "我人在 Asia/Shanghai，这段别动") {
+		t.Errorf("the user's own message was edited:\n%s", got)
+	}
+	// And it is the only occurrence of the source zone left.
+	if n := strings.Count(got, "Asia/Shanghai"); n != 1 {
+		t.Errorf("Asia/Shanghai appears %d times, want exactly 1 (the prose)", n)
+	}
+	// The structured sites all moved.
+	if n := strings.Count(got, "America/New_York"); n != 2 {
+		t.Errorf("the target appears %d times, want 2 (the json field and the tag)", n)
+	}
+	if !json.Valid(out) {
+		t.Errorf("the result is no longer valid JSON:\n%s", got)
+	}
+}
+
+// TestRewrite_CountsSpansNotOccurrences pins what "how many places" means: one
+// span per marker, and the number depends on which marker forms the request
+// carries rather than on how often a zone name appears in it.
+func TestRewrite_CountsSpansNotOccurrences(t *testing.T) {
+	f := at(t, "2026-09-23T02:00:00Z")
+
+	cases := []struct {
+		name  string
+		body  string
+		forms []string
+	}{
+		{
+			name:  "json fields only",
+			body:  `{"timezone":"Asia/Shanghai","timezone_offset_min":-480}`,
+			forms: []string{FormJSONField, FormOffsetMin},
+		},
+		{
+			name: "environment context only",
+			body: `{"input":[{"type":"input_text","text":"<timezone>Asia/Shanghai</timezone>` +
+				`<current_date>2026-09-23</current_date>"}]}`,
+			forms: []string{FormTag, FormCurrentDate},
+		},
+		{
+			name:  "the tag without a date",
+			body:  `{"input":[{"type":"input_text","text":"<timezone>Asia/Shanghai</timezone>"}]}`,
+			forms: []string{FormTag},
+		},
+		{
+			name: "both shapes in one body",
+			body: `{"timezone":"Asia/Shanghai","timezone_offset_min":-480,` +
+				`"input":[{"type":"input_text","text":"<timezone>Asia/Shanghai</timezone>` +
+				`<current_date>2026-09-23</current_date>"}]}`,
+			forms: []string{FormTag, FormCurrentDate, FormJSONField, FormOffsetMin},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, res := f.rewrite([]byte(tc.body))
+			if len(res.Forms) != len(tc.forms) {
+				t.Fatalf("forms = %v, want %v", res.Forms, tc.forms)
+			}
+			for i := range tc.forms {
+				if res.Forms[i] != tc.forms[i] {
+					t.Fatalf("forms = %v, want %v", res.Forms, tc.forms)
+				}
+			}
+		})
+	}
+}
