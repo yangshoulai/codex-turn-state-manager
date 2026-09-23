@@ -248,13 +248,27 @@ and the visible result was a healthy account reported as broken.
 
 Off by default, behind the master switch, and behind its own switch. It replaces
 the timezone a request declares about its caller — `<timezone>` and
-`<current_date>` in the Codex environment context, plus a defensive `"timezone"`
-/ `"timezone_offset_min"` JSON field. `timezone_offset_min` is NOT part of this
+`<current_date>` inside the `<environment_context>` block, plus a defensive
+`"timezone"` / `"timezone_offset_min"` JSON field. `timezone_offset_min` is NOT part of this
 API (it belongs to the ChatGPT web backend); it is handled only so a client that
 passes it through does not end up with a stale offset beside a rewritten zone.
 
 Four rules, all of them load-bearing:
 
+- **A body spells its angle brackets one of three ways.** Raw `<`/`>`, or
+  `\u003c`/`\u003e`, or uppercase-hex. A JSON encoder with HTML escaping on —
+  Go's default, and what the Codex desktop client uses — produces the second, and
+  measured on a real capture **not one raw `<` appeared in the whole 118 KB
+  body**. Recognising only the raw form made a request that plainly declared a
+  timezone report as carrying none, and the counter was then misread as "this
+  client sends no timezone". Every spelling has to be in `mentionsAMarker` too:
+  missing one there is the same failure, one layer earlier. The substitution
+  keeps the body's own dialect, because writing a raw tag into an escaped
+  document corrupts it.
+- **The tags are only rewritten inside `<environment_context>`.** That block is
+  what the client declares about its own environment, so a message quoting a
+  `<timezone>` pair, or a tool description documenting one, is unreachable. A
+  body with no wrapper falls back to bare tags.
 - **Byte-level and anchored. Never unmarshal and re-marshal.** The payload is an
   opaque conversation; a round trip through a Go struct rewrites key order,
   escaping and unknown fields in a request we were only asked to change one value

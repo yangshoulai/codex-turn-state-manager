@@ -479,3 +479,131 @@ func TestRewrite_CountsSpansNotOccurrences(t *testing.T) {
 		})
 	}
 }
+
+// TestRewrite_HandlesTheEscapedDialect is the regression test for the bug a real
+// capture exposed.
+//
+// The Codex desktop client serialises with HTML escaping on -- Go's default --
+// so the environment context arrives as \u003ctimezone\u003e, not <timezone>.
+// Measured: not one raw "<" appeared in the whole 118 KB body. The rewriter
+// recognised only the raw spelling, so a request that plainly declared
+// Asia/Shanghai was reported as carrying no timezone at all, and the operator
+// went looking at their client instead of at this code.
+//
+// The excerpt below is the shape from that capture, reduced to its skeleton.
+func TestRewrite_HandlesTheEscapedDialect(t *testing.T) {
+	f := at(t, "2026-09-23T01:42:00Z")
+
+	for _, tc := range []struct {
+		name   string
+		open   string
+		closer string
+	}{
+		{"lowercase hex, which Go emits", `\u003c`, `\u003e`},
+		{"uppercase hex, which JSON also allows", `\u003C`, `\u003E`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"input":[{"type":"message","role":"user","content":[{"type":"input_text",` +
+				`"text":"` + tc.open + `environment_context` + tc.closer + `\n  ` +
+				tc.open + `cwd` + tc.closer + `/Users/me/proj` + tc.open + `/cwd` + tc.closer + `\n  ` +
+				tc.open + `current_date` + tc.closer + `2026-09-23` + tc.open + `/current_date` + tc.closer + `\n  ` +
+				tc.open + `timezone` + tc.closer + `Asia/Shanghai` + tc.open + `/timezone` + tc.closer + `\n"}]}]}`
+
+			out, res := f.rewrite([]byte(body))
+			if !res.Changed {
+				t.Fatal("the escaped form was not recognised")
+			}
+			if res.From != "Asia/Shanghai" {
+				t.Errorf("From = %q, want Asia/Shanghai", res.From)
+			}
+			got := string(out)
+			// The substitution keeps the body's own escaping: writing a raw tag
+			// back into an escaped document would corrupt it.
+			if !strings.Contains(got, tc.open+`timezone`+tc.closer+`America/New_York`+tc.open+`/timezone`+tc.closer) {
+				t.Errorf("the escaped timezone was not rewritten in place:\n%s", got)
+			}
+			// The date moves with the zone, and here it has to: the fixture
+			// instant is 01:42 UTC, which is still the 22nd in New York.
+			if !strings.Contains(got, tc.open+`current_date`+tc.closer+`2026-09-22`+tc.open+`/current_date`+tc.closer) {
+				t.Errorf("the date was not rewritten to the target zone's today:\n%s", got)
+			}
+			if strings.Contains(got, "<timezone>") {
+				t.Errorf("a raw tag was written into an escaped body:\n%s", got)
+			}
+			if !json.Valid(out) {
+				t.Errorf("the result is no longer valid JSON:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestRewrite_OnlyTouchesTheEnvironmentContext is what the block anchoring buys.
+//
+// A client that quotes a timezone tag in its own message -- or a tool
+// description that documents one -- produces a well-formed <timezone>...</timezone>
+// pair that is not the declaration. Anchoring on the enclosing block makes those
+// unreachable, which a bare tag search cannot do.
+func TestRewrite_OnlyTouchesTheEnvironmentContext(t *testing.T) {
+	f := at(t, "2026-09-23T12:00:00Z")
+
+	body := `{"input":[` +
+		// A well-formed pair that is NOT the declaration.
+		`{"type":"input_text","text":"示例：<timezone>Asia/Shanghai</timezone> 这样写对吗？"},` +
+		// The real one.
+		`{"type":"input_text","text":"<environment_context>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>"}` +
+		`]}`
+
+	out, res := f.rewrite([]byte(body))
+	if !res.Changed {
+		t.Fatal("nothing was rewritten")
+	}
+	got := string(out)
+
+	if !strings.Contains(got, "示例：<timezone>Asia/Shanghai</timezone> 这样写对吗？") {
+		t.Errorf("the quoted example was edited:\n%s", got)
+	}
+	// Asserted in two pieces rather than across the newline: the body spells it as a
+	// literal backslash-n, and a needle written with a real newline would silently
+	// never match.
+	if !strings.Contains(got, `<environment_context>`) {
+		t.Errorf("the wrapper was lost:\n%s", got)
+	}
+	if !strings.Contains(got, `<timezone>America/New_York</timezone>`) {
+		t.Errorf("the declaration was not rewritten:\n%s", got)
+	}
+	if n := strings.Count(got, "America/New_York"); n != 1 {
+		t.Errorf("the target appears %d times, want exactly 1", n)
+	}
+}
+
+// TestMentionsAMarker covers the pre-check, which is where the bug actually bit:
+// a spelling missing from this list makes a request that declares a timezone
+// report as carrying none.
+func TestMentionsAMarker(t *testing.T) {
+	yes := []string{
+		`<timezone>Asia/Shanghai</timezone>`,
+		`\u003ctimezone\u003eAsia/Shanghai\u003c/timezone\u003e`,
+		`\u003Ctimezone\u003EAsia/Shanghai\u003C/timezone\u003E`,
+		`<environment_context>`,
+		`\u003cenvironment_context\u003e`,
+		`{"timezone":"Asia/Shanghai"}`,
+		`{"timezone_offset_min":-480}`,
+	}
+	for _, s := range yes {
+		if !mentionsAMarker([]byte(s)) {
+			t.Errorf("not recognised as a marker: %s", s)
+		}
+	}
+
+	no := []string{
+		``,
+		`{"input":[{"type":"input_text","text":"hello"}]}`,
+		`{"timezone_mentioned":true}`,
+		`the word timezone on its own`,
+	}
+	for _, s := range no {
+		if mentionsAMarker([]byte(s)) {
+			t.Errorf("wrongly treated as a marker: %s", s)
+		}
+	}
+}
